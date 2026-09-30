@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cids.prompts.narrative import (SYSTEM_PROMPT, FilterConfig,  # noqa: E402
@@ -112,6 +113,10 @@ def main():
     llm, sim = LLM(model_name, a.quant), Similarity(a.sim_model)
     t0 = time.time()
     rows = todo.to_dict("records")
+    counts = {"strict": 0, "relaxed": 0, "insufficient": 0}
+    n_cand = n_fact_ok = 0
+    bar = tqdm(total=len(df), initial=len(done), desc=f"{a.target}", unit="case",
+               file=sys.stdout, dynamic_ncols=True, mininterval=5, smoothing=0.1)
     for b in range(0, len(rows), a.batch_size):
         batch = rows[b:b + a.batch_size]
         facts = [{c: r[c] for c in FIELD_COLS} for r in batch]
@@ -143,9 +148,16 @@ def main():
                                         relaxed=c.valid_relaxed, problems=c.fact_problems)
                                    for c in pool[i]],
                 }, ensure_ascii=False) + "\n")
-        n = b + len(batch)
-        el = time.time() - t0
-        print(f"  {n}/{len(rows)} cases | {el/60:.1f} min | ETA {el/n*(len(rows)-n)/60:.1f} min", flush=True)
+        for i in range(len(batch)):
+            counts[chosen[i][1].split("(")[0]] += 1
+            n_cand += len(pool[i])
+            n_fact_ok += sum(not c.fact_problems for c in pool[i])
+        bar.update(len(batch))
+        bar.set_postfix(strict=counts["strict"], relaxed=counts["relaxed"],
+                        short=counts["insufficient"],
+                        fact_ok=f"{n_fact_ok / max(n_cand, 1):.0%}")
+    bar.close()
+    print(f"finished {len(rows)} cases in {(time.time() - t0) / 60:.1f} min", flush=True)
 
     # ---- merge back into the prompt table ----
     recs = [json.loads(l) for l in progress.open(encoding="utf-8")]
