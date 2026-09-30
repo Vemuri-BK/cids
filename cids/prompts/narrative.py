@@ -154,6 +154,11 @@ def check_facts(text: str, f: Dict[str, str]) -> List[str]:
     # leakage words
     if re.search(r"complete response|\bpcr\b|chemotherapy|neoadjuvant|mastectomy|recurrence", t):
         problems.append("mentions treatment/outcome")
+    # bilateral ACQUISITION must not become bilateral TUMOR (not in the metadata)
+    if re.search(r"(tumou?rs?|cancers?|lesions?|masse?s?|carcinomas?)\s+(located\s+)?(in|of|within|across)\s+both\s+breasts"
+                 r"|bilateral\s+(breast\s+)?(tumou?rs?|cancers?|lesions?|masses|carcinomas?)"
+                 r"|(tumou?rs?|cancers?|lesions?)\s+(are\s+)?bilateral", t):
+        problems.append("claims tumor in both breasts")
     return problems
 
 

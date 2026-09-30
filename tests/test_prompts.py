@@ -74,3 +74,13 @@ def test_selection_top_k():
     assert len(chosen) == 2 and status in ("strict", "relaxed")
     assert all("Siemens" not in c.text for c in chosen)
     assert 0 <= jaccard_distance(ref, GOOD) <= 1
+
+
+def test_bilateral_scan_is_not_bilateral_tumor():
+    ok = GOOD  # "Bilateral axial ... DCE-MRI" = both breasts imaged
+    assert "claims tumor in both breasts" not in check_facts(ok, F)
+    bad = GOOD.replace("Please delineate the enhancing primary tumor.",
+                       "Segment the enhancing breast tumor in both breasts.")
+    assert "claims tumor in both breasts" in check_facts(bad, F)
+    bad2 = GOOD.replace("triple-negative carcinoma", "triple-negative bilateral breast cancer")
+    assert "claims tumor in both breasts" in check_facts(bad2, F)
