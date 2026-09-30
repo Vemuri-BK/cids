@@ -12,3 +12,8 @@ transformers>=4.44
 bitsandbytes
 sentence-transformers
 accelerate
+# SAM-Med3D model definition
+medim
+einops
+appdirs
+huggingface_hub
