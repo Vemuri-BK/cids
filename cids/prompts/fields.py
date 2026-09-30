@@ -23,6 +23,7 @@ EXCLUDED_FIELDS = {
     "days_to_metastasis": "follow-up outcome",
     "days_to_death": "follow-up outcome",
     "multifocal_cancer": "partly derived from the segmentation itself - leakage risk",
+    "bilateral_breast_cancer": "only 30 patients; expert masks label only the primary tumor (one breast), so the contralateral cancer is background - flag these cases at evaluation",
     "breast_density": "96% missing - not usable as a prompt field",
     "oncotype_score": "99% missing",
     "nottingham_grade": "87% missing",
