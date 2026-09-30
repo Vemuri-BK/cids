@@ -21,6 +21,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cids.prompts import (COUNTERFACTUAL_KINDS, EXCLUDED_FIELDS,  # noqa: E402
                           counterfactual_fields, normalize_row, structured_prompt)
+from cids.prompts.guide import write_guide_sheet  # noqa: E402
 
 N_NARRATIVES = 3
 SEED = 42
@@ -131,6 +132,8 @@ def write_excel(out: pd.DataFrame, fd: pd.DataFrame, sm: pd.DataFrame, path: Pat
                     for cell in ws[letter][1:]:
                         cell.alignment = Alignment(wrap_text=True, vertical="top")
             ws.auto_filter.ref = ws.dimensions
+        write_guide_sheet(xw, out)
+        xw.book.active = 0
 
 
 def main() -> None:
