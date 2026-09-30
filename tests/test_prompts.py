@@ -84,3 +84,19 @@ def test_bilateral_scan_is_not_bilateral_tumor():
     assert "claims tumor in both breasts" in check_facts(bad, F)
     bad2 = GOOD.replace("triple-negative carcinoma", "triple-negative bilateral breast cancer")
     assert "claims tumor in both breasts" in check_facts(bad2, F)
+
+
+def test_phase_count_as_int_and_word():
+    f = dict(F, num_phases=4)                       # int, as read from CSV
+    assert check_facts(GOOD, f) == []               # GOOD says "four dynamic phases"
+    assert check_facts(GOOD.replace("four", "4"), f) == []
+    assert any("num_phases" in p for p in check_facts(GOOD.replace("four", "five"), f))
+
+
+def test_age_phrasing_variants():
+    young = dict(F, age_bin="under 35", menopause="pre-menopausal")
+    txt = GOOD.replace("aged 35-45", "under the age of 35")
+    assert not any("age_bin" in p for p in check_facts(txt, young))
+    old = dict(F, age_bin="over 65")
+    assert not any("age_bin" in p for p in check_facts(GOOD.replace("aged 35-45", "over the age of 65"), old))
+    assert any("age_bin" in p for p in check_facts(GOOD.replace("aged 35-45", "34-year-old"), young))

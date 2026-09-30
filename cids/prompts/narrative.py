@@ -48,10 +48,11 @@ def build_user_message(instruction: str, f: Dict[str, str]) -> str:
 # Fact-preservation check
 # ---------------------------------------------------------------------------
 def _age_patterns(v: str) -> List[str]:
+    age_of = r"(the\s+age\s+of\s+)?"
     if v == "under 35":
-        return [r"under\s*35", r"below\s*35", r"younger than\s*35", r"<\s*35", r"less than\s*35"]
+        return [rf"(under|below|younger than|less than)\s+{age_of}35", r"<\s*35"]
     if v == "over 65":
-        return [r"over\s*65", r"above\s*65", r"older than\s*65", r">\s*65", r"more than\s*65", r"65\s*(\+|or older|and older)"]
+        return [rf"(over|above|older than|more than)\s+{age_of}65", r">\s*65", r"65\s*(\+|or older|and older)"]
     lo, hi = v.split("-")
     return [rf"{lo}\s*(-|–|—|to|and)\s*{hi}"]
 
@@ -111,6 +112,7 @@ def _any(patterns: Sequence[str], text: str) -> bool:
 def check_facts(text: str, f: Dict[str, str]) -> List[str]:
     """Return a list of problems (empty list = all facts preserved, none contradicted)."""
     t = text.lower()
+    f = {k: str(v) for k, v in f.items()}
     problems: List[str] = []
 
     # age
@@ -118,7 +120,9 @@ def check_facts(text: str, f: Dict[str, str]) -> List[str]:
         problems.append(f"missing age_bin={f['age_bin']}")
 
     # phases
-    n = f.get("num_phases", UNKNOWN)
+    n = str(f.get("num_phases", UNKNOWN))   # may arrive as int from a CSV
+    if n.endswith(".0"):
+        n = n[:-2]
     if n != UNKNOWN and not _any([rf"\b{n}\b", rf"\b{NUM_WORDS.get(n, n)}\b"], t):
         problems.append(f"missing num_phases={n}")
 
