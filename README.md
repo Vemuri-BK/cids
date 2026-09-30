@@ -10,7 +10,7 @@ Frequency-prompted SAM-Med3D council for 3D breast DCE-MRI tumor segmentation (M
 ## Workflow
 
 ```
-VS Code (this folder)  --git push-->  GitHub (private repo)  --git clone-->  Kaggle notebook (GPU)
+VS Code (this folder)  --git push-->  GitHub Vemuri-BK/cids (public)  --git clone-->  Kaggle notebook (GPU)
 data never goes to GitHub; it reaches Kaggle as Kaggle datasets
 ```
 
@@ -53,7 +53,7 @@ Field dropout (fields → "unknown") is applied at training time, not stored in 
 ## Step 2 — narratives (Kaggle GPU)
 
 Upload `data/prompts/cids_prompts.csv` in the `cids-assets` dataset, open
-`notebooks/00_generate_narratives.ipynb` on Kaggle (GPU T4, Internet ON), run all.
+`notebooks/00_generate_narratives.ipynb` on Kaggle (GPU T4, Internet ON), optionally pin EXPECTED_GIT_COMMIT, run all.
 Download `cids_prompts_final.csv`, then:
 
 ```bash

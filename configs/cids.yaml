@@ -1,7 +1,7 @@
 # CIDS configuration (paths are Kaggle defaults; override locally)
 data:
-  cache_root: ""                 # auto-detect: the FADC 2-channel cache under /kaggle/input
-  prompts_csv: ""                # auto-detect: cids_prompts.csv under /kaggle/input
+  cache_root: /kaggle/input/datasets/bharathkumarvemuri/mama-mia-preprocessed-cache-2ch   # FADC 2-channel cache
+  prompts_csv: /kaggle/input/datasets/bharathkumarvemuri/cids-assets/cids_prompts.csv
   channels: {pre: 0, post1: 1}   # cache layout; subtraction = post1 - pre (approximate: channels normalized separately)
   sam_input: subtraction         # subtraction | post1  (early ablation)
   crop_size: [128, 128, 128]     # SAM-Med3D input
