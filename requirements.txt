@@ -1,0 +1,14 @@
+# core
+numpy
+pandas>=2.0
+openpyxl
+pyyaml
+pytest
+# models (Kaggle already has torch/transformers/monai-compatible versions)
+torch
+monai
+transformers>=4.44
+# narrative generation (Kaggle)
+bitsandbytes
+sentence-transformers
+accelerate

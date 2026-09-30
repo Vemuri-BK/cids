@@ -1,0 +1,35 @@
+# CIDS configuration (paths are Kaggle defaults; override locally)
+data:
+  cache_root: ""                 # auto-detect: the FADC 2-channel cache under /kaggle/input
+  prompts_csv: ""                # auto-detect: cids_prompts.csv under /kaggle/input
+  channels: {pre: 0, post1: 1}   # cache layout; subtraction = post1 - pre (approximate: channels normalized separately)
+  sam_input: subtraction         # subtraction | post1  (early ablation)
+  crop_size: [128, 128, 128]     # SAM-Med3D input
+  spacing_mm: 1.0
+
+prompts:
+  type: S                        # S | N | SN   (experiments E1/E2/E3)
+  column_S: prompt_S
+  columns_N: [narrative_1, narrative_2, narrative_3]
+  field_dropout: 0.3
+  text_encoder: emilyalsentzer/Bio_ClinicalBERT
+  text_dim: 256
+
+frequency:
+  wavelet: haar
+  stem_channels: 32
+  shrink_bands: [LHH, HLH, HHL, HHH]
+  boundary_shell_hhh: true
+
+council:
+  member_b: segresnet
+  peer_tau: 0.3
+  lambda_peer_max: 0.5
+  lambda_band: 0.1
+  lambda_jury: 0.1
+  band_weights: {single_H: 1.0, double_H: 0.5, HHH: 0.25}
+
+train:
+  seed: 42
+  amp: true
+  batch_size: 2

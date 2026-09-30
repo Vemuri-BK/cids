@@ -1,0 +1,27 @@
+# data never goes to GitHub (it reaches Kaggle as Kaggle datasets)
+data/**
+!data/**/
+!data/**/.gitkeep
+*.npz
+*.nii
+*.nii.gz
+*.pt
+*.pth
+*.ckpt
+outputs/
+runs/
+narratives/
+wandb/
+
+# python / editors
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+.vscode/settings.json
+*.egg-info/
+.DS_Store
+Thumbs.db
+~$*.xlsx
