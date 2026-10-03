@@ -24,3 +24,8 @@ DCE-MRI tumour segmentation on MAMA-MIA. Target: IEEE JBHI / TMI.
 - Expert masks label only the primary tumour (one breast); 30 bilateral-cancer patients are flagged at evaluation.
 - Narrative filters live in `cids/prompts/narrative.py`; if they change, re-run `scripts/refilter_narratives.py` (no GPU).
 - Run `pytest -q` before committing.
+
+## Git from Claude sessions
+- Claude may commit (author Vemuri-BK) but must first get delete permission for this folder,
+  so git can remove its own lock files (.git/index.lock, HEAD.lock). If locks are left behind,
+  remove them before the next git command. vbk also commits/pushes from VS Code; pushing is done by vbk.
