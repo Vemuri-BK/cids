@@ -52,9 +52,12 @@ def find_emb_root(explicit: str = "", search_root: str = "/kaggle/input") -> Pat
     if explicit:
         return Path(explicit)
     hits = sorted({p.parent for p in Path(search_root).rglob("index.csv")
-                   if (p.parent / "train").is_dir() and (p.parent / "test").is_dir()})
-    if len(hits) != 1:
-        raise FileNotFoundError(f"Set --emb_root explicitly; candidates: {hits}")
+                   if (p.parent / "train").is_dir() and (p.parent / "test").is_dir()
+                   and next((p.parent / "test").glob("*.npz"), None)}, key=lambda h: (len(h.parts), str(h)))
+    if not hits:
+        raise FileNotFoundError(f"no embedding folder (index.csv + train/ + test/) under {search_root}; set --emb_root")
+    if len(hits) > 1:
+        print(f"[note] several embedding folders found, using {hits[0]}; others: {hits[1:]}")
     return hits[0]
 
 
