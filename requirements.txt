@@ -17,3 +17,4 @@ medim
 einops
 appdirs
 huggingface_hub
+scipy

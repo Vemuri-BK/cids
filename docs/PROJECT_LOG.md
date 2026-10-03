@@ -17,7 +17,7 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | S0: SAM-Med3D embeddings + zero-shot baseline | ✅ run done | `data/sam_emb/` unzipped + verified (1200 train, 306 test, sizes match zip); Kaggle dataset `cids-sam-emb` pending |
 | Fixed split train 1080 / val 120 / test 306 (+ LOCO columns) | ✅ done | `configs/splits.csv` |
 | Upload final `cids_prompts.csv` to Kaggle `cids-assets` | ⏳ todo | new dataset version |
-| S1: SegResNet + text (council member B) | ⏳ next | — |
+| S1: SegResNet + text (council member B) | 🛠 code ready, tested | `notebooks/02_s1_segresnet.ipynb` (Exp 1 img / Exp 2 txt) |
 | Baselines (SegResNet, nnU-Net ref., SAM-Med3D FT) | ⏳ | — |
 | S2: FIPG + SAM decoder LoRA (member A) | ⏳ | needs `cids-sam-emb` |
 | S3: council + dual supervision | ⏳ | — |
@@ -37,6 +37,12 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 
 ### Analysis
 - Zero-shot SAM-Med3D Dice by tumour volume quartile (1 click): 0.36 (<5.3 ml) · 0.51 · 0.57 · 0.62 (>27 ml); 5 clicks 0.50 → 0.67. Only 3.9% of cases < 0.1 Dice, 8.8% > 0.8 → SAM finds the tumour but boundaries/small tumours are poor (32³ decoder output ≈ 6 mm voxels).
+
+### S1 code (2026-10-03)
+- `TextSegResNet` (MONAI SegResNet 4.70M; +FiLM 4.86M) — FiLM at bottleneck + each decoder stage, zero-init (text model == image model at step 0; verified: identical epoch-1 loss).
+- Input 3 ch [pre, post1, post1−pre] at 1 mm; 96³ patches ×4/patient (⅔ tumour-centred), flips + intensity jitter; DiceCE; AdamW 2e-4, cosine, 60 epochs, AMP; val Dice every 5 epochs (sliding window overlap 0.25) → best.pt; test once (overlap 0.5) → Dice/HD95/NSD@2mm per case + saved masks. Resumable, 10 h time budget.
+- Text: BioClinicalBERT mean-pooled (frozen), `prompt_S` with 30% field dropout at train time; full prompt at val/test. `--prompt_mode N/SN` ready for E2/E3.
+- Tested: 23 unit tests; end-to-end on 3 real cases (CPU) for img and txt paths, resume, outputs.
 
 ### Next
 - ✅ Unzipped `data/sam_emb.zip` (Explorer *Extract all*, <1 min); file sets match `configs/splits.csv`, all 1506 sizes match the zip, sampled arrays finite. Upload final `cids_prompts.csv` to `cids-assets`; create `cids-sam-emb`; `git push`.

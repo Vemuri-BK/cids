@@ -35,6 +35,14 @@ scripts/update_excel.py      put Kaggle narratives back into the Excel sheet
 notebooks/00_generate_narratives.ipynb   Kaggle notebook for the step above
 scripts/s0_sam_embeddings.py   S0 embedding cache + zero-shot baseline
 notebooks/01_s0_sam_embeddings.ipynb   Kaggle notebook for S0
+cids/models/segresnet_text.py SegResNet + FiLM text conditioning (zero-init)
+cids/text/encoder.py         frozen BioClinicalBERT sentence encoder
+cids/eval/metrics.py         3D Dice / HD95 / NSD
+cids/data/volumes.py         1 mm volumes, patch sampling, augmentation
+cids/prompts/sampling.py     prompt choice + field dropout at train time
+scripts/make_splits.py       train/val/test + LOCO split -> configs/splits.csv
+scripts/s1_train_segresnet.py  S1 training / validation / test
+notebooks/02_s1_segresnet.ipynb  Kaggle notebook for S1
 tests/                       pytest
 ```
 
@@ -71,6 +79,14 @@ For every case: 1 mm -> 1.5 mm, 128^3 crops (train 1 centred + 3 jittered, test 
 two SAM inputs (`subtraction` = post1 - pre, `post1`), frozen SAM-Med3D-turbo encoder -> 384x8^3 fp16.
 Writes `sam_emb/{train,test}/<cache_id>.npz`, `index.csv`, and `zero_shot_clicks.csv`
 (SAM-Med3D zero-shot, 1-5 GT-sampled clicks, official protocol) -> save output as Kaggle dataset `cids-sam-emb`.
+
+## Step 4 — S1: SegResNet, council member B (Kaggle GPU)
+
+`notebooks/02_s1_segresnet.ipynb` — set `EXPERIMENT='img'` (Exp 1, image only) or `'txt'`
+(Exp 2, + clinical instruction via BioClinicalBERT → FiLM, 30% field dropout); run both in parallel
+on two Kaggle accounts. Inputs: 2-channel cache + `cids-assets`. Split `configs/splits.csv`
+(train 1080 / val 120 / test 306). 96³ patches ×4 per patient, DiceCE, AdamW + cosine, AMP; best epoch on
+val Dice; test once → `test_metrics.csv` (Dice/HD95/NSD per case), `test_pred/` masks. Resumable; time budget.
 
 ## Tests
 
