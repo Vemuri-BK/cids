@@ -17,12 +17,33 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | S0: SAM-Med3D embeddings + zero-shot baseline | ✅ run done | `data/sam_emb/` unzipped + verified (1200 train, 306 test, sizes match zip); Kaggle dataset `cids-sam-emb` pending |
 | Fixed split train 1080 / val 120 / test 306 (+ LOCO columns) | ✅ done | `configs/splits.csv` |
 | Upload final `cids_prompts.csv` to Kaggle `cids-assets` | ⏳ todo | new dataset version |
-| S1: SegResNet + text (council member B) | 🛠 code ready, tested | `notebooks/02_s1_segresnet.ipynb` (Exp 1 img / Exp 2 txt) |
+| S1: SegResNet + text (council member B) | 🏃 full runs on Kaggle (img + txt, Draft Sessions) | `notebooks/02_s1_segresnet.ipynb`; val Dice @10: img 0.528, txt 0.529 |
+| S2a: SAM-Med3D-turbo fine-tuned, image only (Exp 3 baseline, decoder LoRA) | 🛠 code ready, tested | `notebooks/03_s2a_sam_decoder.ipynb`; needs `cids-sam-emb` |
 | Baselines (SegResNet, nnU-Net ref., SAM-Med3D FT) | ⏳ | — |
 | S2: FIPG + SAM decoder LoRA (member A) | ⏳ | needs `cids-sam-emb` |
 | S3: council + dual supervision | ⏳ | — |
 | Experiments E0–E5, fairness, ablations | ⏳ | — |
 | Paper (IEEE JBHI / TMI) | ⏳ | — |
+
+---
+
+## Day 3 (evening) — 2026-10-03
+
+### S1 progress (Kaggle, two accounts, Draft Sessions — keep tabs open, Quick Save with output at the end)
+- img: ~7.7 min/epoch, val Dice 0.397 @5, 0.528 @10. txt: ~8.7 min/epoch, val 0.385 @5, 0.529 @10. Seed 42.
+
+### S2a — SAM-Med3D-turbo fine-tuned on images only (Exp 3 baseline, variant A)
+- Purpose: "just adapt SAM to MAMA-MIA" baseline that the full CIDS SAM branch (FIPG prompts) must beat.
+- Frozen encoder → S0 cached post1 embeddings; mask decoder LoRA r=8 α=16 on 14 q/v projections = **71,424 trainable params** (incl. 768 box params). `--tune decoder_full` = 7.58M.
+- **Found:** turbo has no usable box prompt (prompt encoder has only 2 point embeddings, box path is 2D-only and would crash) → added 2 learnable 3D box-corner tokens (init = positive-point embedding). So zero-shot has no box row.
+- Train: 1080 × 4 cached crops (1 random per epoch), batch 8, AdamW 5e-4, cosine, 2 warm-up epochs, 60 epochs, AMP. Prompt per batch: jittered GT box (±5 vox, p=0.5) or random first click, then 0–4 corrective clicks (SAM-Med3D error-region rule), previous low-res mask fed back; loss BCE + soft Dice on 128³ upsampled logits, averaged over steps.
+- Val (120, centred crop): mean(Dice@1 click, @5 clicks, @box). Test (306): zero-shot and fine-tuned with the same seeded clicks; crop Dice (1.5 mm) steps 1–5 for click and box(+clicks); full-res Dice/HD95/NSD at 1 mm for click1, click5, box1.
+- Full-res check: GT crop pasted back to 1 mm gives Dice 0.941 / HD95 1.0 mm on duke_019 → resampling ceiling, reported as row `gt_crop_ceiling`.
+- Tested: 26 unit tests; end-to-end CPU run on real embeddings (duke_001/002/019) with random weights, resume, decoder_full. Turbo weights not downloadable from this sandbox → first real numbers come from the Kaggle smoke test (zero-shot click1 should be ~0.4–0.6).
+- Variant B (encoder LoRA, on-the-fly encoding) planned later, possibly on local A5000s.
+
+### Parked
+- FSSM-Net (Zhao et al., Inf. Sci. 2027): low-frequency-guided subband gating, learnable anti-aliasing before Haar, local-only HH path. Parked by vbk until CIDS architecture/results are fixed; possible later ablation (LLL+text gates). Must be cited as closest image-only frequency-gating work.
 
 ---
 

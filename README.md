@@ -43,6 +43,9 @@ cids/prompts/sampling.py     prompt choice + field dropout at train time
 scripts/make_splits.py       train/val/test + LOCO split -> configs/splits.csv
 scripts/s1_train_segresnet.py  S1 training / validation / test
 notebooks/02_s1_segresnet.ipynb  Kaggle notebook for S1
+cids/models/sam_lora.py      decoder LoRA, 3D box-corner tokens, batched click simulation
+scripts/s2a_sam_finetune.py  S2a: SAM-Med3D fine-tuned on images only (Exp 3 baseline)
+notebooks/03_s2a_sam_decoder.ipynb  Kaggle notebook for S2a
 tests/                       pytest
 ```
 
@@ -87,6 +90,15 @@ Writes `sam_emb/{train,test}/<cache_id>.npz`, `index.csv`, and `zero_shot_clicks
 on two Kaggle accounts. Inputs: 2-channel cache + `cids-assets`. Split `configs/splits.csv`
 (train 1080 / val 120 / test 306). 96³ patches ×4 per patient, DiceCE, AdamW + cosine, AMP; best epoch on
 val Dice; test once → `test_metrics.csv` (Dice/HD95/NSD per case), `test_pred/` masks. Resumable; time budget.
+
+## Step 5 — S2a: SAM-Med3D-turbo fine-tuned on images only (Exp 3 baseline, Kaggle GPU)
+
+`notebooks/03_s2a_sam_decoder.ipynb` — inputs `cids-sam-emb` + 2-channel cache; Internet ON.
+Frozen encoder (cached post1 embeddings), mask decoder adapted with LoRA r=8 on q/v (`TUNE='lora'`, ~71k params)
+or fully (`'decoder_full'`, 7.6M) + 2 learnable 3D box-corner tokens. Train prompts: jittered GT box (50%) or a
+random click, then up to 4 corrective clicks. Val score = mean(Dice@1 click, @5 clicks, @box) → best.pt.
+Test: zero-shot vs fine-tuned with identical seeded clicks → `test_crop_metrics.csv` (crop Dice, 1.5 mm, steps 1–5),
+`test_full_metrics.csv` (Dice/HD95/NSD at 1 mm; includes `gt_crop_ceiling` = resampling upper bound), `test_summary.json`.
 
 ## Tests
 
