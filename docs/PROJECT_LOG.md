@@ -15,6 +15,7 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | Narrative prompts (Type-N, Qwen2.5-7B) | ✅ done, re-filtered | 1506 × 3, 0 failing |
 | Held-out narratives (Phi-3.5-mini) | ✅ done, re-filtered | 306 × 3, 0 failing |
 | S0: SAM-Med3D embeddings + zero-shot baseline | ✅ run done | `data/sam_emb.zip` (local, not yet unzipped); Kaggle dataset `cids-sam-emb` pending |
+| Fixed split train 1080 / val 120 / test 306 (+ LOCO columns) | ✅ done | `configs/splits.csv` |
 | Upload final `cids_prompts.csv` to Kaggle `cids-assets` | ⏳ todo | new dataset version |
 | S1: SegResNet + text (council member B) | ⏳ next | — |
 | Baselines (SegResNet, nnU-Net ref., SAM-Med3D FT) | ⏳ | — |
@@ -22,6 +23,24 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | S3: council + dual supervision | ⏳ | — |
 | Experiments E0–E5, fairness, ablations | ⏳ | — |
 | Paper (IEEE JBHI / TMI) | ⏳ | — |
+
+---
+
+## Day 2–3 — 2026-10-02/03
+
+### Decisions
+- **Validation comes out of the official train set.** Official MAMA-MIA split = 1200 train / 306 **test** (file columns `train_split`, `test_split`; the FADC cache only *named* the folder `val/`). CIDS split: **train 1080 / val 120 (10% per collection, seed 42) / test 306** — test is used only for final numbers. `scripts/make_splits.py` → `configs/splits.csv` (deterministic; also `loco_<collection>` columns for leave-one-hospital-out).
+  - Val per collection: DUKE 20, ISPY1 10, ISPY2 85, NACT 5.
+  - Note for FADC: if its best epoch was chosen on the 306, those numbers are optimistic.
+- SAM-Med3D adaptation = frozen encoder (92.9M) + LoRA r=8 on the 14 q/v attention projections of the mask decoder (~70k params; decoder 7.6M). Ablation planned: LoRA vs full-decoder fine-tune; optional full fine-tune (encoder LoRA) on local A5000s.
+- Council member B confirmed: **SegResNet** (MONAI), text via FiLM + cross-attention, 3 input channels (pre, post1, subtraction), 1 mm.
+
+### Analysis
+- Zero-shot SAM-Med3D Dice by tumour volume quartile (1 click): 0.36 (<5.3 ml) · 0.51 · 0.57 · 0.62 (>27 ml); 5 clicks 0.50 → 0.67. Only 3.9% of cases < 0.1 Dice, 8.8% > 0.8 → SAM finds the tumour but boundaries/small tumours are poor (32³ decoder output ≈ 6 mm voxels).
+
+### Next
+- Unzip `data/sam_emb.zip` on Windows; upload final `cids_prompts.csv` to `cids-assets`; create `cids-sam-emb`; `git push`.
+- Write notebook 02 (S1): SegResNet without text (Exp 1) and with text (Exp 2), run in parallel on two Kaggle accounts.
 
 ---
 
