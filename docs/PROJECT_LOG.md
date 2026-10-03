@@ -14,7 +14,7 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | Structured prompts (Type-S) + counterfactuals | ✅ done | `data/prompts/cids_prompts.xlsx/.csv` |
 | Narrative prompts (Type-N, Qwen2.5-7B) | ✅ done, re-filtered | 1506 × 3, 0 failing |
 | Held-out narratives (Phi-3.5-mini) | ✅ done, re-filtered | 306 × 3, 0 failing |
-| S0: SAM-Med3D embeddings + zero-shot baseline | ✅ run done | `data/sam_emb.zip` (local, not yet unzipped); Kaggle dataset `cids-sam-emb` pending |
+| S0: SAM-Med3D embeddings + zero-shot baseline | ✅ run done | `data/sam_emb/` unzipped + verified (1200 train, 306 test, sizes match zip); Kaggle dataset `cids-sam-emb` pending |
 | Fixed split train 1080 / val 120 / test 306 (+ LOCO columns) | ✅ done | `configs/splits.csv` |
 | Upload final `cids_prompts.csv` to Kaggle `cids-assets` | ⏳ todo | new dataset version |
 | S1: SegResNet + text (council member B) | ⏳ next | — |
@@ -39,7 +39,7 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 - Zero-shot SAM-Med3D Dice by tumour volume quartile (1 click): 0.36 (<5.3 ml) · 0.51 · 0.57 · 0.62 (>27 ml); 5 clicks 0.50 → 0.67. Only 3.9% of cases < 0.1 Dice, 8.8% > 0.8 → SAM finds the tumour but boundaries/small tumours are poor (32³ decoder output ≈ 6 mm voxels).
 
 ### Next
-- Unzip `data/sam_emb.zip` on Windows; upload final `cids_prompts.csv` to `cids-assets`; create `cids-sam-emb`; `git push`.
+- ✅ Unzipped `data/sam_emb.zip` (Explorer *Extract all*, <1 min); file sets match `configs/splits.csv`, all 1506 sizes match the zip, sampled arrays finite. Upload final `cids_prompts.csv` to `cids-assets`; create `cids-sam-emb`; `git push`.
 - Write notebook 02 (S1): SegResNet without text (Exp 1) and with text (Exp 2), run in parallel on two Kaggle accounts.
 
 ---
