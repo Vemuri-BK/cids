@@ -113,10 +113,11 @@ def decode(model, box_mod: Optional[BoxCorners], emb: torch.Tensor,
     if boxes is not None:
         parts.append(box_mod(pe_, boxes))
     sparse = torch.cat(parts, 1) if parts else torch.empty(B, 0, pe_.embed_dim, device=emb.device)
-    if low_mask is not None:
-        dense = pe_._embed_masks(low_mask)
-    else:
-        dense = pe_.no_mask_embed.weight.reshape(1, -1, 1, 1, 1).expand(B, -1, *pe_.image_embedding_size)
+    if low_mask is None:
+        # SAM-Med3D(-turbo) always receives a mask prompt; on the first step it is all zeros
+        # (official inference + our S0). The 'no_mask_embed' path is untrained -> near-zero Dice.
+        low_mask = torch.zeros(B, 1, *[4 * s for s in pe_.image_embedding_size], device=emb.device, dtype=emb.dtype)
+    dense = pe_._embed_masks(low_mask)
     low, _ = model.mask_decoder(image_embeddings=emb, image_pe=pe_.get_dense_pe(),
                                 sparse_prompt_embeddings=sparse, dense_prompt_embeddings=dense,
                                 multimask_output=False)

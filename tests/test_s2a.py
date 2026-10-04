@@ -62,3 +62,15 @@ def test_click_rules():
     prev = gt.clone(); prev[0, 0:5, 0:5, 0:5] = True                    # false positive only -> negative there
     c, l = sample_clicks(prev, gt, g); i = c[0, 0].long()
     assert l.item() == 0 and (i < 5).all()
+
+
+def test_first_step_matches_official_zero_mask(sam):
+    """decode(low_mask=None) must equal the official path prompt_encoder(points, masks=zeros) used in S0."""
+    emb = torch.randn(1, 384, 8, 8, 8)
+    c = torch.tensor([[[60., 64., 70.]]]); l = torch.ones(1, 1, dtype=torch.long)
+    with torch.no_grad():
+        ours = decode(sam, None, emb, c, l, None, None)
+        sp, de = sam.prompt_encoder(points=[c, l], boxes=None, masks=torch.zeros(1, 1, 32, 32, 32))
+        ref, _ = sam.mask_decoder(image_embeddings=emb, image_pe=sam.prompt_encoder.get_dense_pe(),
+                                  sparse_prompt_embeddings=sp, dense_prompt_embeddings=de, multimask_output=False)
+    assert torch.allclose(ours, ref, atol=1e-5)
