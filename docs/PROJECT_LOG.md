@@ -14,16 +14,61 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | Structured prompts (Type-S) + counterfactuals | ✅ done | `data/prompts/cids_prompts.xlsx/.csv` |
 | Narrative prompts (Type-N, Qwen2.5-7B) | ✅ done, re-filtered | 1506 × 3, 0 failing |
 | Held-out narratives (Phi-3.5-mini) | ✅ done, re-filtered | 306 × 3, 0 failing |
-| S0: SAM-Med3D embeddings + zero-shot baseline | ✅ run done | `data/sam_emb/` unzipped + verified (1200 train, 306 test, sizes match zip); Kaggle dataset `cids-sam-emb` pending |
+| S0: SAM-Med3D embeddings + zero-shot baseline | ✅ done | `data/sam_emb/`; Kaggle dataset `kumarvemuri1/cids-sam-emb` (from sam_emb.zip) |
 | Fixed split train 1080 / val 120 / test 306 (+ LOCO columns) | ✅ done | `configs/splits.csv` |
 | Upload final `cids_prompts.csv` to Kaggle `cids-assets` | ⏳ todo | new dataset version |
-| S1: SegResNet + text (council member B) | 🏃 full runs on Kaggle (img + txt, Draft Sessions) | `notebooks/02_s1_segresnet.ipynb`; val Dice @10: img 0.528, txt 0.529 |
-| S2a: SAM-Med3D-turbo fine-tuned, image only (Exp 3 baseline, decoder LoRA) | 🛠 code ready, tested | `notebooks/03_s2a_sam_decoder.ipynb`; needs `cids-sam-emb` |
+| S1: SegResNet img (Exp 1) / + text FiLM (Exp 2) | ✅ done | test Dice after rel20: img 0.655, txt 0.650 (p=0.94); Day 4 |
+| S1 post-processing (connected components, rule chosen on val) | ✅ done (rel20) | `postproc_*` in s1_img / s1_txt outputs |
+| S2a: SAM-Med3D-turbo + decoder LoRA, image only (Exp 3) | ✅ done (oracle prompts) | test Dice box 0.708, click1 0.650, click5 0.717; zero-shot click1 0.520 |
+| Breast-region depth filter on S1 | 🛠 cell ready | not run yet |
+| SegResNet → SAM (automatic box, first council step) | ⏳ next | needs re-encoding crops at SegResNet boxes |
+| Text refiner diagnostic (4 arms, field tokens) | 💡 proposed | after SegResNet→SAM |
 | Baselines (SegResNet, nnU-Net ref., SAM-Med3D FT) | ⏳ | — |
 | S2: FIPG + SAM decoder LoRA (member A) | ⏳ | needs `cids-sam-emb` |
 | S3: council + dual supervision | ⏳ | — |
 | Experiments E0–E5, fairness, ablations | ⏳ | — |
 | Paper (IEEE JBHI / TMI) | ⏳ | — |
+
+---
+
+## Day 4 — 2026-10-04 (to 2026-10-05 morning)
+
+### S1 results (test 306, official split; seed 42; best epoch by val Dice)
+| Model | Dice raw | Dice rel20 | Dice median | HD95 median | NSD@2mm | missed <0.1 |
+|---|---|---|---|---|---|---|
+| SegResNet image (Exp 1), best val 0.693 @60 | 0.640 | **0.655 ± 0.250** | 0.740 | 16.0 mm (raw 67.6) | 0.681 | 15 |
+| SegResNet + text FiLM (Exp 2), best val 0.693 @60 | 0.634 | 0.650 ± 0.253 | 0.730 | 17.0 mm (raw 61.2) | 0.674 | 16 |
+- Text vs image: no overall difference (Dice p=0.94, NSD p=0.44, paired Wilcoxon). Per site (rel20 Dice img/txt): DUKE 0.490/0.512 (p=0.048), ISPY1 0.718/0.723, ISPY2 0.728/0.696 (p=0.011, only one surviving Bonferroni over 4 sites), NACT 0.727/0.741.
+- Why text via FiLM does not help (discussed): prompt has no spatial/boundary info, mostly visible in image, template sentences -> near-identical mean-pooled BERT vectors, FiLM is global, zero-init lets model ignore it.
+- Power cut during txt run: resumed from last.pt; epoch-45 val recomputed in a separate cell (0.634 < best 0.683, best.pt unchanged).
+- DUKE is the failure: Dice 0.49, HD95 ~150 mm, 48/91 cases still >2x over-segmented after post-processing (large connected false regions: heart, chest wall). Small tumours (<5 ml) Dice 0.47. Error types seen in figures: distant FPs (DUKE), under-segmented non-mass tumours (ISPY1), leakage into attached enhancing tissue (ISPY2).
+
+### Post-processing (connected-component analysis, 26-connectivity)
+- Rules raw / largest / rel20 (components >= 20% of largest) / min0.1ml; chosen on val (both models picked rel20); applied once to test. img: Dice 0.640->0.655, HD95 median 67.6->16.0 mm, p~1e-22; 7 new misses (small tumour beside larger false blob).
+- Breast-region filter (depth behind most anterior body point per axial slice; per-collection threshold = deepest training tumour + 15 mm): cell written and tested on duke_019; not run yet.
+- Visualisation cells: best/median/worst per collection; one-per-collection figure with legend (image | GT | pred | error slice | error all slices).
+
+### S2a — SAM-Med3D-turbo + decoder LoRA (71,424 params), image only (Exp 3)
+- Bug found by smoke test and fixed (6d8a3d5): first decoder step must get an all-zero mask prompt (as official/S0), not no_mask_embed -> step-1 Dice was 0.01. Stale last.pt from the buggy run was deleted before the clean run.
+- Training: 60 epochs x ~20 s; val score 0.683 @5 -> 0.719 @60 (click1 0.675, click5 0.745, box 0.739).
+- Test 306, full resolution 1 mm (ORACLE prompts: GT-centred crop, GT clicks/box):
+| | Dice | median | HD95 med | NSD | missed |
+|---|---|---|---|---|---|
+| zero-shot click1 | 0.520 | 0.561 | 9.0 | 0.439 | 12 |
+| zero-shot click5 | 0.618 | 0.653 | 6.0 | 0.576 | 6 |
+| fine-tuned click1 | 0.650 | 0.690 | 5.9 | 0.644 | 0 |
+| fine-tuned box | **0.708** | 0.741 | **4.4** | 0.729 | 0 |
+| fine-tuned click5 | 0.717 | 0.745 | 4.6 | 0.738 | 0 |
+| GT crop ceiling | 0.932 | | 1.0 | | |
+- Per site, box: DUKE 0.678 (SegResNet 0.490), ISPY1 0.715, ISPY2 0.720, NACT 0.747. Small tumours <5 ml: 0.651 vs SegResNet 0.474; >27 ml SegResNet better (0.782 vs 0.741).
+- Insight: DUKE/small-tumour failure is localisation, not segmentation -> council (SegResNet box -> SAM refine). Oracle numbers are an upper bound only.
+
+### Reviewed / parked
+- FSSM-Net (Inf. Sci. 2027) parked. External suggestion: frozen SegResNet + zero-init text cross-attention residual refiner -> keep as diagnostic with 4 arms (none / no-text / correct / shuffled text), 11 field tokens, hard negatives, judged after rel20 vs 0.655.
+
+### Next
+1. SegResNet -> SAM automatic pipeline (crop + box from SegResNet rel20 mask, re-encode, fine-tuned SAM box) vs 0.655.
+2. Breast-region filter run. 3. Text refiner diagnostic. 4. S2 FIPG (frequency + text prompts). 5. Council + dual supervision. 6. Final: 3 seeds, longer schedule on A5000s, LOCO, fairness.
 
 ---
 
