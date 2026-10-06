@@ -11,6 +11,8 @@ Rules compared (all fully automatic; chosen by validation Dice, applied once to 
   sam_rel20        SAM refinement of the rel20 components
   avg_rel20        mean of SegResNet and SAM probabilities on the rel20 components
   jury_t (t=0.3/0.5/0.7)  SAM on candidates whose agreement >= t (fallback: best-agreeing candidate)
+  segjury_t        the same jury, but keep the SegResNet mask of the accepted candidates
+  avgjury_t        the same jury, mean of SegResNet and SAM probabilities on the accepted candidates
 No ground truth is used for prompting anywhere.
 """
 from __future__ import annotations
@@ -39,7 +41,8 @@ from cids.models.segresnet_text import TextSegResNet  # noqa: E402
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 STRUCT = np.ones((3, 3, 3))
 JURY_T = (0.3, 0.5, 0.7)
-RULES = ["seg_rel20", "sam_rel20", "avg_rel20"] + [f"jury_{t}" for t in JURY_T]
+RULES = (["seg_rel20", "sam_rel20", "avg_rel20"] + [f"jury_{t}" for t in JURY_T]
+         + [f"segjury_{t}" for t in JURY_T] + [f"avgjury_{t}" for t in JURY_T])
 
 
 def find_file(name: str, explicit: str = "", root: str = "/kaggle/input") -> Path:
@@ -145,7 +148,11 @@ def predict_rules(sprob, refined, lab, cands):
     preds["avg_rel20"] = (0.5 * sprob * seg20 + 0.5 * sam20) > 0.5
     for t in JURY_T:
         ks = [d["k"] for d in refined if d["agree"] >= t] or [max(refined, key=lambda d: d["agree"])["k"]]
-        preds[f"jury_{t}"] = np.max([by_k[k]["prob"] for k in ks], 0) > 0.5
+        samk = np.max([by_k[k]["prob"] for k in ks], 0)
+        segk = np.isin(lab, ks)
+        preds[f"jury_{t}"] = samk > 0.5                                   # SAM masks of the kept candidates
+        preds[f"segjury_{t}"] = segk                                       # jury only filters SegResNet regions
+        preds[f"avgjury_{t}"] = (0.5 * sprob * segk + 0.5 * samk) > 0.5    # fuse both on kept candidates
     return preds
 
 
@@ -182,6 +189,7 @@ def main():
         return lst[:a.limit_eval] if a.limit_eval else lst
 
     def run(cases, desc, full, save_rule=None):
+        """full: set of rules that get HD95/NSD as well (Dice for every rule)."""
         rows, case_rows = [], []
         ds = VolumeDataset(cases, 96)
         for i in tqdm(range(len(ds)), desc=desc, unit="case", file=sys.stdout, dynamic_ncols=True, mininterval=10):
@@ -196,30 +204,34 @@ def main():
                                   agree=";".join(f"{d['agree']:.2f}" for d in refined),
                                   on_tumour=";".join(str(int(h)) for h in hit)))
             for r, p in preds.items():
-                m = all_metrics(p, gt) if full else dict(dice=dice(p, gt))
+                m = all_metrics(p, gt) if (full and r in full) else dict(dice=dice(p, gt))
                 rows.append(dict(cache_id=cid, collection=cid.split("_")[0].upper(), rule=r, **m))
             if save_rule:
                 np.savez_compressed(out / "test_pred" / f"{cid}.npz", mask=preds[save_rule].astype(np.uint8))
         return pd.DataFrame(rows), pd.DataFrame(case_rows)
 
     if a.skip_val:
-        best = a.rule or "jury_0.5"
+        best, top = a.rule or "jury_0.7", []
     else:
-        val, vc = run(items("val"), "val", False)
+        val, vc = run(items("val"), "val", None)
         val.to_csv(out / "val_metrics.csv", index=False); vc.to_csv(out / "val_cases.csv", index=False)
         vs = val.groupby("rule").dice.agg(["mean", "median"]).loc[RULES]
         best = vs["mean"].idxmax()
+        top = list(vs["mean"].sort_values(ascending=False).index[:3])
         print("\nVALIDATION (120) Dice:"); print(vs.round(4).to_string()); print("-> chosen rule:", best)
+    full = {"seg_rel20", "sam_rel20", best, *top}
 
-    te, tc = run(items("test"), "test", True, save_rule=best)
+    te, tc = run(items("test"), "test", full, save_rule=best)
     te.to_csv(out / "test_metrics.csv", index=False); tc.to_csv(out / "test_cases.csv", index=False)
-    agg = dict(dice=("dice", "mean"), dice_sd=("dice", "std"), dice_median=("dice", "median"),
-               hd95_median=("hd95", "median"), nsd=("nsd", "mean"), missed=("dice", lambda x: int((x < 0.1).sum())))
-    ts = te.groupby("rule").agg(**agg).loc[RULES]
+    te_full = te[te.rule.isin(full)]
+    ts = te.groupby("rule").dice.agg(["mean", "std", "median"]).loc[RULES].rename(
+        columns={"mean": "dice", "std": "dice_sd", "median": "dice_median"})
+    ts = ts.join(te_full.groupby("rule").agg(hd95_median=("hd95", "median"), nsd=("nsd", "mean")))
+    ts["missed"] = te.groupby("rule").dice.apply(lambda x: int((x < 0.1).sum()))
     print(f"\nTEST (306), all rules (chosen on val: {best}):"); print(ts.round(4).to_string())
     print("\nper collection Dice:"); print(te.pivot_table(index="collection", columns="rule", values="dice")[RULES].round(3).to_string())
-    print("\nper collection HD95 median:")
-    print(te.pivot_table(index="collection", columns="rule", values="hd95", aggfunc="median")[RULES].round(1).to_string())
+    print("\nper collection HD95 median (rules with full metrics):")
+    print(te_full.pivot_table(index="collection", columns="rule", values="hd95", aggfunc="median").round(1).to_string())
     print(f"\ncandidates per case: mean {tc.n_cand.mean():.2f}; a candidate lies on the tumour in "
           f"{tc.any_cand_on_tumour.mean():.1%} of test cases")
     json.dump({"chosen_rule_on_val": best, "test": ts.round(4).to_dict(orient="index"),
