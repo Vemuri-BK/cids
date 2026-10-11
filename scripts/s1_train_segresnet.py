@@ -38,6 +38,21 @@ from cids.prompts.sampling import pick_prompt  # noqa: E402
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def lr_factor(e: int, a) -> float:
+    """LR multiplier for 0-based epoch e. Main cycle: linear warm-up + cosine over --epochs.
+    With --restart_at R (extending a finished R-epoch run to --epochs): epochs < R follow the original
+    R-epoch cycle; from R on a new warm-up + cosine cycle peaks at --restart_lr and decays to 0."""
+    R = a.restart_at
+    if R and e >= R:
+        k, n, w = e - R, max(1, a.epochs - R), a.restart_warmup
+        f = (k + 1) / w if k < w else 0.5 * (1 + math.cos(math.pi * (k - w) / max(1, n - w)))
+        return f * a.restart_lr / a.lr
+    total = R if R else a.epochs
+    if e < a.warmup:
+        return (e + 1) / a.warmup
+    return 0.5 * (1 + math.cos(math.pi * (e - a.warmup) / max(1, total - a.warmup)))
+
+
 def _identity(x):
     return x
 
@@ -102,6 +117,11 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--wd", type=float, default=1e-5)
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--restart_at", type=int, default=0,
+                    help="extend a finished run: from this epoch on, a new warm-up + cosine cycle (SGDR-style "
+                         "warm restart) runs to --epochs. Use the epoch count of the finished run, e.g. 60")
+    ap.add_argument("--restart_lr", type=float, default=1e-4, help="peak LR of the restart cycle")
+    ap.add_argument("--restart_warmup", type=int, default=2)
     ap.add_argument("--val_every", type=int, default=5)
     ap.add_argument("--val_overlap", type=float, default=0.25, help="sliding-window overlap for validation (test uses 0.5)")
     ap.add_argument("--time_budget_h", type=float, default=10.0, help="stop training after this; test still runs")
@@ -147,9 +167,7 @@ def main():
     from monai.losses import DiceCELoss
     loss_fn = DiceCELoss(sigmoid=True, squared_pred=True, smooth_nr=1e-5, smooth_dr=1e-5)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda e: (e + 1) / a.warmup if e < a.warmup else
-        0.5 * (1 + math.cos(math.pi * (e - a.warmup) / max(1, a.epochs - a.warmup))))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda e: lr_factor(e, a))
     scaler = torch.amp.GradScaler(DEV, enabled=a.amp)
 
     start_epoch, best, log = 0, -1.0, []
@@ -164,7 +182,11 @@ def main():
         model.load_state_dict(s["model"]); opt.load_state_dict(s["opt"])
         sched.load_state_dict(s["sched"]); scaler.load_state_dict(s["scaler"])
         start_epoch, best, log = s["epoch"] + 1, s["best"], s["log"]
-        print(f"resumed at epoch {start_epoch}, best val Dice {best:.4f}")
+        # the optimizer stores the LR of the last finished epoch; recompute it from the (possibly
+        # extended) schedule so the first resumed epoch does not train at the old, near-zero LR
+        for g, b in zip(opt.param_groups, sched.base_lrs):
+            g["lr"] = b * lr_factor(start_epoch, a)
+        print(f"resumed at epoch {start_epoch}, best val Dice {best:.4f}, lr now {opt.param_groups[0]['lr']:.2e}")
 
     vol_loader = lambda cs: DataLoader(VolumeDataset(cs, a.patch), batch_size=None, num_workers=2,
                                        collate_fn=_identity, worker_init_fn=_worker_init)

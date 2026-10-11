@@ -66,3 +66,16 @@ def test_prompt_sampling_dropout():
     assert pick_prompt(row, "N", 0.0, random.Random(0)) in ("n1", "n2", "n3")
     txt = pick_prompt(row, "S", 1.0, random.Random(0))
     assert "unknown" in txt and "GE" not in txt and "35-45" not in txt
+
+
+def test_restart_schedule_extends_without_changing_first_cycle():
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location("s1", Path(__file__).resolve().parents[1] / "scripts/s1_train_segresnet.py")
+    s1 = importlib.util.module_from_spec(spec); spec.loader.exec_module(s1)
+    old = types.SimpleNamespace(epochs=60, warmup=3, restart_at=0, restart_lr=1e-4, restart_warmup=2, lr=2e-4)
+    new = types.SimpleNamespace(epochs=100, warmup=3, restart_at=60, restart_lr=1e-4, restart_warmup=2, lr=2e-4)
+    assert all(abs(s1.lr_factor(e, old) - s1.lr_factor(e, new)) < 1e-12 for e in range(60))   # epochs 1-60 unchanged
+    assert s1.lr_factor(59, new) < 0.01                                                        # old cycle ended near 0
+    assert abs(s1.lr_factor(61, new) * new.lr - 1e-4) < 1e-12                                  # restart peak
+    assert s1.lr_factor(99, new) < 0.01                                                        # decays to ~0 at 100
