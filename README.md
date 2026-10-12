@@ -49,6 +49,7 @@ notebooks/03_s2a_sam_decoder.ipynb  Kaggle notebook for S2a
 scripts/s3a_seg2sam.py       S3a: SegResNet -> SAM, fully automatic (candidates, box prompts, jury)
 notebooks/04_s3a_seg2sam.ipynb  Kaggle notebook for S3a
 notebooks/05_s2b_sam_realistic_boxes.ipynb  Kaggle notebook for S2b (realistic + negative boxes)
+notebooks/06_s3b_council_s2b.ipynb  Kaggle notebook for S3b (council with SegResNet-100 + S2b)
 tests/                       pytest
 ```
 
@@ -119,6 +120,15 @@ so SAM learns to handle SegResNet-like boxes and to answer "no tumour". Val scor
 messy-box Dice, negative rejection rate; rejection = output < 0.1 ml). 100 epochs from the original turbo weights.
 Test adds `messy` and `neg` prompts and evaluates the S2a checkpoint on the same boxes (`--compare_ckpt`, model `compare`).
 `RUN='s2a100'` re-trains S2a for 100 epochs with clean boxes (fair baseline).
+
+
+## Step 8 — S3b: council with SegResNet-100 + S2b (Kaggle GPU)
+
+`notebooks/06_s3b_council_s2b.ipynb` — same script as S3a (`scripts/s3a_seg2sam.py`) with the new checkpoints
+(`segresnet_img_e100_best.pt`, `sam_s2b_best.pt`; `RUN='s2a'` uses `sam_lora_best.pt` for the comparison).
+New rules `segkeep`/`samkeep` keep only candidates SAM did not reject (SAM output ≥ 0.1 ml). Also writes
+`val_candidates.csv` / `test_candidates.csv` (one row per candidate: size, SegResNet confidence, agreement, SAM volume,
+position, on-tumour) for the learned council, and reports how many false/true candidates SAM rejected.
 
 ## Tests
 

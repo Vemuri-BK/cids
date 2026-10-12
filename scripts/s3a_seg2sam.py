@@ -41,8 +41,10 @@ from cids.models.segresnet_text import TextSegResNet  # noqa: E402
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 STRUCT = np.ones((3, 3, 3))
 JURY_T = (0.3, 0.5, 0.7)
+REJECT_ML = 0.1                 # SAM output below this (in its crop) = "no tumour here" (S2b can say this)
 RULES = (["seg_rel20", "sam_rel20", "avg_rel20"] + [f"jury_{t}" for t in JURY_T]
-         + [f"segjury_{t}" for t in JURY_T] + [f"avgjury_{t}" for t in JURY_T])
+         + [f"segjury_{t}" for t in JURY_T] + [f"avgjury_{t}" for t in JURY_T]
+         + ["segkeep", "samkeep"])
 
 
 def find_file(name: str, explicit: str = "", root: str = "/kaggle/input") -> Path:
@@ -121,12 +123,13 @@ def sam_refine(sam, box_mod, img, lab, cands, amp):
     for j, (k, _) in enumerate(cands):
         p = prob[j]
         agree = dice((p > 0.5).numpy(), comp_crops[j])
+        sam_ml = float((p > 0.5).sum()) * 1.5 ** 3 / 1000
         vol = torch.zeros(tuple(int(s) for s in shape15))
         o = origins[j]; lo_ = np.maximum(o, 0); hi_ = np.minimum(o + SAM_SIZE, shape15)
         a, b = lo_ - o, hi_ - o
         vol[lo_[0]:hi_[0], lo_[1]:hi_[1], lo_[2]:hi_[2]] = p[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
         up = F.interpolate(vol[None, None], size=shape1, mode="trilinear", align_corners=False)[0, 0].numpy()
-        out.append(dict(k=k, prob=up, agree=float(agree)))
+        out.append(dict(k=k, prob=up, agree=float(agree), sam_ml=sam_ml))
     return out
 
 
@@ -153,6 +156,10 @@ def predict_rules(sprob, refined, lab, cands):
         preds[f"jury_{t}"] = samk > 0.5                                   # SAM masks of the kept candidates
         preds[f"segjury_{t}"] = segk                                       # jury only filters SegResNet regions
         preds[f"avgjury_{t}"] = (0.5 * sprob * segk + 0.5 * samk) > 0.5    # fuse both on kept candidates
+    # keep the candidates SAM did not reject (needs a checker trained with negative boxes, S2b)
+    ks = [d["k"] for d in refined if d["sam_ml"] >= REJECT_ML] or [max(refined, key=lambda d: d["agree"])["k"]]
+    preds["segkeep"] = np.isin(lab, ks)
+    preds["samkeep"] = np.max([by_k[k]["prob"] for k in ks], 0) > 0.5
     return preds
 
 
@@ -190,7 +197,7 @@ def main():
 
     def run(cases, desc, full, save_rule=None):
         """full: set of rules that get HD95/NSD as well (Dice for every rule)."""
-        rows, case_rows = [], []
+        rows, case_rows, cand_rows = [], [], []
         ds = VolumeDataset(cases, 96)
         for i in tqdm(range(len(ds)), desc=desc, unit="case", file=sys.stdout, dynamic_ncols=True, mininterval=10):
             item = ds[i]; cid = item["cid"]
@@ -202,27 +209,39 @@ def main():
             hit = [bool((lab == k)[gt].any()) for k, _ in cands]
             case_rows.append(dict(cache_id=cid, n_cand=len(cands), any_cand_on_tumour=any(hit),
                                   agree=";".join(f"{d['agree']:.2f}" for d in refined),
+                                  sam_ml=";".join(f"{d['sam_ml']:.2f}" for d in refined),
                                   on_tumour=";".join(str(int(h)) for h in hit)))
+            largest = max((s_ for _, s_ in cands), default=1)
+            for rank, ((k, size), d, h) in enumerate(zip(cands, refined, hit)):   # features for a learned council
+                comp = lab == k
+                ctr = np.argwhere(comp).mean(0) / np.array(comp.shape)
+                cand_rows.append(dict(cache_id=cid, rank=rank, seg_ml=size / 1000, rel_size=size / largest,
+                                      seg_prob_mean=float(sprob[comp].mean()), seg_prob_max=float(sprob[comp].max()),
+                                      agree=d["agree"], sam_ml=d["sam_ml"], cx=ctr[0], cy=ctr[1], cz=ctr[2],
+                                      n_cand=len(cands), on_tumour=int(h),
+                                      overlap_gt=float((comp & gt).sum() / max(comp.sum(), 1))))
             for r, p in preds.items():
                 m = all_metrics(p, gt) if (full and r in full) else dict(dice=dice(p, gt))
                 rows.append(dict(cache_id=cid, collection=cid.split("_")[0].upper(), rule=r, **m))
             if save_rule:
                 np.savez_compressed(out / "test_pred" / f"{cid}.npz", mask=preds[save_rule].astype(np.uint8))
-        return pd.DataFrame(rows), pd.DataFrame(case_rows)
+        return pd.DataFrame(rows), pd.DataFrame(case_rows), pd.DataFrame(cand_rows)
 
     if a.skip_val:
         best, top = a.rule or "jury_0.7", []
     else:
-        val, vc = run(items("val"), "val", None)
+        val, vc, vcand = run(items("val"), "val", None)
         val.to_csv(out / "val_metrics.csv", index=False); vc.to_csv(out / "val_cases.csv", index=False)
+        vcand.to_csv(out / "val_candidates.csv", index=False)
         vs = val.groupby("rule").dice.agg(["mean", "median"]).loc[RULES]
         best = vs["mean"].idxmax()
         top = list(vs["mean"].sort_values(ascending=False).index[:3])
         print("\nVALIDATION (120) Dice:"); print(vs.round(4).to_string()); print("-> chosen rule:", best)
     full = {"seg_rel20", "sam_rel20", best, *top}
 
-    te, tc = run(items("test"), "test", full, save_rule=best)
+    te, tc, tcand = run(items("test"), "test", full, save_rule=best)
     te.to_csv(out / "test_metrics.csv", index=False); tc.to_csv(out / "test_cases.csv", index=False)
+    tcand.to_csv(out / "test_candidates.csv", index=False)
     te_full = te[te.rule.isin(full)]
     ts = te.groupby("rule").dice.agg(["mean", "std", "median"]).loc[RULES].rename(
         columns={"mean": "dice", "std": "dice_sd", "median": "dice_median"})
@@ -234,7 +253,17 @@ def main():
     print(te_full.pivot_table(index="collection", columns="rule", values="hd95", aggfunc="median").round(1).to_string())
     print(f"\ncandidates per case: mean {tc.n_cand.mean():.2f}; a candidate lies on the tumour in "
           f"{tc.any_cand_on_tumour.mean():.1%} of test cases")
-    json.dump({"chosen_rule_on_val": best, "test": ts.round(4).to_dict(orient="index"),
+    if len(tcand):
+        rej = tcand.sam_ml < REJECT_ML
+        print(f"SAM rejected {rej[tcand.on_tumour == 0].mean():.1%} of false candidates and "
+              f"{rej[tcand.on_tumour == 1].mean():.1%} of true candidates (test)")
+    rej_stats = {}
+    if len(tcand):
+        rej = tcand.sam_ml < REJECT_ML
+        rej_stats = dict(false_candidates_rejected=float(rej[tcand.on_tumour == 0].mean()),
+                         true_candidates_rejected=float(rej[tcand.on_tumour == 1].mean()))
+    json.dump({"chosen_rule_on_val": best, "seg_ckpt": str(seg_ckpt), "sam_ckpt": str(sam_ckpt),
+               "sam_rejection": rej_stats, "test": ts.round(4).to_dict(orient="index"),
                "candidate_on_tumour_rate": float(tc.any_cand_on_tumour.mean()),
                "minutes": (time.time() - t0) / 60}, open(out / "summary.json", "w"), indent=2, default=float)
     print(f"total {(time.time() - t0) / 60:.1f} min")
