@@ -535,6 +535,9 @@ def main():
         if args.cand_root:
             tcand = load_cands(args.cand_root, "train", {c for c, _ in tr})
             vcand = load_cands(args.cand_root, "val", {c for c, _ in va})
+            if tcand is None or vcand is None or not len(tcand["false_idx"]):
+                raise SystemExit(f"--cand_root {args.cand_root}: no mined train/val candidates (or no false ones) "
+                                 f"-> run s2c_mine_candidates.py first (did it fail?)")
             if start_epoch == 1:                                    # epoch 0 = the starting model (S2b)
                 m = validate(model, box, val_data, args, vcand)
                 log.append(dict(epoch=0, **{f"val_{k}": v for k, v in m.items()}))

@@ -10,7 +10,8 @@ Per case:
                   -> frozen SAM-Med3D-turbo encoder -> embedding (384,8,8,8) fp16
   label: true  = the candidate touches the tumour   -> SAM target = tumour inside the crop
          false = no overlap with the tumour          -> SAM target = EMPTY mask ("no tumour here")
-Saved: <out>/<split>/<cache_id>.npz  emb (K,384,8,8,8) f16, box (K,2,3) i16, is_true (K,) bool,
+Saved: <out>/<split>/<cache_id>.npz  emb (K,384,8,8,8) f16, box (K,2,3) i16, origin (K,3) i16 (crop corner on the
+       1.5 mm grid: rebuild the SAM input with cids.fcouncil.sam_crops.sam_crop_from_case), is_true (K,) bool,
        gt_bits (K, 128^3/8) packed tumour crop, seg_ml (K,), seg_prob_mean (K,)
        <out>/<split>_index.csv   one row per candidate.
 GT is used only to LABEL candidates (true/false) for training and for measuring val/test, never for prompting.
@@ -60,7 +61,7 @@ def mine_case(seg, sam, item, path, thr, top_k, amp, overlap):
                          for j in range(0, len(cands), 4)])
     is_true = np.array([bool(gt[lab == k].any()) for k, _ in cands])
     return dict(emb=emb.float().cpu().numpy().astype(np.float16),
-                box=cc["boxes"].astype(np.int16), is_true=is_true,
+                box=cc["boxes"].astype(np.int16), origin=cc["origins"].astype(np.int16), is_true=is_true,
                 gt_bits=np.packbits(cc["gt"].reshape(len(cands), -1), axis=1),
                 seg_ml=np.array([s / 1000 for _, s in cands], np.float32),
                 seg_prob_mean=np.array([sprob[lab == k].mean() for k, _ in cands], np.float32))
@@ -106,7 +107,7 @@ def main():
             item = ds[i]
             d = mine_case(seg, sam, item, todo[i][1], thr, top_k, amp, 0.25 if split == "train" else 0.5)
             if d is None:                       # no candidate: empty marker so the case is not redone
-                d = dict(emb=np.zeros((0, 384, 8, 8, 8), np.float16), box=np.zeros((0, 2, 3), np.int16),
+                d = dict(emb=np.zeros((0, 384, 8, 8, 8), np.float16), box=np.zeros((0, 2, 3), np.int16), origin=np.zeros((0, 3), np.int16),
                          is_true=np.zeros(0, bool), gt_bits=np.zeros((0, 128 ** 3 // 8), np.uint8),
                          seg_ml=np.zeros(0, np.float32), seg_prob_mean=np.zeros(0, np.float32))
             np.savez_compressed(out / split / f"{item['cid']}.npz", **d)

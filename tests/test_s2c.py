@@ -38,6 +38,13 @@ def test_mining_labels_true_and_false_candidates(tmp_path, monkeypatch):
     assert d["emb"].shape == (2, 384, 8, 8, 8) and d["box"].shape == (2, 2, 3)
     assert sorted(d["is_true"].tolist()) == [False, True]
     t = int(np.flatnonzero(d["is_true"])[0])
+    from cids.data.cache import load_case                          # origin rebuilds the exact SAM input crop
+    from cids.fcouncil.sam_crops import sam_crop_from_case
+    img, lb = load_case(path)
+    lab, cands = s3.components(img[1] > 0.9)
+    ref = s3.candidate_crops(img, lab, cands, lb)
+    for j in range(2):
+        assert np.allclose(sam_crop_from_case(img, lb, d["origin"][j]), ref["crops"][j, 0], atol=1e-5)
     gt = np.unpackbits(d["gt_bits"][t], count=128 ** 3).reshape(128, 128, 128).astype(bool)
     lo, hi = d["box"][t].astype(int) + np.array([[-1], [2]])     # 1 voxel: nearest vs trilinear 1.5 mm grids
     inside = gt[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].sum()
