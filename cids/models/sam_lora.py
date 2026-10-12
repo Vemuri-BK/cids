@@ -78,6 +78,79 @@ def gt_boxes(gt: torch.Tensor, jitter: int = 0, gen: Optional[torch.Generator] =
     return out
 
 
+# ---------------------------------------------------------------------------- realistic boxes (S2b)
+def _uniform(rng, a, b):
+    return a + (b - a) * rng.random()
+
+
+def messy_box(g: torch.Tensor, rng, scale=(0.7, 1.8), shift=0.4, min_size=4, tries=10):
+    """A SegResNet-like box around the tumour in g (D,H,W bool): each axis scaled by U(scale) and its
+    centre shifted by up to +-shift x tumour size; must still contain >=1 tumour voxel.
+    Returns (2,3) float [min, max] or None if g is empty."""
+    idx = torch.nonzero(g)
+    if not len(idx):
+        return None
+    S = torch.tensor(g.shape, device=g.device, dtype=torch.float)
+    lo, hi = idx.min(0).values.float(), idx.max(0).values.float()
+    size, c = hi - lo + 1, (lo + hi) / 2
+    for _ in range(tries):
+        f = torch.tensor([_uniform(rng, *scale) for _ in range(3)], device=g.device)
+        sh = torch.tensor([_uniform(rng, -shift, shift) for _ in range(3)], device=g.device) * size
+        half = torch.clamp(size * f, min=min_size) / 2
+        a = torch.clamp(torch.round(c + sh - half), min=0)
+        b = torch.minimum(torch.round(c + sh + half), S - 1)
+        b = torch.maximum(b, torch.minimum(a + min_size - 1, S - 1))
+        a = torch.minimum(a, b - min_size + 1).clamp(min=0)
+        ai, bi = a.long(), b.long()
+        if g[ai[0]:bi[0] + 1, ai[1]:bi[1] + 1, ai[2]:bi[2] + 1].any():
+            return torch.stack([a, b])
+    return torch.stack([lo, hi])
+
+
+def negative_box(g: torch.Tensor, rng, size=(6, 40), margin=2, tries=30):
+    """A box of random size (voxels per side, 1.5 mm) placed where it holds no tumour voxel
+    (within `margin`). Returns (2,3) float or None if no such place was found."""
+    S = g.shape
+    for _ in range(tries):
+        s = [rng.randint(size[0], size[1]) for _ in range(3)]
+        a = [rng.randint(0, S[k] - s[k]) for k in range(3)]
+        lo = [max(0, a[k] - margin) for k in range(3)]
+        hi = [min(S[k], a[k] + s[k] + margin) for k in range(3)]
+        if not g[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].any():
+            return torch.tensor([a, [a[k] + s[k] - 1 for k in range(3)]], device=g.device, dtype=torch.float)
+    return None
+
+
+def realistic_boxes(gt: torch.Tensor, rng, p_messy=0.4, p_neg=0.2, jitter=5):
+    """S2b box prompts for a batch gt (B,D,H,W) bool. Per sample: negative (p_neg, box on tumour-free
+    tissue, target = empty), messy (p_messy, see messy_box) or clean (GT box +-jitter).
+    Returns boxes (B,2,3) float and neg (B,) bool; the training target is gt & ~neg."""
+    boxes, neg = [], []
+    S = torch.tensor(gt.shape[1:], device=gt.device, dtype=torch.float)
+    for g in gt:
+        u, b, is_neg = rng.random(), None, False
+        if u < p_neg or not g.any():
+            b = negative_box(g, rng)
+            is_neg = b is not None
+        if b is None and u < p_neg + p_messy:
+            b = messy_box(g, rng)
+        if b is None:                                            # clean: GT box +- jitter
+            idx = torch.nonzero(g)
+            if len(idx):
+                b = torch.stack([idx.min(0).values.float(), idx.max(0).values.float()])
+                if jitter:
+                    b = b + torch.tensor([[rng.randint(-jitter, jitter) for _ in range(3)] for _ in range(2)],
+                                         device=g.device, dtype=torch.float)
+                    b = torch.minimum(torch.clamp(b, min=0), S - 1)
+                    b[1] = torch.maximum(b[1], b[0])
+            else:                                                # empty crop and no free space: whole crop
+                b = torch.stack([torch.zeros(3, device=g.device), S - 1])
+                is_neg = True
+        boxes.append(b)
+        neg.append(is_neg)
+    return torch.stack(boxes), torch.tensor(neg, device=gt.device)
+
+
 # ---------------------------------------------------------------------------- clicks
 def _random_voxel(mask: torch.Tensor, gen: Optional[torch.Generator]) -> torch.Tensor:
     """mask (B, N) bool, every row non-empty -> (B,) flat index of a uniformly random True voxel."""

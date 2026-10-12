@@ -1,4 +1,10 @@
-"""S2a: SAM-Med3D-turbo fine-tuned on MAMA-MIA images only (Exp 3 baseline, variant A).
+"""S2a / S2b: SAM-Med3D-turbo fine-tuned on MAMA-MIA images only.
+
+S2a (--box_aug clean, default): box prompts are the GT box +-5 voxels.
+S2b (--box_aug realistic): box prompts look like SegResNet candidates -- clean (GT +- jitter), messy
+  (scaled 0.7-1.8x, shifted up to 40% of tumour size, may cover part of it) or negative (on tumour-free
+  tissue, target = EMPTY mask, so SAM learns to answer "no tumour here"). Validation score =
+  mean(clean-box Dice, messy-box Dice, negative-box rejection rate); rejection = predicted volume < 0.1 ml.
 
 Frozen image encoder -> cached post1 embeddings from S0 (`cids-sam-emb`); only the mask decoder
 is adapted (LoRA r=8 on q/v, ~70k params; or --tune decoder_full) + 2 learnable box-corner tokens.
@@ -39,12 +45,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cids.data.cache import find_cache_root, load_case  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.models.sam_lora import (BoxCorners, add_lora, decode, gt_boxes, interactive,  # noqa: E402
-                                  sample_clicks, upsample)
+                                  negative_box, messy_box, realistic_boxes, sample_clicks, upsample)
 from cids.models.sam_med3d import download_turbo, load_sam_med3d  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 VOX = 128 ** 3
-FULL_RES_PROMPTS = [("click", 1), ("click", 5), ("box", 1)]
+FULL_RES_PROMPTS = [("click", 1), ("click", 5), ("box", 1), ("messy", 1)]
+REJECT_VOX = 30                     # < 30 voxels at 1.5 mm (~0.1 ml, the candidate minimum) = "no tumour"
 
 
 # ---------------------------------------------------------------------------- data
@@ -159,16 +166,21 @@ def train_epoch(model, box, opt, scaler, data, args, epoch, step0, total_steps, 
             g["lr"] = lr_at(step0 + b, total_steps, args.warmup_steps, args.lr)
         coords = torch.zeros(len(idx), 0, 3, device=DEV)
         labels = torch.zeros(len(idx), 0, dtype=torch.long, device=DEV)
-        boxes = gt_boxes(gt, args.box_jitter, gen) if use_box else None
+        boxes, tgt = None, gt
+        if use_box and args.box_aug == "realistic":
+            boxes, neg = realistic_boxes(gt, rng, args.p_messy, args.p_neg, args.box_jitter)
+            tgt = gt & ~neg[:, None, None, None]                  # negative box -> empty target
+        elif use_box:
+            boxes = gt_boxes(gt, args.box_jitter, gen)
         prev, low, loss = torch.zeros_like(gt), None, 0.0
         with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
             for s in range(n_steps):
                 if not (use_box and s == 0):
-                    c, l = sample_clicks(prev, gt, gen)
+                    c, l = sample_clicks(prev, tgt, gen)
                     coords, labels = torch.cat([coords, c], 1), torch.cat([labels, l], 1)
                 low = decode(model, box, emb, coords, labels, boxes, None if low is None else low.detach())
                 logits = upsample(low)
-                loss = loss + seg_loss(logits, gt) / n_steps
+                loss = loss + seg_loss(logits, tgt) / n_steps
                 prev = (logits.detach()[:, 0] > 0)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -188,9 +200,25 @@ def batch_dice(prob, gt):
     return torch.where(s > 0, 2 * inter / s.clamp(min=1), torch.ones_like(s)).cpu().numpy()
 
 
+def eval_boxes(gt, seed):
+    """Fixed messy and negative boxes for evaluation (same seed -> same boxes for every model).
+    Returns messy (B,2,3), neg (B,2,3) and has_neg (B,) bool (False if no tumour-free place was found)."""
+    rng = random.Random(seed)
+    messy, neg, ok = [], [], []
+    for g in gt:
+        m = messy_box(g, rng)
+        n = negative_box(g, rng)
+        messy.append(m if m is not None else torch.stack([torch.zeros(3, device=g.device),
+                                                          torch.full((3,), 127., device=g.device)]))
+        ok.append(n is not None)
+        neg.append(n if n is not None else torch.zeros(2, 3, device=g.device))
+    return torch.stack(messy), torch.stack(neg), torch.tensor(ok)
+
+
 @torch.no_grad()
 def run_prompts(model, box, emb, gt, args, with_box=True, seed=233):
-    """Returns {('click'|'box', step): prob (B,128^3)} with seeded clicks (same for every model)."""
+    """Returns {('click'|'box'|'messy'|'neg', step): prob (B,128^3)} with seeded clicks/boxes
+    (same for every model). 'messy'/'neg' are single box prompts without clicks."""
     model.eval()
     out = {}
     with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
@@ -201,21 +229,41 @@ def run_prompts(model, box, emb, gt, args, with_box=True, seed=233):
             g = torch.Generator(device=DEV).manual_seed(seed)
             for k, p in enumerate(interactive(model, box, emb, gt, args.test_clicks, True, g), 1):
                 out[("box", k)] = p.float()
+            messy, neg, _ = eval_boxes(gt, seed)
+            for name, bx in (("messy", messy), ("neg", neg)):
+                low = decode(model, box, emb, None, None, bx, None)
+                out[(name, 1)] = torch.sigmoid(upsample(low.float()))[:, 0]
     return out
 
 
+def neg_stats(prob, gt, seed):
+    """Rejection (predicted < REJECT_VOX voxels) and predicted ml on the negative boxes; NaN where no
+    tumour-free box exists."""
+    _, _, ok = eval_boxes(gt, seed)
+    vox = (prob > 0.5).flatten(1).sum(1).float().cpu().numpy()
+    rej = np.where(ok.numpy(), (vox < REJECT_VOX).astype(float), np.nan)
+    ml = np.where(ok.numpy(), vox * 1.5 ** 3 / 1000, np.nan)
+    return rej, ml
+
+
 def validate(model, box, data, args):
-    res = {("click", 1): [], ("click", 5): [], ("box", 1): []}
+    res = {("click", 1): [], ("click", 5): [], ("box", 1): [], ("messy", 1): []}
+    rej = []
     for s in range(0, len(data), args.batch):
         chunk = data[s:s + args.batch]
         emb = torch.from_numpy(np.stack([c["emb"][0] for c in chunk])).to(DEV).float()
         gt = unpack([c["bits"][0] for c in chunk]).to(DEV)
         out = run_prompts(model, box, emb, gt, args, seed=233 + s)
         for key in res:
-            k = (key[0], min(key[1], args.test_clicks))
+            k = (key[0], min(key[1], args.test_clicks)) if key[0] == "click" else key
             res[key].extend(batch_dice(out[k], gt))
+        rej.extend(neg_stats(out[("neg", 1)], gt, 233 + s)[0])
     m = {f"{a}{b}": float(np.mean(v)) for (a, b), v in res.items()}
-    m["score"] = float(np.mean(list(m.values())))
+    m["neg_reject"] = float(np.nanmean(rej))
+    if args.box_aug == "realistic":
+        m["score"] = float(np.mean([m["box1"], m["messy1"], m["neg_reject"]]))
+    else:                                                       # S2a criterion, unchanged
+        m["score"] = float(np.mean([m["click1"], m["click5"], m["box1"]]))
     return m
 
 
@@ -243,6 +291,12 @@ def test(models, test_items, coll, args, cache_root, out):
         for name, (model, box, with_box) in models.items():
             outs = run_prompts(model, box, emb, gt, args, with_box=with_box, seed=233 + s)
             for (ptype, k), prob in outs.items():
+                if ptype == "neg":
+                    rej, ml = neg_stats(prob, gt, 233 + s)
+                    for c, r_, v in zip(chunk, rej, ml):
+                        crop_rows.append(dict(cache_id=c["cid"], collection=coll[c["cid"]], model=name,
+                                              prompt="neg", step=k, reject=r_, neg_pred_ml=v))
+                    continue
                 for c, d in zip(chunk, batch_dice(prob, gt)):
                     crop_rows.append(dict(cache_id=c["cid"], collection=coll[c["cid"]], model=name,
                                           prompt=ptype, step=k, dice=float(d)))
@@ -263,12 +317,19 @@ def test(models, test_items, coll, args, cache_root, out):
                                               prompt=f"{key[0]}{key[1]}", **m))
     cr = pd.DataFrame(crop_rows)
     cr.to_csv(out / "test_crop_metrics.csv", index=False)
-    summary = {"crop_dice_1.5mm": {}}
-    for (name, ptype), g in cr.groupby(["model", "prompt"]):
+    summary = {"crop_dice_1.5mm": {}, "negative_boxes": {}}
+    for name, g in cr[cr.prompt == "neg"].groupby("model"):
+        summary["negative_boxes"][name] = dict(reject_rate=round(float(g.reject.mean()), 4),
+                                               mean_pred_ml=round(float(g.neg_pred_ml.mean()), 3),
+                                               n=int(g.reject.notna().sum()))
+    print("\nNegative boxes (no tumour inside): rejection rate = output < 0.1 ml")
+    print(json.dumps(summary["negative_boxes"], indent=2))
+    cr_d = cr[cr.prompt != "neg"]
+    for (name, ptype), g in cr_d.groupby(["model", "prompt"]):
         summary["crop_dice_1.5mm"][f"{name}/{ptype}"] = {int(k): round(float(v), 4)
                                                          for k, v in g.groupby("step").dice.mean().items()}
     print("\nTest, crop-level Dice (1.5 mm, same seeded clicks for every model):")
-    print(cr.pivot_table(index="step", columns=["model", "prompt"], values="dice").round(4).to_string())
+    print(cr_d.pivot_table(index="step", columns=["model", "prompt"], values="dice").round(4).to_string())
     print("\n1 click, per collection:")
     print(cr[(cr.prompt == "click") & (cr.step == 1)].pivot_table(index="collection", columns="model",
                                                                   values="dice").round(4).to_string())
@@ -308,6 +369,10 @@ def main():
     ap.add_argument("--max_clicks", type=int, default=5)
     ap.add_argument("--p_box", type=float, default=0.5)
     ap.add_argument("--box_jitter", type=int, default=5, help="voxels at 1.5 mm")
+    ap.add_argument("--box_aug", choices=["clean", "realistic"], default="clean", help="S2a = clean, S2b = realistic")
+    ap.add_argument("--p_messy", type=float, default=0.4, help="share of box prompts that are messy (S2b)")
+    ap.add_argument("--p_neg", type=float, default=0.2, help="share of box prompts that are negative (S2b)")
+    ap.add_argument("--compare_ckpt", default="", help="best.pt of another run (same --tune/--r), tested as 'compare'")
     ap.add_argument("--test_clicks", type=int, default=5)
     ap.add_argument("--val_every", type=int, default=5)
     ap.add_argument("--time_budget_h", type=float, default=10.0)
@@ -387,7 +452,8 @@ def main():
                     best = m["score"]
                     torch.save(trainable_state(model, box), out / "best.pt")
                 print(f"epoch {epoch}: loss {loss:.4f} | val click1 {m['click1']:.4f} click5 {m['click5']:.4f} "
-                      f"box {m['box1']:.4f} | score {m['score']:.4f} (best {best:.4f})")
+                      f"box {m['box1']:.4f} messy {m['messy1']:.4f} neg_reject {m['neg_reject']:.3f} "
+                      f"| score {m['score']:.4f} (best {best:.4f})")
             else:
                 print(f"epoch {epoch}: loss {loss:.4f}")
             ep_times.append(time.time() - t0)
@@ -407,6 +473,12 @@ def main():
     st = torch.load(out / "best.pt", map_location=DEV, weights_only=False)
     model.mask_decoder.load_state_dict(st["mask_decoder"]); box.load_state_dict(st["box"])
     models = {"finetuned": (model, box, True)}
+    if args.compare_ckpt:
+        cm, cb, _ = build(args, ckpt)
+        cs = torch.load(args.compare_ckpt, map_location=DEV, weights_only=False)
+        cm.mask_decoder.load_state_dict(cs["mask_decoder"]); cb.load_state_dict(cs["box"])
+        models["compare"] = (cm, cb, True)
+        print("comparison model:", args.compare_ckpt)
     if not args.no_zero_shot:
         zs = load_sam_med3d(ckpt, DEV); zs.image_encoder = torch.nn.Identity()
         models = {"zero_shot": (zs, None, False), **models}            # turbo has no 3D box prompt

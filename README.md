@@ -48,6 +48,7 @@ scripts/s2a_sam_finetune.py  S2a: SAM-Med3D fine-tuned on images only (Exp 3 bas
 notebooks/03_s2a_sam_decoder.ipynb  Kaggle notebook for S2a
 scripts/s3a_seg2sam.py       S3a: SegResNet -> SAM, fully automatic (candidates, box prompts, jury)
 notebooks/04_s3a_seg2sam.ipynb  Kaggle notebook for S3a
+notebooks/05_s2b_sam_realistic_boxes.ipynb  Kaggle notebook for S2b (realistic + negative boxes)
 tests/                       pytest
 ```
 
@@ -108,6 +109,16 @@ Test: zero-shot vs fine-tuned with identical seeded clicks → `test_crop_metric
 `sam_lora_best.pt` = S2a best.pt); Internet ON. SegResNet candidates (components >= 0.1 ml, top 5) -> SAM crop + box per
 candidate -> rules seg_rel20 / sam_rel20 / avg_rel20 / jury_t (agreement = Dice(SAM, SegResNet candidate)); rule chosen on val,
 test once -> `test_metrics.csv`, `test_cases.csv`, `summary.json`, `test_pred/`. No ground truth is used for prompting.
+
+
+## Step 7 — S2b: SAM trained on realistic + negative boxes (Kaggle GPU)
+
+`notebooks/05_s2b_sam_realistic_boxes.ipynb` — same script as S2a with `--box_aug realistic`: box prompts are
+clean (GT ± 5 vox, 40%), messy (0.7–1.8× size, shifted ≤ 40%, 40%) or negative (tumour-free tissue, empty target, 20%),
+so SAM learns to handle SegResNet-like boxes and to answer "no tumour". Val score = mean(clean-box Dice,
+messy-box Dice, negative rejection rate; rejection = output < 0.1 ml). 100 epochs from the original turbo weights.
+Test adds `messy` and `neg` prompts and evaluates the S2a checkpoint on the same boxes (`--compare_ckpt`, model `compare`).
+`RUN='s2a100'` re-trains S2a for 100 epochs with clean boxes (fair baseline).
 
 ## Tests
 

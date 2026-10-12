@@ -74,3 +74,26 @@ def test_first_step_matches_official_zero_mask(sam):
         ref, _ = sam.mask_decoder(image_embeddings=emb, image_pe=sam.prompt_encoder.get_dense_pe(),
                                   sparse_prompt_embeddings=sp, dense_prompt_embeddings=de, multimask_output=False)
     assert torch.allclose(ours, ref, atol=1e-5)
+
+
+def test_realistic_boxes_messy_overlap_and_negatives_tumour_free():
+    import random
+    from cids.models.sam_lora import messy_box, negative_box, realistic_boxes
+    rng = random.Random(0)
+    gt = torch.zeros(4, 128, 128, 128, dtype=torch.bool)
+    gt[:, 50:70, 40:60, 60:75] = True
+    gt[3] = False                                               # empty crop -> must become a negative
+    for _ in range(50):
+        m = messy_box(gt[0], rng)
+        a, b = m[0].long(), m[1].long()
+        assert (m >= 0).all() and (m <= 127).all() and (b >= a).all()
+        assert gt[0, a[0]:b[0] + 1, a[1]:b[1] + 1, a[2]:b[2] + 1].any()
+        n = negative_box(gt[0], rng)
+        a, b = n[0].long(), n[1].long()
+        assert not gt[0, a[0]:b[0] + 1, a[1]:b[1] + 1, a[2]:b[2] + 1].any()
+    boxes, neg = realistic_boxes(gt, rng, p_messy=0.4, p_neg=0.2)
+    assert boxes.shape == (4, 2, 3) and bool(neg[3])
+    _, neg_all = realistic_boxes(gt[:3], random.Random(1), p_messy=0.0, p_neg=1.0)
+    assert neg_all.all()
+    _, neg_none = realistic_boxes(gt[:3], random.Random(1), p_messy=0.5, p_neg=0.0)
+    assert not neg_none.any()
