@@ -91,16 +91,17 @@ def components(mask, min_vox=100, top_k=5):
     return lab, [(k, float(size[k - 1])) for k in order]
 
 
-@torch.no_grad()
-def sam_refine(sam, box_mod, img, lab, cands, amp):
-    """Returns per candidate: SAM probability pasted into a 1 mm volume, and agreement with SegResNet."""
-    shape1 = lab.shape
-    img15, _ = resample(img, np.zeros(shape1, np.uint8))
+def candidate_crops(img, lab, cands, lbl=None):
+    """SAM input for every candidate: 128^3 post1 crop at 1.5 mm centred on the candidate + its box.
+    Shared by S3 (pipeline) and S2c (hard-negative mining), so both see exactly the same crops.
+    Returns dict(crops (K,1,128^3) f32, boxes (K,2,3), origins (K,3), comp (K,128^3) bool,
+    gt (K,128^3) bool or None, shape15)."""
+    img15, lbl15 = resample(img, np.zeros(lab.shape, np.uint8) if lbl is None else lbl)
     shape15 = img15.shape[1:]
     lab15 = F.interpolate(torch.from_numpy(lab.astype(np.float32))[None, None], size=shape15,
                           mode="nearest")[0, 0].numpy().astype(np.int32)
     post, fg = img15[1], (img15[1] > 0).astype(np.uint8)
-    crops, boxes, origins, comp_crops = [], [], [], []
+    crops, boxes, origins, comp, gts = [], [], [], [], []
     for k, _ in cands:
         idx = np.argwhere(lab15 == k)
         if len(idx) == 0:                           # component vanished at 1.5 mm: use 1 mm centre / 1.5
@@ -110,13 +111,27 @@ def sam_refine(sam, box_mod, img, lab, cands, amp):
         vc, origin = crop_pad(post, c)
         fc, _ = crop_pad(fg, c)
         crops.append(znorm(vc, fc)[None])
-        b = np.stack([np.clip(lo - origin, 0, SAM_SIZE - 1), np.clip(hi - origin, 0, SAM_SIZE - 1)])
-        boxes.append(b)
+        boxes.append(np.stack([np.clip(lo - origin, 0, SAM_SIZE - 1), np.clip(hi - origin, 0, SAM_SIZE - 1)]))
         origins.append(origin)
-        comp_crops.append(crop_pad((lab15 == k).astype(np.uint8), c)[0] > 0)
-    x = torch.from_numpy(np.stack(crops)).to(DEV)
+        comp.append(crop_pad((lab15 == k).astype(np.uint8), c)[0] > 0)
+        if lbl is not None:
+            gts.append(crop_pad(lbl15, c)[0] > 0)
+    return dict(crops=np.stack(crops), boxes=np.stack(boxes), origins=np.stack(origins), comp=np.stack(comp),
+                gt=np.stack(gts) if lbl is not None else None, shape15=shape15)
+
+
+@torch.no_grad()
+def sam_refine(sam, box_mod, img, lab, cands, amp, adapter=None):
+    """Returns per candidate: SAM probability pasted into a 1 mm volume, and agreement with SegResNet.
+    adapter (optional, S4 SamFreqAdapter): residual added to SAM's image embedding from the same crop."""
+    shape1 = lab.shape
+    cc = candidate_crops(img, lab, cands)
+    shape15, boxes, origins, comp_crops = cc["shape15"], cc["boxes"], cc["origins"], cc["comp"]
+    x = torch.from_numpy(cc["crops"]).to(DEV)
     with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
         emb = sam.image_encoder(x)
+        if adapter is not None:
+            emb = emb + adapter(x)
         low = decode(sam, box_mod, emb.float(), None, None, torch.from_numpy(np.stack(boxes)).float().to(DEV), None)
     prob = torch.sigmoid(upsample(low.float()))[:, 0].cpu()           # (K,128,128,128)
     out = []
