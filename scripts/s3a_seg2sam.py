@@ -139,12 +139,13 @@ def sam_refine(sam, box_mod, img, lab, cands, amp, adapter=None):
         p = prob[j]
         agree = dice((p > 0.5).numpy(), comp_crops[j])
         sam_ml = float((p > 0.5).sum()) * 1.5 ** 3 / 1000
+        sam_soft_ml = float(p.sum()) * 1.5 ** 3 / 1000                 # soft volume (threshold-free)
         vol = torch.zeros(tuple(int(s) for s in shape15))
         o = origins[j]; lo_ = np.maximum(o, 0); hi_ = np.minimum(o + SAM_SIZE, shape15)
         a, b = lo_ - o, hi_ - o
         vol[lo_[0]:hi_[0], lo_[1]:hi_[1], lo_[2]:hi_[2]] = p[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
         up = F.interpolate(vol[None, None], size=shape1, mode="trilinear", align_corners=False)[0, 0].numpy()
-        out.append(dict(k=k, prob=up, agree=float(agree), sam_ml=sam_ml))
+        out.append(dict(k=k, prob=up, agree=float(agree), sam_ml=sam_ml, sam_soft_ml=sam_soft_ml))
     return out
 
 

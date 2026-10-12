@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -66,3 +67,23 @@ def test_candidate_crops_same_as_pipeline_without_label(tmp_path):
     a = s3.candidate_crops(img, lab, cands)
     b = s3.candidate_crops(img, lab, cands, lbl)
     assert a["gt"] is None and np.array_equal(a["crops"], b["crops"]) and np.array_equal(a["boxes"], b["boxes"])
+
+
+def test_learned_jury_table_dice_equals_mask_dice():
+    import s3d_learned_jury as jury
+    from cids.eval.metrics import dice
+    rng = np.random.default_rng(0)
+    gt = np.zeros((40, 40, 40), bool); gt[5:15, 5:15, 5:15] = True
+    lab = np.zeros((40, 40, 40), np.int32)
+    lab[8:18, 8:18, 8:18] = 1; lab[25:30, 25:30, 25:30] = 2; lab[2:5, 30:35, 30:35] = 3
+    cands = [(k, float((lab == k).sum())) for k in (1, 2, 3)]
+    refined = [dict(k=k, agree=a, sam_ml=s, sam_soft_ml=s) for k, a, s in ((1, 0.8, 1.0), (2, 0.2, 0.0), (3, 0.75, 0.2))]
+    sprob = rng.random(gt.shape)
+    df = pd.DataFrame(jury.candidate_rows("duke_001", sprob, lab, cands, refined, gt))
+    assert df.on_tumour.tolist() == [1, 0, 0]
+    tab = jury.rule_tables(df, proba=np.array([0.9, 0.1, 0.6]))
+    assert np.isclose(tab["segjury_0.7"].iloc[0], dice(np.isin(lab, [1, 3]), gt))
+    assert np.isclose(tab["oracle"].iloc[0], dice(lab == 1, gt))
+    assert np.isclose(tab["seg_rel20"].iloc[0], dice(lab == 1, gt))     # 2 and 3 are < 20 % of the largest
+    assert np.isclose(tab["learned_t0.50"].iloc[0], dice(np.isin(lab, [1, 3]), gt))
+    assert np.isclose(tab["learned_t0.95"].iloc[0], dice(lab == 1, gt))             # none >= t -> most likely
