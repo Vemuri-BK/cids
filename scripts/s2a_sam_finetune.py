@@ -299,24 +299,41 @@ def neg_stats(prob, gt, seed):
     return rej, ml
 
 
+def auc(score, is_true):
+    """Area under the ROC curve: probability that a true candidate scores higher than a false one (ties 0.5).
+    1.0 = SAM's soft volume separates real tumours from SegResNet's false blobs perfectly, 0.5 = chance."""
+    pos, neg = np.asarray(score)[is_true], np.asarray(score)[~is_true]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    r = pd.Series(np.concatenate([pos, neg])).rank().to_numpy()
+    return float((r[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+
+
 @torch.no_grad()
-def cand_eval(model, box, cands, args):
+def cand_eval(model, box, cands, args, return_rows=False):
     """SAM on real SegResNet candidates (box only, as in the pipeline).
     hard_reject = share of FALSE candidates rejected (< REJECT_VOX = 0.1 ml); real_keep = share of TRUE
-    candidates kept; real_dice = Dice on true candidates (crop, 1.5 mm)."""
+    candidates kept; real_dice = Dice on true candidates (crop, 1.5 mm); auc = how well SAM's soft predicted
+    volume ranks true above false candidates (threshold-free: what a learned jury can use)."""
     model.eval()
-    vox, dsc = [], []
+    vox, soft, dsc = [], [], []
     for s in range(0, len(cands["cid"]), args.batch):
         idx = np.arange(s, min(s + args.batch, len(cands["cid"])))
         emb, bx, gt = cand_batch(cands, idx)
         with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
             prob = torch.sigmoid(upsample(decode(model, box, emb, None, None, bx, None).float()))[:, 0]
         vox.extend((prob > 0.5).flatten(1).sum(1).cpu().numpy()); dsc.extend(batch_dice(prob, gt))
-    vox, dsc, t = np.array(vox), np.array(dsc), cands["is_true"]
-    return dict(hard_reject=float((vox[~t] < REJECT_VOX).mean()) if (~t).any() else float("nan"),
-                real_keep=float((vox[t] >= REJECT_VOX).mean()) if t.any() else float("nan"),
-                real_dice=float(dsc[t].mean()) if t.any() else float("nan"),
-                hard_pred_ml=float(np.median(vox[~t]) * 1.5 ** 3 / 1000) if (~t).any() else float("nan"))
+        soft.extend(prob.flatten(1).sum(1).cpu().numpy())
+    vox, soft, dsc, t = np.array(vox), np.array(soft), np.array(dsc), cands["is_true"]
+    m = dict(hard_reject=float((vox[~t] < REJECT_VOX).mean()) if (~t).any() else float("nan"),
+             real_keep=float((vox[t] >= REJECT_VOX).mean()) if t.any() else float("nan"),
+             real_dice=float(dsc[t].mean()) if t.any() else float("nan"),
+             hard_pred_ml=float(np.median(vox[~t]) * 1.5 ** 3 / 1000) if (~t).any() else float("nan"),
+             auc=auc(soft, t))
+    if return_rows:
+        return m, pd.DataFrame(dict(cache_id=cands["cid"], is_true=t, sam_ml=vox * 1.5 ** 3 / 1000,
+                                    sam_soft_ml=soft * 1.5 ** 3 / 1000, dice=dsc))
+    return m
 
 
 def validate(model, box, data, args, vcands=None):
@@ -359,11 +376,14 @@ def full_res_metrics(prob_crop, origin, shape15, cache_path):
 
 def test(models, test_items, coll, args, cache_root, out, tcands=None):
     crop_rows, full_rows = [], []
-    real = {}
+    real, rows_all = {}, []
     if tcands is not None:
         for name, (model, box, with_box) in models.items():
             if with_box:
-                real[name] = {k: round(v, 4) for k, v in cand_eval(model, box, tcands, args).items()}
+                mres, rows = cand_eval(model, box, tcands, args, return_rows=True)
+                real[name] = {k: round(v, 4) for k, v in mres.items()}
+                rows.insert(0, "model", name); rows_all.append(rows)
+        pd.concat(rows_all).to_csv(out / "test_real_candidates.csv", index=False)
         print("\nTest, SegResNet's REAL candidates (pipeline setting): hard_reject = false candidates rejected, "
               "real_keep = true candidates kept")
         print(pd.DataFrame(real).T.to_string())
@@ -461,6 +481,8 @@ def main():
     ap.add_argument("--cand_root", default="", help="S2c: output of s2c_mine_candidates.py (train/ val/ test/)")
     ap.add_argument("--p_hard", type=float, default=0.25, help="S2c: share of batches = real false candidates")
     ap.add_argument("--p_realpos", type=float, default=0.10, help="S2c: share of batches = real true candidates")
+    ap.add_argument("--min_real_keep", type=float, default=0.95,
+                    help="S2c: an epoch can only be 'best' if it keeps >= this share of real tumours on val")
     ap.add_argument("--init_ckpt", default="", help="start from this best.pt (S2c: the S2b checkpoint)")
     ap.add_argument("--compare_ckpt", default="", help="best.pt of another run (same --tune/--r), tested as 'compare'")
     ap.add_argument("--test_clicks", type=int, default=5)
@@ -554,13 +576,15 @@ def main():
             if epoch % args.val_every == 0 or epoch == args.epochs:
                 m = validate(model, box, val_data, args, vcand)
                 row.update({f"val_{k}": v for k, v in m.items()})
-                if m["score"] > best:
-                    best = m["score"]
+                sel = m["score"] - (1.0 if m.get("real_keep", 1.0) < args.min_real_keep else 0.0)
+                m["select"] = sel
+                if sel > best:
+                    best = sel
                     torch.save(trainable_state(model, box), out / "best.pt")
                 print(f"epoch {epoch}: loss {loss:.4f} | val click1 {m['click1']:.4f} click5 {m['click5']:.4f} "
                       f"box {m['box1']:.4f} messy {m['messy1']:.4f} neg_reject {m['neg_reject']:.3f} "
                       + (f"| REAL hard_reject {m['hard_reject']:.3f} real_keep {m['real_keep']:.3f} "
-                         if 'hard_reject' in m else "")
+                         f"auc {m['auc']:.3f} " if 'hard_reject' in m else "")
                       + f"| score {m['score']:.4f} (best {best:.4f})")
             else:
                 print(f"epoch {epoch}: loss {loss:.4f}")
