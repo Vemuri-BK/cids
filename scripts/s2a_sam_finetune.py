@@ -6,6 +6,13 @@ S2b (--box_aug realistic): box prompts look like SegResNet candidates -- clean (
   tissue, target = EMPTY mask, so SAM learns to answer "no tumour here"). Validation score =
   mean(clean-box Dice, messy-box Dice, negative-box rejection rate); rejection = predicted volume < 0.1 ml.
 
+S2c (--cand_root, on top of S2b, usually --init_ckpt = S2b best.pt): adds SegResNet's REAL candidates
+  (scripts/s2c_mine_candidates.py). A share --p_hard of the batches are hard negatives: crop + box of a
+  candidate that does NOT touch the tumour, target = empty mask. A share --p_realpos are real true candidates
+  (target = tumour), so SAM does not start rejecting real tumours. Validation adds, on val's real candidates
+  (pipeline setting), hard_reject (false candidates rejected) and real_keep (true candidates kept);
+  score = mean(box1, messy1, hard_reject, real_keep). Test reports both for every model (S2b = 'compare').
+
 Frozen image encoder -> cached post1 embeddings from S0 (`cids-sam-emb`); only the mask decoder
 is adapted (LoRA r=8 on q/v, ~70k params; or --tune decoder_full) + 2 learnable box-corner tokens.
 No text, no frequency prompts.
@@ -102,6 +109,34 @@ def preload(items, crops, workers, desc):
     return [x for x in tqdm(dl, desc=desc, unit="case", file=sys.stdout, dynamic_ncols=True, mininterval=10)]
 
 
+def load_cands(root, split, keep_ids=None):
+    """Real SegResNet candidates of one split (s2c_mine_candidates.py) -> flat arrays (N candidates)."""
+    files = sorted(Path(root, split).glob("*.npz"))
+    if keep_ids is not None:
+        files = [f for f in files if f.stem in keep_ids]
+    emb, box, true, bits, cid = [], [], [], [], []
+    for f in tqdm(files, desc=f"load {split} candidates", unit="case", file=sys.stdout, mininterval=10):
+        d = np.load(f)
+        if len(d["is_true"]) == 0:
+            continue
+        emb.append(d["emb"]); box.append(d["box"].astype(np.float32)); true.append(d["is_true"])
+        bits.extend(list(d["gt_bits"])); cid.extend([f.stem] * len(d["is_true"]))
+    if not emb:
+        return None
+    c = dict(emb=np.concatenate(emb), box=np.concatenate(box), is_true=np.concatenate(true), bits=bits, cid=cid)
+    c["false_idx"], c["true_idx"] = np.flatnonzero(~c["is_true"]), np.flatnonzero(c["is_true"])
+    print(f"{split}: {len(c['cid'])} real candidates = {len(c['true_idx'])} true + {len(c['false_idx'])} false")
+    return c
+
+
+def cand_batch(cands, idx):
+    emb = torch.from_numpy(cands["emb"][idx]).to(DEV).float()
+    boxes = torch.from_numpy(cands["box"][idx]).to(DEV)
+    gt = unpack([cands["bits"][i] for i in idx]).to(DEV)
+    gt &= torch.from_numpy(cands["is_true"][idx]).to(DEV)[:, None, None, None]     # false candidate -> empty target
+    return emb, boxes, gt
+
+
 def unpack(bits_list) -> torch.Tensor:
     lab = np.unpackbits(np.stack(bits_list), axis=1, count=VOX).reshape(-1, 128, 128, 128)
     return torch.from_numpy(lab.astype(bool))
@@ -147,13 +182,13 @@ def lr_at(step, total, warm, base):
 
 
 # ---------------------------------------------------------------------------- train
-def train_epoch(model, box, opt, scaler, data, args, epoch, step0, total_steps, gen):
+def train_epoch(model, box, opt, scaler, data, args, epoch, step0, total_steps, gen, cands=None):
     model.train()
     rng = random.Random(args.seed * 1000 + epoch)
     order = list(range(len(data)))
     rng.shuffle(order)
     nb = len(order) // args.batch
-    losses = []
+    losses, kinds = [], {"gt": 0, "hard": 0, "realpos": 0}
     bar = tqdm(range(nb), desc=f"ep {epoch}", unit="it", file=sys.stdout, dynamic_ncols=True, mininterval=10)
     for b in bar:
         idx = order[b * args.batch:(b + 1) * args.batch]
@@ -164,6 +199,22 @@ def train_epoch(model, box, opt, scaler, data, args, epoch, step0, total_steps, 
         n_steps = rng.randint(1, args.max_clicks)
         for g in opt.param_groups:
             g["lr"] = lr_at(step0 + b, total_steps, args.warmup_steps, args.lr)
+        kind, r = "gt", rng.random()
+        if cands is not None:
+            if r < args.p_hard and len(cands["false_idx"]):
+                kind, pool = "hard", cands["false_idx"]
+            elif r < args.p_hard + args.p_realpos and len(cands["true_idx"]):
+                kind, pool = "realpos", cands["true_idx"]
+        if kind != "gt":                       # SegResNet's real box, one decoder pass, as in the pipeline
+            cidx = np.array([pool[rng.randrange(len(pool))] for _ in idx])
+            cemb, cbox, cgt = cand_batch(cands, cidx)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+                loss = seg_loss(upsample(decode(model, box, cemb, None, None, cbox, None)), cgt)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            losses.append(loss.item()); kinds[kind] += 1
+            continue
+        kinds["gt"] += 1
         coords = torch.zeros(len(idx), 0, 3, device=DEV)
         labels = torch.zeros(len(idx), 0, dtype=torch.long, device=DEV)
         boxes, tgt = None, gt
@@ -190,6 +241,8 @@ def train_epoch(model, box, opt, scaler, data, args, epoch, step0, total_steps, 
         if b % 20 == 0:
             bar.set_postfix(loss=f"{np.mean(losses[-20:]):.4f}", lr=f"{opt.param_groups[0]['lr']:.1e}")
     bar.close()
+    if cands is not None:
+        print(f"  batches: {kinds}")
     return float(np.mean(losses)) if losses else float("nan"), nb
 
 
@@ -246,7 +299,27 @@ def neg_stats(prob, gt, seed):
     return rej, ml
 
 
-def validate(model, box, data, args):
+@torch.no_grad()
+def cand_eval(model, box, cands, args):
+    """SAM on real SegResNet candidates (box only, as in the pipeline).
+    hard_reject = share of FALSE candidates rejected (< REJECT_VOX = 0.1 ml); real_keep = share of TRUE
+    candidates kept; real_dice = Dice on true candidates (crop, 1.5 mm)."""
+    model.eval()
+    vox, dsc = [], []
+    for s in range(0, len(cands["cid"]), args.batch):
+        idx = np.arange(s, min(s + args.batch, len(cands["cid"])))
+        emb, bx, gt = cand_batch(cands, idx)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+            prob = torch.sigmoid(upsample(decode(model, box, emb, None, None, bx, None).float()))[:, 0]
+        vox.extend((prob > 0.5).flatten(1).sum(1).cpu().numpy()); dsc.extend(batch_dice(prob, gt))
+    vox, dsc, t = np.array(vox), np.array(dsc), cands["is_true"]
+    return dict(hard_reject=float((vox[~t] < REJECT_VOX).mean()) if (~t).any() else float("nan"),
+                real_keep=float((vox[t] >= REJECT_VOX).mean()) if t.any() else float("nan"),
+                real_dice=float(dsc[t].mean()) if t.any() else float("nan"),
+                hard_pred_ml=float(np.median(vox[~t]) * 1.5 ** 3 / 1000) if (~t).any() else float("nan"))
+
+
+def validate(model, box, data, args, vcands=None):
     res = {("click", 1): [], ("click", 5): [], ("box", 1): [], ("messy", 1): []}
     rej = []
     for s in range(0, len(data), args.batch):
@@ -260,7 +333,10 @@ def validate(model, box, data, args):
         rej.extend(neg_stats(out[("neg", 1)], gt, 233 + s)[0])
     m = {f"{a}{b}": float(np.mean(v)) for (a, b), v in res.items()}
     m["neg_reject"] = float(np.nanmean(rej))
-    if args.box_aug == "realistic":
+    if vcands is not None:
+        m.update(cand_eval(model, box, vcands, args))
+        m["score"] = float(np.nanmean([m["box1"], m["messy1"], m["hard_reject"], m["real_keep"]]))
+    elif args.box_aug == "realistic":
         m["score"] = float(np.mean([m["box1"], m["messy1"], m["neg_reject"]]))
     else:                                                       # S2a criterion, unchanged
         m["score"] = float(np.mean([m["click1"], m["click5"], m["box1"]]))
@@ -281,8 +357,16 @@ def full_res_metrics(prob_crop, origin, shape15, cache_path):
     return all_metrics((up > 0.5).numpy(), lbl > 0)
 
 
-def test(models, test_items, coll, args, cache_root, out):
+def test(models, test_items, coll, args, cache_root, out, tcands=None):
     crop_rows, full_rows = [], []
+    real = {}
+    if tcands is not None:
+        for name, (model, box, with_box) in models.items():
+            if with_box:
+                real[name] = {k: round(v, 4) for k, v in cand_eval(model, box, tcands, args).items()}
+        print("\nTest, SegResNet's REAL candidates (pipeline setting): hard_reject = false candidates rejected, "
+              "real_keep = true candidates kept")
+        print(pd.DataFrame(real).T.to_string())
     for s in tqdm(range(0, len(test_items), args.batch), desc="test", unit="batch", file=sys.stdout,
                   dynamic_ncols=True, mininterval=10):
         chunk = test_items[s:s + args.batch]
@@ -345,6 +429,8 @@ def test(models, test_items, coll, args, cache_root, out):
         per_coll = fr.pivot_table(index="collection", columns=["model", "prompt"], values="dice").round(4)
         print("\nfull-res Dice per collection:")
         print(per_coll.to_string())
+    if real:
+        summary["real_candidates"] = real
     json.dump(summary, open(out / "test_summary.json", "w"), indent=2)
 
 
@@ -372,6 +458,10 @@ def main():
     ap.add_argument("--box_aug", choices=["clean", "realistic"], default="clean", help="S2a = clean, S2b = realistic")
     ap.add_argument("--p_messy", type=float, default=0.4, help="share of box prompts that are messy (S2b)")
     ap.add_argument("--p_neg", type=float, default=0.2, help="share of box prompts that are negative (S2b)")
+    ap.add_argument("--cand_root", default="", help="S2c: output of s2c_mine_candidates.py (train/ val/ test/)")
+    ap.add_argument("--p_hard", type=float, default=0.25, help="S2c: share of batches = real false candidates")
+    ap.add_argument("--p_realpos", type=float, default=0.10, help="S2c: share of batches = real true candidates")
+    ap.add_argument("--init_ckpt", default="", help="start from this best.pt (S2c: the S2b checkpoint)")
     ap.add_argument("--compare_ckpt", default="", help="best.pt of another run (same --tune/--r), tested as 'compare'")
     ap.add_argument("--test_clicks", type=int, default=5)
     ap.add_argument("--val_every", type=int, default=5)
@@ -421,6 +511,10 @@ def main():
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
+    if args.init_ckpt:
+        st = torch.load(args.init_ckpt, map_location=DEV, weights_only=False)
+        model.mask_decoder.load_state_dict(st["mask_decoder"]); box.load_state_dict(st["box"])
+        print("initialised from", args.init_ckpt)
     start_epoch, best, log = 1, -1.0, []
     resume = Path(args.resume_from) if args.resume_from else out / "last.pt"
     if resume.exists():
@@ -437,23 +531,34 @@ def main():
     if start_epoch <= args.epochs:
         train_data = preload(tr, "all", args.workers, "load train")
         val_data = preload(va, "first", args.workers, "load val")
+        tcand = vcand = None
+        if args.cand_root:
+            tcand = load_cands(args.cand_root, "train", {c for c, _ in tr})
+            vcand = load_cands(args.cand_root, "val", {c for c, _ in va})
+            if start_epoch == 1:                                    # epoch 0 = the starting model (S2b)
+                m = validate(model, box, val_data, args, vcand)
+                log.append(dict(epoch=0, **{f"val_{k}": v for k, v in m.items()}))
+                print("epoch 0 (start):", {k: round(v, 4) for k, v in m.items()})
         nb = len(train_data) // args.batch
         total = nb * args.epochs
         args.warmup_steps = nb * args.warmup
         ep_times = []
         for epoch in range(start_epoch, args.epochs + 1):
             t0 = time.time()
-            loss, _ = train_epoch(model, box, opt, scaler, train_data, args, epoch, (epoch - 1) * nb, total, gen)
+            loss, _ = train_epoch(model, box, opt, scaler, train_data, args, epoch, (epoch - 1) * nb, total, gen,
+                                  tcand)
             row = dict(epoch=epoch, loss=loss, lr=opt.param_groups[0]["lr"])
             if epoch % args.val_every == 0 or epoch == args.epochs:
-                m = validate(model, box, val_data, args)
+                m = validate(model, box, val_data, args, vcand)
                 row.update({f"val_{k}": v for k, v in m.items()})
                 if m["score"] > best:
                     best = m["score"]
                     torch.save(trainable_state(model, box), out / "best.pt")
                 print(f"epoch {epoch}: loss {loss:.4f} | val click1 {m['click1']:.4f} click5 {m['click5']:.4f} "
                       f"box {m['box1']:.4f} messy {m['messy1']:.4f} neg_reject {m['neg_reject']:.3f} "
-                      f"| score {m['score']:.4f} (best {best:.4f})")
+                      + (f"| REAL hard_reject {m['hard_reject']:.3f} real_keep {m['real_keep']:.3f} "
+                         if 'hard_reject' in m else "")
+                      + f"| score {m['score']:.4f} (best {best:.4f})")
             else:
                 print(f"epoch {epoch}: loss {loss:.4f}")
             ep_times.append(time.time() - t0)
@@ -466,7 +571,7 @@ def main():
             if used + 2 * np.mean(ep_times) / 3600 + 0.5 > args.time_budget_h and epoch < args.epochs:
                 print(f"time budget reached after epoch {epoch} ({used:.2f} h); stopping training")
                 break
-        del train_data
+        del train_data, tcand
 
     if args.skip_test:
         return
@@ -483,7 +588,10 @@ def main():
         zs = load_sam_med3d(ckpt, DEV); zs.image_encoder = torch.nn.Identity()
         models = {"zero_shot": (zs, None, False), **models}            # turbo has no 3D box prompt
     test_data = preload(te, "first", args.workers, "load test")
-    test(models, test_data, coll, args, cache_root, out)
+    tc = None
+    if args.cand_root and Path(args.cand_root, "test").is_dir():
+        tc = load_cands(args.cand_root, "test", {c for c, _ in te})
+    test(models, test_data, coll, args, cache_root, out, tc)
     print(f"total time {(time.time() - t_start) / 3600:.2f} h")
 
 

@@ -50,6 +50,13 @@ scripts/s3a_seg2sam.py       S3a: SegResNet -> SAM, fully automatic (candidates,
 notebooks/04_s3a_seg2sam.ipynb  Kaggle notebook for S3a
 notebooks/05_s2b_sam_realistic_boxes.ipynb  Kaggle notebook for S2b (realistic + negative boxes)
 notebooks/06_s3b_council_s2b.ipynb  Kaggle notebook for S3b (council with SegResNet-100 + S2b)
+cids/fcouncil/                 frequency adapter for SAM + frequency council (4 independent band experts, gate), losses, data
+cids/eval/postproc.py          rel20 connected-component post-processing (26-connectivity)
+scripts/s4_sam_adapter.py      S4: frequency adapter (Haar bands of SAM's crop -> residual into SAM-S2b's embedding)
+scripts/s5_export_maps.py      S5: finder (SegResNet-100) and checker (SAM-S2b + adapter) maps for every case
+scripts/s6_freq_council.py     S6: train / evaluate the frequency council
+notebooks/07_s4_sam_adapter.ipynb      Kaggle notebook for S4
+notebooks/08_s5_s6_freq_council.ipynb  Kaggle notebook for S5 + S6
 tests/                       pytest
 ```
 
@@ -129,6 +136,35 @@ Test adds `messy` and `neg` prompts and evaluates the S2a checkpoint on the same
 New rules `segkeep`/`samkeep` keep only candidates SAM did not reject (SAM output ≥ 0.1 ml). Also writes
 `val_candidates.csv` / `test_candidates.csv` (one row per candidate: size, SegResNet confidence, agreement, SAM volume,
 position, on-tumour) for the learned council, and reports how many false/true candidates SAM rejected.
+
+
+## Step 8b — S2c: SAM trained on SegResNet's real false candidates (hard negatives)
+S2b rejected 97% of synthetic negative boxes but only 0.6% of SegResNet's real false candidates (S3b test).
+`notebooks/09_s2c_hard_negatives.ipynb`:
+1. `scripts/s2c_mine_candidates.py` — SegResNet-100 candidates on train (prob > 0.3, top 8) and val/test (0.5, top 5),
+   the same SAM crop + box as the pipeline (`s3a.candidate_crops`), frozen-encoder embeddings, labelled true/false.
+2. `scripts/s2a_sam_finetune.py --cand_root ... --init_ckpt sam_s2b_best.pt` — 30 epochs from S2b; 25% of batches are
+   real false candidates (target: empty), 10% real true candidates. Val score = mean(box1, messy1, hard_reject, real_keep).
+3. S3c = `s3a_seg2sam.py` with the S2c checkpoint (notebook 06 with `RUN = 's2c'` or the last cell of notebook 09).
+Upload `s2c/best.pt` to `cids-checkpoints` as `sam_s2c_best.pt`.
+
+## Step 9 — S4: frequency adapter for SAM (⑤, no metadata yet)
+
+`notebooks/07_s4_sam_adapter.ipynb`. SAM's input crop -> 3D Haar (8 directional bands) -> learned band weights
+-> small CNN -> residual added to SAM-S2b's cached image embedding (zero-initialised: SAM = S2b at step 0).
+Only the adapter trains (~333k params; `--train_decoder` also trains LoRA/box). Same boxes as S2b. Test: S2b vs
+S2b + adapter on identical prompts; `band_weights.json` = learned weight per band. Save `best.pt` as
+`sam_s2b_adapter_best.pt` in `cids-checkpoints`.
+
+## Step 10 — S5 + S6: frequency council with dual supervision (⑥, no metadata yet)
+
+`notebooks/08_s5_s6_freq_council.ipynb`. S5 exports, fully automatically, the finder map (SegResNet-100) and the
+checker map (SAM-S2b + adapter on SegResNet's candidates) for all cases. S6 trains 4 independent experts
+(E1 LLL shape · E2 LLH/LHL/HLL one-axis edges · E3 LHH/HLH/HHL two-axis corners · E4 HHH texture); each sees its
+Haar bands of the image + both maps and predicts its own mask; a gate combines them into the final mask; the
+experts' spread is the uncertainty. Loss: DiceCE(final) + 0.5·mean DiceCE(each expert) + 0.3·distillation towards
+mean(finder, checker) where they agree + 0.01·gate balance. Training maps get map augmentation (finder maps of
+training cases are optimistic). `USE_TEACHERS=False` = ablation without dual supervision.
 
 ## Tests
 
