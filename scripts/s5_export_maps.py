@@ -5,7 +5,10 @@ Fully automatic, no ground truth used:
   SAM-S2b (+ S4 frequency adapter, if given) on one crop + box per candidate (checker)
 Saved per case at the 1 mm cache grid: <out>/<cache_id>.npz with
   seg  uint8  SegResNet probability x 255
-  sam  uint8  max over candidates of SAM's probability x 255 (0 where no candidate)
+  sam  uint8  max over candidates of SAM's probability x 255 (0 where no candidate);
+             with --jury (S3d train_features.csv): each candidate's SAM map is multiplied by the learned
+             jury's P(real tumour), so SegResNet's false blobs enter the council weak (no ground truth used;
+             training cases get a cross-fitted jury that never saw them)
 Train cases use sliding-window overlap 0.25 (faster), val/test 0.5. Existing files are skipped
 (resumable). Prints a sanity table for val/test: Dice of finder (rel20) and checker (rel20).
 
@@ -44,6 +47,8 @@ def main():
     ap.add_argument("--seg_ckpt", required=True)
     ap.add_argument("--sam_ckpt", required=True, help="S2b best.pt")
     ap.add_argument("--adapter_ckpt", default="", help="S4 best.pt (adapter + decoder state); '' = S2b alone")
+    ap.add_argument("--jury", default="", help="S3d train_features.csv: weight each candidate's SAM map by the "
+                    "learned jury's P(tumour); training cases use a cross-fitted jury that never saw them")
     ap.add_argument("--turbo_ckpt", default="")
     ap.add_argument("--random_weights", action="store_true", help="CPU tests only")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
@@ -65,6 +70,11 @@ def main():
         adapter = SamFreqAdapter().to(DEV).eval()
         adapter.load_state_dict(st["adapter"])
         sam.mask_decoder.load_state_dict(st["mask_decoder"]); box.load_state_dict(st["box"])
+    jury = None
+    if a.jury:
+        import s3d_learned_jury as s3d
+        jury = s3d.CrossFitJury(a.jury)
+    print(f"jury: {a.jury or 'none'}")
     print(f"cache {root}\nfinder {a.seg_ckpt}\nchecker {a.sam_ckpt} + adapter: {a.adapter_ckpt or 'none'}\n{DEV}")
 
     sp = pd.read_csv(a.splits)
@@ -86,7 +96,12 @@ def main():
                 sprob = unpad(s3.seg_prob(seg, item["image"], amp, overlap=overlap), item["pads"])
                 lab, cands = s3.components(sprob > 0.5, top_k=a.top_k)
                 refined = s3.sam_refine(sam, box, img, lab, cands, amp, adapter) if cands else []
-            sam_p = np.max([d["prob"] for d in refined], 0) if refined else np.zeros_like(sprob)
+            w = [1.0] * len(refined)
+            if jury is not None and refined:
+                feats = pd.DataFrame(s3d.candidate_rows(cid, sprob, lab, cands, refined, np.zeros_like(sprob, bool)))
+                w = jury.predict(cid, feats)
+                by_k = dict(zip(feats.k, w)); w = [by_k[d["k"]] for d in refined]
+            sam_p = np.max([wi * d["prob"] for wi, d in zip(w, refined)], 0) if refined else np.zeros_like(sprob)
             np.savez_compressed(out / f"{cid}.npz", seg=(np.clip(sprob, 0, 1) * 255).round().astype(np.uint8),
                                 sam=(np.clip(sam_p, 0, 1) * 255).round().astype(np.uint8))
             if split != "train":

@@ -143,6 +143,26 @@ def fit_models(tr):
     return {"logreg": lr, "gboost": gb}
 
 
+class CrossFitJury:
+    """Jury for building council inputs. Training cases get P(tumour) from a model fitted WITHOUT them
+    (5-fold by case), so their checker maps are as noisy as on new cases; other cases use the full model.
+    Fitted from <out>/train_features.csv in seconds (same settings as the chosen 'gboost' jury)."""
+
+    def __init__(self, train_features_csv, n_folds: int = 5, model: str = "gboost"):
+        from sklearn.model_selection import GroupKFold
+        tr = pd.read_csv(train_features_csv)
+        tr = tr[tr.k >= 0].reset_index(drop=True)
+        self.full = fit_models(tr)[model]
+        self.fold_of, self.fold_models = {}, []
+        for f, (fit_idx, held) in enumerate(GroupKFold(n_folds).split(tr, groups=tr.cache_id)):
+            self.fold_models.append(fit_models(tr.iloc[fit_idx])[model])
+            self.fold_of.update({c: f for c in tr.cache_id.iloc[held]})
+
+    def predict(self, cid, feats: pd.DataFrame) -> np.ndarray:
+        m = self.fold_models[self.fold_of[cid]] if cid in self.fold_of else self.full
+        return m.predict_proba(feats[FEATURES].to_numpy(float))[:, 1]
+
+
 def auc(score, y):
     from sklearn.metrics import roc_auc_score
     return float(roc_auc_score(y, score)) if 0 < y.sum() < len(y) else float("nan")
