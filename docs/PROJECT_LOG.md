@@ -9,25 +9,123 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 
 | Stage | Status | Output / where |
 |---|---|---|
-| Idea + method design (CIDS-1) | ✅ done | this log, Day 1 |
+| Idea + method design (CIDS-1) | ✅ done, revised Day 7 | this log |
 | Repo scaffold (VS Code → GitHub → Kaggle) | ✅ done | `Vemuri-BK/cids` (public) |
-| Structured prompts (Type-S) + counterfactuals | ✅ done | `data/prompts/cids_prompts.xlsx/.csv` |
-| Narrative prompts (Type-N, Qwen2.5-7B) | ✅ done, re-filtered | 1506 × 3, 0 failing |
-| Held-out narratives (Phi-3.5-mini) | ✅ done, re-filtered | 306 × 3, 0 failing |
-| S0: SAM-Med3D embeddings + zero-shot baseline | ✅ done | `data/sam_emb/`; Kaggle dataset `kumarvemuri1/cids-sam-emb` (from sam_emb.zip) |
+| Structured / narrative prompts (text track) | ✅ done, **parked** | text FiLM gave no gain (Day 4); metadata now acquisition-only |
+| S0: SAM-Med3D embeddings + zero-shot baseline | ✅ done | Kaggle `kumarvemuri1/cids-sam-emb` |
 | Fixed split train 1080 / val 120 / test 306 (+ LOCO columns) | ✅ done | `configs/splits.csv` |
-| Upload final `cids_prompts.csv` to Kaggle `cids-assets` | ⏳ todo | new dataset version |
-| S1: SegResNet img (Exp 1) / + text FiLM (Exp 2) | ✅ done | test Dice after rel20: img 0.655, txt 0.650 (p=0.94); Day 4 |
-| S1 post-processing (connected components, rule chosen on val) | ✅ done (rel20) | `postproc_*` in s1_img / s1_txt outputs |
-| S2a: SAM-Med3D-turbo + decoder LoRA, image only (Exp 3) | ✅ done (oracle prompts) | test Dice box 0.708, click1 0.650, click5 0.717; zero-shot click1 0.520 |
-| Breast-region depth filter on S1 | 🛠 cell ready | not run yet |
-| SegResNet → SAM (automatic box, first council step) | ⏳ next | needs re-encoding crops at SegResNet boxes |
-| Text refiner diagnostic (4 arms, field tokens) | 💡 proposed | after SegResNet→SAM |
-| Baselines (SegResNet, nnU-Net ref., SAM-Med3D FT) | ⏳ | — |
-| S2: FIPG + SAM decoder LoRA (member A) | ⏳ | needs `cids-sam-emb` |
-| S3: council + dual supervision | ⏳ | — |
-| Experiments E0–E5, fairness, ablations | ⏳ | — |
+| S1: SegResNet image, 60 → **100 epochs** (warm restart) | ✅ done | test rel20 **0.684** (60 ep: 0.655); `segresnet_img_e100_best.pt` |
+| S2a: SAM decoder LoRA, clean GT boxes | ✅ done | test box 0.708 (oracle prompts) |
+| S2b: SAM + messy / negative boxes | ✅ done | test box 0.698, messy 0.653, rejects 96.7 % synthetic negatives; `sam_s2b_best.pt` |
+| S3a: SegResNet-60 → SAM-S2a, rule-based jury | ✅ done | test 0.675 |
+| S3b: SegResNet-100 → SAM-S2b, rule `segjury_0.7` | ✅ done | test **0.699** |
+| S2c: SAM trained on SegResNet's real false candidates | ✅ done — **negative result** | rejection ↑ but real tumours lost; AUC not improved |
+| **S3d: learned jury (gradient boosting on candidate clues)** | ✅ done — **current best** | **test 0.735**, HD95 3.6, NSD 0.783, p = 0.0008 vs S3b |
+| Frequency council code (S4 adapter, S5 maps, S6 council) | ✅ built, tested | `cids/fcouncil/`, `scripts/s4–s6`, notebooks 07, 08 |
+| S4: SAM frequency adapter (60 epochs) | 🏃 running (notebook 07) | decides whether 08 uses the adapter |
+| S5 + S6: frequency council, dual supervision (main method) | ⏳ next (notebook 08) | must beat 0.735 |
+| One-file pipeline export (S3d as `.pt`) | 🛠 code ready, uncommitted | `cids/pipeline.py`, `scripts/s3d_export_pipeline.py` |
+| Acquisition-metadata token (geometry → band weights) | ⏳ after S6 | `cond_dim` slot already in adapter / gate |
+| Ablations, LOCO, 3 seeds, fairness, faster full-res metrics | ⏳ | — |
 | Paper (IEEE JBHI / TMI) | ⏳ | — |
+
+### Results so far (test 306 = official test set; val 120)
+| Method (fully automatic unless noted) | Val Dice | Test Dice | HD95 med | NSD | missed |
+|---|---|---|---|---|---|
+| SegResNet-60, rel20 | 0.693 (best val) | 0.655 | 16.0 | 0.681 | 15 |
+| SegResNet-100, rel20 | 0.724 | 0.684 | 7.3 | 0.716 | 14 |
+| S3a: SegResNet-60 + SAM-S2a, rules | – | 0.675 | – | – | – |
+| S3b: SegResNet-100 + SAM-S2b, `segjury_0.7` | 0.747 | 0.699 | 4.1 | 0.744 | 26 |
+| **S3d: SegResNet-100 + SAM-S2b + learned jury** | **0.766** | **0.735** | **3.6** | **0.783** | **17** |
+| perfect candidate choice (upper bound, all touching candidates) | 0.812 | 0.787 | – | – | – |
+| SAM-S2a / S2b with GT box (oracle prompt, not automatic) | – / 0.729 crop | 0.708 / 0.698 | 4.4 / – | 0.729 / – | – |
+
+---
+
+## Day 10 — 2026-10-13
+
+### S2c-balanced (hard negatives, fixed) — negative result confirmed
+- Retrained from S2b with equal batches (20 % real false candidates → empty mask, 20 % real true candidates), lr 5e-5, 30 epochs, val every 2, new selection rule: an epoch can only be "best" if it keeps ≥ 95 % of real tumours on val (`--min_real_keep 0.95`). New metric: AUC of SAM's soft volume (true vs false candidates).
+- Epoch 0 = S2b: val AUC 0.801, hard_reject 0.006, real_keep 1.0. Training only moved the operating point (e.g. ep 4: hard_reject 0.669 / real_keep 0.823), **AUC never improved (0.80 → 0.77)** and box Dice fell (0.729 → 0.64). No epoch passed the 95 % rule → best = S2b; test AUC 0.822 = S2b.
+- Conclusion: fine-tuning the mask decoder on the finder's false positives trades sensitivity for specificity without improving discrimination. The information is already in S2b's output → use it in a better decision rule.
+
+### S3d — learned jury (commit 9c54ae1, notebook 10) — **new best, test 0.735**
+- Same pipeline as S3b (SegResNet-100 → candidates prob > 0.5, ≥ 0.1 ml, top 5 → SAM-S2b crop + box each). Only the decision step changes.
+- 11 clues per candidate (no ground truth): log size, size relative to largest, is-largest, rank, number of candidates, SegResNet mean / max prob, agreement Dice(SAM, SegResNet), SAM hard and **soft** volume, SAM / SegResNet volume ratio. Label for training: candidate touches the tumour.
+- Train 1080 → 2561 candidates (1246 true / 1315 false); fit logistic regression + gradient boosting. Val 120: choose model + cut-off by Dice → **gboost, t = 0.60** (val 0.766; logreg 0.747). Test applied once. If no candidate ≥ t: keep the most likely one. Final mask = SegResNet mask of kept candidates.
+- Dice for any selection computed exactly from per-candidate tables (components disjoint: Dice = 2Σinter / (Σsize + |GT|)); unit test checks it against mask Dice.
+
+| Test 306 | Dice | HD95 | NSD | missed |
+|---|---|---|---|---|
+| seg_rel20 | 0.684 | 7.3 | 0.716 | 14 |
+| segjury_0.7 (S3b) | 0.699 | 4.1 | 0.744 | 26 |
+| **learned (gboost, t 0.60)** | **0.735** | **3.6** | **0.783** | **17** |
+| oracle | 0.787 | | | |
+- Wilcoxon learned vs segjury p = 0.0008, vs rel20 p = 7e-8. Per case: better than S3b in 39, worse in 14 (|Δ| > 0.05); vs rel20 75 / 12.
+- Per collection (rel20 / S3b / learned): DUKE 0.544 / 0.587 / **0.674**, ISPY1 0.729 / 0.743 / 0.733, ISPY2 0.753 / 0.752 / **0.793**, NACT 0.720 / 0.719 / 0.626.
+- AUC true vs false candidates: jury test 0.916 (val 0.903); single clues val: agree 0.844, SegResNet mean prob 0.866, SAM soft volume 0.801.
+- Checks (reproduced locally from the feature CSVs, exact 0.7352): best possible test cut-off 0.75 → 0.741, so the val-chosen 0.60 loses only 0.006 (not over-tuned). NACT drop = 3 of 17 cases (nact_55, 17, 60) where the jury chose the wrong blob (nact_55: true largest candidate got P = 0.05). 17 misses: 15 had a true candidate available, 2 had none. Test has 27 cases (9 %) with no candidate ≥ 0.60 vs 5 in val. Tried fallback "keep largest" → val 0.759 (worse) → rejected.
+- Possible later improvements: within-case relative clues (e.g. P relative to the case's best candidate), keeping all fragments of a split tumour.
+
+### S5 update — checker map weighted by the jury (commit c626987)
+- `s5_export_maps.py --jury s3d_train_features.csv`: each candidate's SAM map × jury P(tumour), so false blobs enter the council weak.
+- **Cross-fitting**: training cases get P from a 5-fold jury that never saw them (in-sample train AUC 0.971 is too optimistic; cross-fitted 0.93 ≈ test 0.916). Full model reproduces test 0.7352.
+- Notebook 08: `JURY = {CKPT_DIR}/s3d_train_features.csv`, `MAPS_DIR = maps_jury`, `ADAPTER_CKPT = ''` until S4 is judged.
+
+### One-file export of S3d (code ready, not committed yet)
+- `cids/pipeline.py` (`CIDSPipeline.load(...).predict(img) → mask + candidate table`) and `scripts/s3d_export_pipeline.py` → `cids_s3d_pipeline.pt` (~403 MB: SegResNet + full SAM incl. turbo encoder + jury + settings). Save → reload gives identical predictions (tested on CPU, random weights). Kaggle export + check on 5 val cases: later.
+
+### S4 frequency adapter — running (notebook 07, 60 epochs, account 2)
+- Smoke OK: epoch 0 = S2b exactly (box 0.699, messy 0.706, neg_reject 1.0) → zero-init works; band weights start at 1.0.
+- Decision rule for notebook 08: adapter used only if messy1 clearly better (Wilcoxon p < 0.05) and HD95 / NSD not worse.
+
+### Lab-meeting framing (Day 10)
+- "Finder–checker candidate verification with a learned jury" = strong baseline (0.735). "Frequency council" = proposed method (S6). Keep the two names separate.
+
+### Next
+1. Read S4 result → set `ADAPTER_CKPT` → notebook 08 once (S5 ~2–3 h + S6 ~4 h). Bar: 0.735.
+2. Ablation `USE_TEACHERS = False` (reuse S5 maps).
+3. Acquisition metadata: CPU check (does geometry predict band energy?) → geometry token into band weights.
+4. Commit + run the S3d one-file export. 5. Ablations, LOCO, 3 seeds, faster full-res metrics, fairness.
+
+---
+
+## Day 9 — 2026-10-12
+
+### S2b — SAM decoder on realistic boxes (commit 86a317e, notebook 05)
+- Box prompts like SegResNet's: clean (GT ± 5 vox), messy (0.7–1.8× size, shifted ≤ 40 %), negative (tumour-free tissue → empty target). Val score = mean(box1, messy1, neg_reject); 100 epochs (best val score 0.803).
+- Test (full res, oracle box): box 0.698, messy 0.653, rejects 96.7 % of synthetic negative boxes.
+
+### S3b — SegResNet-100 + S2b (commit 85dcc32, notebook 06)
+- New rules segkeep / samkeep (drop candidates SAM rejects); per-candidate feature tables (`val/test_candidates.csv`).
+- Test: segjury_0.7 **0.699** (vs SegResNet-100 0.684, p = 0.11), HD95 7.3 → 4.1, NSD 0.744, DUKE 0.544 → 0.587, missed 14 → 26; best-candidate oracle 0.741.
+- Key finding: S2b rejected only **0.6 %** of SegResNet's real false candidates (vs 97 % synthetic). But SAM volume still discriminates (median 2.2 vs 8.9 ml) and a logistic regression on candidate features gave AUC ≈ 0.90 → motivated S2c and later the learned jury.
+
+### Frequency council built without metadata (commit ba35859)
+- vbk's correction: the council = **independent frequency-band experts producing the final mask** (first build that put frequency inside SegResNet was discarded → `outputs/_obsolete_s4_v1/`).
+- `cids/fcouncil/`: `bands.py` (3D Haar, groups E1 LLL shape / E2 LLH,LHL,HLL edges / E3 LHH,HLH,HHL corners / E4 HHH texture), `adapter.py` (SamFreqAdapter: Haar → 8 learned band weights → CNN → zero-init residual on SAM's 384×8³ embedding, 333 k params, `cond` slot), `experts.py` (BandExpert small 3D U-Net, ~0.78 M each), `council.py` (gate, uniform at init), `model.py` (FreqCouncil, input 5 ch = image 3 + finder map + checker map; final, experts, weights, uncertainty), `losses.py` (dual supervision: GT on final + every expert, agreement-gated distillation to mean(finder, checker), gate balance), `data.py` (map augmentation).
+- Scripts: `s4_sam_adapter.py`, `s5_export_maps.py`, `s6_freq_council.py`; notebooks 07, 08.
+
+### S2c — hard negatives (commits 897f519, dcf8596, notebook 09)
+- Mined SegResNet's real candidates with the same crop + box as the pipeline (`s3a.candidate_crops`), frozen-encoder embeddings, crop origins saved: train (prob > 0.3, top 8) 3274 = 1241 true + **2033 false** (62 % of cases have ≥ 1 false); val 307 (166 false); test 836 = 349 true + 487 false (66 % of cases). False blobs small (median ~0.9 ml) vs true ~9 ml. 85 min on T4, 1.6 GB.
+- Run 1 (25 % hard / 10 % real-positive batches, lr 2e-4, 100 epochs): test hard_reject 0.844 but **real_keep 0.650**, real Dice 0.42 (S2b 0.595); val box 0.729 → ~0.6. Over-rejection from batch imbalance → Day 10 balanced run.
+- Lesson on tooling: files copied to the device under an existing name can arrive as an older cached copy → always copy under a new name and verify md5.
+
+---
+
+## Day 5–8 — 2026-10-05 … 10-11
+
+### S3a — first automatic SegResNet → SAM pipeline (commits 04e22ba, 0be680b, notebook 04)
+- Candidates = connected components of SegResNet mask (≥ 0.1 ml, top 5) → one SAM crop + box each → rules (sam / avg / jury / segjury / avgjury). Test 0.675 with SegResNet-60 + S2a.
+
+### SegResNet extended 60 → 100 epochs (commit 50d2e0c, notebook 02)
+- Warm-restart LR cycle (`--restart_at 60 --restart_lr 1e-4`), LR reset on resume. Test rel20 0.655 → **0.684**, HD95 16.0 → 7.3, DUKE 0.490 → 0.544.
+
+### Architecture and research question finalised
+- Research question: *Can acquisition geometry guide the selection of local frequency features in a 3D foundation model and, combined with a finder–checker council, improve fully automatic 3D breast tumour segmentation on unseen MRI collections?*
+- Components: finder SegResNet, checker SAM-Med3D-turbo (frozen encoder + LoRA decoder + 3D box tokens), 3D Haar bands, frequency council of 4 independent band experts, dual supervision (GT + agreement-gated finder/checker teachers), acquisition-geometry metadata (later).
+- Metadata: **acquisition fields only** (pixel spacing, slice thickness, view, field strength, manufacturer/model, TE, TR, post-contrast timing, bilateral); patient fields (age, menopause, subtype) only as ablation; ethnicity only for fairness evaluation. Build the architecture **without metadata first**.
+- Out of scope for now: agent, diffusion models. "Fully automatic" = no human prompt at test time.
 
 ---
 
