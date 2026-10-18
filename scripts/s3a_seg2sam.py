@@ -120,10 +120,22 @@ def candidate_crops(img, lab, cands, lbl=None):
                 gt=np.stack(gts) if lbl is not None else None, shape15=shape15)
 
 
+def embedding_descriptor(emb_j: torch.Tensor, box) -> np.ndarray:
+    """Compact descriptor of one candidate from SAM's frozen embedding (384 x 8^3, one token = 16^3 voxels):
+    [mean over the tokens covered by the candidate's box | mean over the whole crop], L2-normalised (768-d)."""
+    lo = np.clip(np.asarray(box[0]) // 16, 0, 7).astype(int)
+    hi = np.clip(np.asarray(box[1]) // 16, 0, 7).astype(int)
+    e = emb_j.float()
+    local = e[:, lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1].mean(dim=(1, 2, 3))
+    d = torch.cat([local, e.mean(dim=(1, 2, 3))])
+    return (d / d.norm().clamp(min=1e-6)).cpu().numpy().astype(np.float32)
+
+
 @torch.no_grad()
-def sam_refine(sam, box_mod, img, lab, cands, amp, adapter=None):
+def sam_refine(sam, box_mod, img, lab, cands, amp, adapter=None, descriptors=False):
     """Returns per candidate: SAM probability pasted into a 1 mm volume, and agreement with SegResNet.
-    adapter (optional, S4 SamFreqAdapter): residual added to SAM's image embedding from the same crop."""
+    adapter (optional, S4 SamFreqAdapter): residual added to SAM's image embedding from the same crop.
+    descriptors=True also returns 'desc' (embedding_descriptor) per candidate, for the memory clue (S3e)."""
     shape1 = lab.shape
     cc = candidate_crops(img, lab, cands)
     shape15, boxes, origins, comp_crops = cc["shape15"], cc["boxes"], cc["origins"], cc["comp"]
@@ -146,6 +158,8 @@ def sam_refine(sam, box_mod, img, lab, cands, amp, adapter=None):
         vol[lo_[0]:hi_[0], lo_[1]:hi_[1], lo_[2]:hi_[2]] = p[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
         up = F.interpolate(vol[None, None], size=shape1, mode="trilinear", align_corners=False)[0, 0].numpy()
         out.append(dict(k=k, prob=up, agree=float(agree), sam_ml=sam_ml, sam_soft_ml=sam_soft_ml))
+        if descriptors:
+            out[-1]["desc"] = embedding_descriptor(emb[j], boxes[j])
     return out
 
 

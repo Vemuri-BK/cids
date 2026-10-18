@@ -87,3 +87,17 @@ def test_learned_jury_table_dice_equals_mask_dice():
     assert np.isclose(tab["seg_rel20"].iloc[0], dice(lab == 1, gt))     # 2 and 3 are < 20 % of the largest
     assert np.isclose(tab["learned_t0.50"].iloc[0], dice(np.isin(lab, [1, 3]), gt))
     assert np.isclose(tab["learned_t0.95"].iloc[0], dice(lab == 1, gt))             # none >= t -> most likely
+
+
+def test_memory_knn_and_no_same_patient_leakage():
+    import s3e_memory_jury as mem
+    e = np.eye(4, dtype=np.float32)
+    # query close to memory 0 (real) -> high score; close to memory 1 (false) -> low score
+    assert mem.knn_score(e[[0]], e[[0, 1]], np.array([1., 0.]), k=2)[0] > 0.99
+    assert mem.knn_score(e[[1]], e[[0, 1]], np.array([1., 0.]), k=2)[0] < 0.01
+    # two patients with identical-looking candidates: A all real, B all false. Cross-fitted training scores
+    # must come only from the OTHER patient -> A gets ~0, B gets ~1 (its own patient would give the opposite)
+    D = np.stack([e[0]] * 4).astype(np.float16)
+    tr = pd.DataFrame(dict(cache_id=["a", "a", "b", "b"], k=[1, 2, 1, 2], on_tumour=[1, 1, 0, 0]))
+    tr2, _ = mem.memory_scores(tr, D, [], k=2, n_folds=2)
+    assert np.allclose(tr2.mem_knn.to_numpy(), [0, 0, 1, 1])
