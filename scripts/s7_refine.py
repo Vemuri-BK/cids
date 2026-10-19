@@ -54,12 +54,27 @@ def _prep(args):
     return prepare_case(*args)
 
 
-def find_s3f(path: str) -> Path:
+def find_s3f(path: str, unpack_to: Path) -> Path:
+    """Folder with summary.json + masks/ (or masks.zip: Kaggle keeps at most 500 output files, so notebook 12's
+    masks are shipped as one zip, unpacked here once)."""
     p = Path(path)
-    hits = [q.parent for q in p.rglob("summary.json") if (q.parent / "masks").is_dir()] if p.exists() else []
-    if not hits:
-        raise SystemExit(f"no s3f output (summary.json + masks/) under {path}")
-    return hits[0]
+    cands = [q.parent for q in p.rglob("summary.json")] if p.exists() else []
+    for c in cands:
+        if (c / "masks").is_dir() and any((c / "masks").glob("*.npz")):
+            return c
+    for c in cands:
+        if (c / "masks.zip").exists():
+            import shutil
+            import zipfile
+            dst = Path(unpack_to)
+            if not (dst / "masks").is_dir():
+                dst.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(c / "masks.zip") as z:
+                    z.extractall(dst)
+                print(f"unpacked {c / 'masks.zip'} -> {dst / 'masks'} ({len(list((dst / 'masks').glob('*.npz')))} masks)")
+            shutil.copy(c / "summary.json", dst / "summary.json")
+            return dst
+    raise SystemExit(f"no notebook 12 output (summary.json + masks/ or masks.zip) under {path}")
 
 
 def dice_bce(z, y):
@@ -134,7 +149,7 @@ def main():
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     out, work = Path(a.out), Path(a.work)
     out.mkdir(parents=True, exist_ok=True); work.mkdir(parents=True, exist_ok=True)
-    s3f = find_s3f(a.s3f_dir)
+    s3f = find_s3f(a.s3f_dir, Path(a.work).parent / "s3f_unpacked")
     root = find_cache_root(a.cache_root)
     sp = pd.read_csv(a.splits)
     coll = dict(zip(sp.cache_id, sp.collection))

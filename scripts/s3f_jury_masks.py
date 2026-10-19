@@ -151,6 +151,7 @@ def main():
     ap.add_argument("--out", default="/kaggle/working/s3f_jury")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--limit", type=int, default=0, help="cases per split (tests)")
+    ap.add_argument("--zip_outputs", action="store_true", help="pack masks/ and cases/ into zips at the end (Kaggle)")
     a = ap.parse_args()
     amp = s3.DEV == "cuda"
     t0 = time.time()
@@ -225,6 +226,16 @@ def main():
                      provenance=base), open(out / "memory_jury.pkl", "wb"))
     summary["minutes"] = (time.time() - t0) / 60
     json.dump(summary, open(out / "summary.json", "w"), indent=2, default=float)
+    if a.zip_outputs:                     # Kaggle keeps at most 500 output files: ship masks/ and cases/ as zips
+        import shutil
+        import zipfile
+        for d in ("masks", "cases"):
+            shutil.make_archive(str(out / d), "zip", str(out), d)
+            with zipfile.ZipFile(out / f"{d}.zip") as z:
+                n = sum(f.endswith(".npz") for f in z.namelist())
+            assert n == sum(len(c) for c in cases.values()), (d, n)
+            shutil.rmtree(out / d)
+            print(f"{d}/ -> {d}.zip ({n} files)")
     print(f"total {summary['minutes']:.1f} min -> {out}")
 
 
