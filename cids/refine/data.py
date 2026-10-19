@@ -81,6 +81,7 @@ def perturb_mask(m: np.ndarray, rng, p: float = 0.8, scale: float = 1.0) -> np.n
 
 def pad_min(x: np.ndarray, size: int):
     """Pad the last 3 dims to >= size and to a multiple of 4 (symmetric). Returns array, pads."""
+    assert size % 4 == 0, f"patch size must be divisible by 4 (got {size})"
     pads = []
     for s in x.shape[-3:]:
         t = max(size, int(np.ceil(s / 4) * 4))
@@ -91,9 +92,12 @@ def pad_min(x: np.ndarray, size: int):
 
 class RefinePatchDataset(Dataset):
     def __init__(self, cids, work: Path, patch: int = 64, n_patches: int = 4, augment: bool = True, seed: int = 42,
-                 p_perturb: float = 0.8, perturb_scale: float = 1.0):
+                 p_perturb: float = 0.8, perturb_scale: float = 1.0, error_sampling: bool = False):
+        """error_sampling: patch centres 25 % on correctable missed tumour (GT & ~M0 & band), 25 % on correctable
+        extra (M0 & ~GT & band), 50 % on M0's boundary (so it also learns where NOT to edit); an empty
+        category goes to the boundary. Uses the ground truth of TRAINING cases only."""
         self.cids, self.work, self.patch, self.n, self.augment, self.seed = list(cids), Path(work), patch, n_patches, augment, seed
-        self.p_perturb, self.perturb_scale = p_perturb, perturb_scale
+        self.p_perturb, self.perturb_scale, self.error_sampling = p_perturb, perturb_scale, error_sampling
         self.epoch = 0
 
     def set_epoch(self, e):
@@ -115,11 +119,20 @@ class RefinePatchDataset(Dataset):
         x, _ = pad_min(x, P); y, _ = pad_min(y, P)
         mp = x[3] > 0.5
         edge = np.argwhere(mp ^ ndimage.binary_erosion(mp))
+        if self.error_sampling:
+            band, g = x[5] > 0.5, y[0] > 0.5
+            pools = [(0.25, np.argwhere(g & ~mp & band)), (0.25, np.argwhere(mp & ~g & band)), (0.5, edge)]
+        else:
+            pools = [(0.75, edge)]
         xs, ys = [], []
         for _ in range(self.n):
-            if len(edge) and rng.random() < 0.75:
-                c = edge[rng.integers(len(edge))]
-            else:
+            u, c, acc = rng.random(), None, 0.0
+            for p_, pool in pools:
+                acc += p_
+                if u < acc:
+                    c = pool[rng.integers(len(pool))] if len(pool) else (edge[rng.integers(len(edge))] if len(edge) else None)
+                    break
+            if c is None:
                 c = np.array([rng.integers(s) for s in x.shape[1:]])
             lo = np.clip(c - P // 2, 0, np.array(x.shape[1:]) - P)
             sl = (slice(None),) + tuple(slice(a, a + P) for a in lo)
@@ -129,7 +142,9 @@ class RefinePatchDataset(Dataset):
                     if rng.random() < 0.5:
                         xp = np.flip(xp, ax + 1); yp = np.flip(yp, ax + 1)
                 xp = np.ascontiguousarray(xp); yp = np.ascontiguousarray(yp)
-                xp[:3] = xp[:3] * rng.uniform(0.9, 1.1, (3, 1, 1, 1)).astype(np.float32) \
-                    + rng.uniform(-0.05, 0.05, (3, 1, 1, 1)).astype(np.float32)
+                # intensity jitter on pre and post only, then the subtraction is RECOMPUTED (keeps sub = post - pre)
+                xp[:2] = xp[:2] * rng.uniform(0.9, 1.1, (2, 1, 1, 1)).astype(np.float32) \
+                    + rng.uniform(-0.05, 0.05, (2, 1, 1, 1)).astype(np.float32)
+                xp[2] = xp[1] - xp[0]
             xs.append(xp); ys.append(yp)
         return dict(cid=cid, x=torch.from_numpy(np.stack(xs)), y=torch.from_numpy(np.stack(ys)))

@@ -28,6 +28,8 @@ def find_s3f(path: str, unpack_to: Path) -> Path:
                     if not (dst / "masks").exists():
                         (dst / "masks").symlink_to(hit.parent.resolve(), target_is_directory=True)
                     shutil.copy(c / "summary.json", dst / "summary.json")
+                    if (c / "val_metrics.csv").exists():
+                        shutil.copy(c / "val_metrics.csv", dst / "val_metrics.csv")
                     print(f"masks found in {hit.parent} ({len(list(hit.parent.glob('*.npz')))} files)")
                     return dst
             elif q.is_file() and zipfile.is_zipfile(q):
@@ -37,6 +39,8 @@ def find_s3f(path: str, unpack_to: Path) -> Path:
                         z.extractall(dst)
                     print(f"unpacked {q} -> {dst / 'masks'} ({len(list((dst / 'masks').glob('*.npz')))} masks)")
                 shutil.copy(c / "summary.json", dst / "summary.json")
+                if (c / "val_metrics.csv").exists():
+                    shutil.copy(c / "val_metrics.csv", dst / "val_metrics.csv")
                 return dst
     listing = [str(x.relative_to(p)) for x in list(p.rglob("*"))[:30]] if p.exists() else []
     raise SystemExit(f"no notebook 12 output (summary.json + masks) under {path}; found: {listing}")

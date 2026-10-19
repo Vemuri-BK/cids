@@ -174,7 +174,8 @@ def main():
 
     # 2. juries
     jury = MemoryJury(k=a.k).fit(tr, Dtr)
-    cross = CrossFitMemoryJury(tr, Dtr, k=a.k)
+    cross = CrossFitMemoryJury(tr, Dtr, k=a.k, allow_tiny=bool(a.limit))   # real runs: fail closed
+    (out / "crossfit_folds.json").write_text(json.dumps(dict(fold_of=cross.fold_of, leaky_folds=cross.leaky_folds)))
     j11 = trees11(tr)
     # 3. cut-offs on val
     pv, pt, ptr = jury.proba(va, Dva), jury.proba(te, Dte), cross.proba(tr, Dtr)

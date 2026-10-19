@@ -42,3 +42,12 @@ def test_crossfit_never_uses_own_patient():
 def test_knn_weights_nearest():
     e = np.eye(3, dtype=np.float32)
     assert knn_score(e[[0]], e, np.array([1.0, 0, 0]), k=3)[0] > 0.99
+
+
+def test_crossfit_fails_closed_when_a_fold_is_too_small():
+    import pytest
+    df, D = _table(n_pat=2)                                   # each fold keeps 1 patient
+    with pytest.raises(Exception):
+        CrossFitMemoryJury(df, D, n_folds=5, k=5)
+    cf = CrossFitMemoryJury(df, D, n_folds=5, k=5, allow_tiny=True)
+    assert cf.leaky_folds                                                # recorded, not silent

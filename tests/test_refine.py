@@ -101,3 +101,40 @@ def test_band_oracle_fixes_band_errors_only():
     a = d <= 8
     o = (m0 & ~a) | ((g | far) & a)
     assert not o[far].any()                                            # unreachable: stays missed
+
+
+def test_pad_min_rejects_patch_not_divisible_by_4():
+    from cids.refine.data import pad_min
+    with pytest.raises(AssertionError):
+        pad_min(np.zeros((1, 10, 10, 10)), 30)
+
+
+def _toy_work(tmp_path):
+    shape = (40, 40, 40)
+    gt = _ball(shape, (20, 20, 20), 8)
+    m0 = _ball(shape, (22, 20, 20), 7)                                 # shifted: both missed and extra voxels
+    img = np.random.default_rng(0).random((2,) + shape).astype(np.float16)
+    np.savez(tmp_path / "duke_001.npz", image=img, label=gt[None].astype(np.uint8))
+    np.savez(tmp_path / "m.npz", mask=m0.astype(np.uint8))
+    work = tmp_path / "work"; work.mkdir()
+    prepare_case("duke_001", tmp_path / "duke_001.npz", tmp_path / "m.npz", work, margin=4)
+    return work
+
+
+def test_augmented_subtraction_channel_stays_post_minus_pre(tmp_path):
+    work = _toy_work(tmp_path)
+    ds = RefinePatchDataset(["duke_001"], work, patch=24, n_patches=4, augment=True, p_perturb=0.0)
+    for e in range(3):
+        ds.set_epoch(e)
+        x = ds[0]["x"].numpy()
+        assert np.allclose(x[:, 2], x[:, 1] - x[:, 0], atol=1e-5)
+
+
+def test_error_sampling_centres_patches_on_correctable_errors(tmp_path):
+    work = _toy_work(tmp_path)
+    def err_frac(es):
+        ds = RefinePatchDataset(["duke_001"], work, patch=8, n_patches=64, augment=False, error_sampling=es)
+        b = ds[0]
+        m, g, band = b["x"][:, 3] > 0.5, b["y"][:, 0] > 0.5, b["x"][:, 5] > 0.5
+        return ((m ^ g) & band).float().mean().item()
+    assert err_frac(True) > err_frac(False)                            # more error voxels per patch

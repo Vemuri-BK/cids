@@ -97,20 +97,23 @@ class MemoryJury:
 class CrossFitMemoryJury:
     """Out-of-fold juries for training patients (folds by patient); other cases use the full jury."""
 
-    def __init__(self, rows: pd.DataFrame, desc: np.ndarray, n_folds: int = 5, **kw):
+    def __init__(self, rows: pd.DataFrame, desc: np.ndarray, n_folds: int = 5, allow_tiny: bool = False, **kw):
         from sklearn.model_selection import GroupKFold
         r = _real(rows)
         ids = rows.cache_id.to_numpy()
         pats = np.array(sorted(set(ids[r])))
         self.full = MemoryJury(**kw).fit(rows, desc)
-        self.fold_of, self.models = {}, []
+        self.fold_of, self.models, self.leaky_folds = {}, [], []
         for f, (fit, held) in enumerate(GroupKFold(min(n_folds, len(pats))).split(pats, groups=pats)):
             keep = np.isin(ids, pats[fit])
             try:
                 self.models.append(MemoryJury(**kw).fit(rows[keep], np.asarray(desc)[keep]))
-            except ValueError:                       # only in tiny test runs: a fold without both classes
-                print(f"[warn] cross-fit fold {f}: too few candidates -> uses the full jury (tests only)")
+            except ValueError:
+                if not allow_tiny:                   # fail closed: never let a held-out patient's own jury leak in
+                    raise
+                print(f"[warn] cross-fit fold {f}: too few candidates -> full jury (allow_tiny, tests only)")
                 self.models.append(self.full)
+                self.leaky_folds.append(f)
             self.fold_of.update({c: f for c in pats[held]})
 
     def proba(self, rows: pd.DataFrame, desc: np.ndarray) -> np.ndarray:

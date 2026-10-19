@@ -41,7 +41,7 @@ from cids.data.cache import find_cache_root, load_case  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.provenance import file_digest, require_cases, save_npz_atomic  # noqa: E402
 from cids.refine.source import find_s3f  # noqa: E402
-from cids.refine.data import RefinePatchDataset, channels, pad_min, prepare_case  # noqa: E402
+from cids.refine.data import R_ALLOW, RefinePatchDataset, channels, pad_min, prepare_case  # noqa: E402
 from cids.refine.model import BoundaryRefiner  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,8 +96,12 @@ def evaluate(model, work, metas, patch, amp):
         gt, m0 = d["gt"].astype(bool), d["m0"].astype(bool)
         r = refine_case(model, work, meta, patch, amp)
         dm = lambda p: 2 * (p & gt).sum() / (p.sum() + G) if p.sum() + G else 1.0
+        add, rem = r & ~m0, m0 & ~r
         rows.append(dict(cache_id=meta["cid"], dice_m0=float(dm(m0)), dice_ref=float(dm(r)), changed=int((r ^ m0).sum()),
-                         added=int((r & ~m0).sum()), removed=int((m0 & ~r).sum())))
+                         added=int(add.sum()), removed=int(rem.sum()),
+                         add_helpful=int((add & gt).sum()), add_harmful=int((add & ~gt).sum()),     # diagnostics only:
+                         rem_helpful=int((rem & ~gt).sum()), rem_harmful=int((rem & gt).sum()),     # GT never enters
+                         vol_m0=int(m0.sum()), vol_ref=int(r.sum()), gt_vol=int(G)))                # the model
     model.train()
     return pd.DataFrame(rows)
 
@@ -132,6 +136,10 @@ def main():
                          "cases cannot be fixed by a boundary refiner and only add noise (v1 0)")
     ap.add_argument("--weight_hard", action="store_true",
                     help="sample training cases in proportion to their boundary error (1 - Dice of the jury mask)")
+    ap.add_argument("--error_sampling", action="store_true",
+                    help="patch centres 25%% correctable missed / 25%% correctable extra / 50%% boundary (training GT only)")
+    ap.add_argument("--skip_test", action="store_true", help="pilot runs: no test-set evaluation")
+    ap.add_argument("--train_check", type=int, default=120, help="fixed training cases evaluated (unaugmented) at each val")
     ap.add_argument("--time_budget_h", type=float, default=10.0)
     ap.add_argument("--limit", type=int, default=0, help="cases per split (tests)")
     ap.add_argument("--no_amp", action="store_true")
@@ -150,6 +158,19 @@ def main():
     if miss:
         raise SystemExit(f"{len(miss)} cases have no S3f mask in {s3f} (e.g. {miss[:3]})")
     s3f_summary = json.loads((s3f / "summary.json").read_text())
+    # ROI cache identity: the crops in --work must come from exactly these masks and settings
+    import hashlib
+    h = hashlib.md5()
+    for c, _ in sorted(x for s_ in cases.values() for x in s_):
+        h.update(c.encode()); h.update((s3f / "masks" / f"{c}.npz").read_bytes())
+    roi_manifest = dict(version=2, masks_md5=h.hexdigest(), n_cases=sum(len(v) for v in cases.values()), margin=16,
+                        r_allow=R_ALLOW, s3f_threshold=s3f_summary.get("threshold"))
+    mf = work / "rois_manifest.json"
+    if mf.exists() and json.loads(mf.read_text()) != roi_manifest:
+        raise SystemExit(f"{work} holds ROIs from other masks/settings ({mf}); use a new --work")
+    if not mf.exists() and any(work.glob("*.npz")):
+        raise SystemExit(f"{work} holds ROIs without a manifest; use a new --work")
+    mf.write_text(json.dumps(roi_manifest, indent=2))
     (out / "config.json").write_text(json.dumps(dict(vars(a), s3f=str(s3f), s3f_summary=file_digest(s3f / "summary.json"),
                                                      s3f_threshold=s3f_summary.get("threshold")), indent=2))
     print(f"S3f masks {s3f} (memory jury t = {s3f_summary.get('threshold')}) | cache {root} | {DEV} | mode {a.mode}")
@@ -179,11 +200,23 @@ def main():
     print(f"refiner ({a.mode}): {n_par:,} parameters")
     v0 = evaluate(model, work, metas["val"], a.patch, amp)
     assert (v0.dice_ref == v0.dice_m0).all() and (v0.changed == 0).all(), "refiner at init must reproduce M0 exactly"
+    vm = s3f / "val_metrics.csv"                         # per-case parity with notebook 12 (not just the mean)
+    if vm.exists() and not a.limit:
+        ref = pd.read_csv(vm).query("rule == 'memory_jury'").set_index("cache_id").dice
+        diff = (v0.set_index("cache_id").dice_m0 - ref.reindex(v0.cache_id).values).abs().max()
+        if not diff < 1e-6:
+            raise SystemExit(f"epoch-0 per-case val Dice differs from notebook 12 (max |diff| {diff:.2e}): wrong masks?")
+        print(f"per-case parity with notebook 12 val_metrics.csv: max |diff| {diff:.1e}")
     print(f"epoch 0 (= M0): val Dice {v0.dice_m0.mean():.4f} (S3f val {s3f_summary.get('val_dice', float('nan')):.4f})")
+    rng_c = np.random.default_rng(0)
+    check_metas = [train_metas[i] for i in sorted(rng_c.choice(len(train_metas), min(a.train_check, len(train_metas)),
+                                                                replace=False))]
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     ds = RefinePatchDataset(train_ids, work, a.patch, a.n_patches, augment=True, seed=a.seed,
-                            p_perturb=a.p_perturb, perturb_scale=a.perturb_scale)
+                            p_perturb=a.p_perturb, perturb_scale=a.perturb_scale, error_sampling=a.error_sampling)
+    print(f"patch sampling: {'error-aware (25/25/50)' if a.error_sampling else 'boundary 75% / random 25%'} | "
+          f"test: {'SKIPPED (pilot)' if a.skip_test else 'once, at the end'}")
     total, warm = a.epochs * len(ds), 2 * len(ds)
     best, log, step, ep_t = float(v0.dice_m0.mean()), [dict(epoch=0, val_dice=float(v0.dice_m0.mean()))], 0, []
     torch.save(model.state_dict(), out / "best.pt")                    # M0 itself is the fallback
@@ -213,18 +246,34 @@ def main():
         msg = f"epoch {epoch}: loss {rec['loss']:.4f}"
         if epoch % a.val_every == 0 or epoch == a.epochs:
             v = evaluate(model, work, metas["val"], a.patch, amp)
+            v.to_csv(out / f"val_epoch{epoch:03d}.csv", index=False)
+            tc = evaluate(model, work, check_metas, a.patch, amp)          # unaugmented training cases
+            torch.save(model.state_dict(), out / "last_model.pt")         # trained state, even if it loses to M0
             rec.update(val_dice=float(v.dice_ref.mean()), val_changed_mean=float(v.changed.mean()),
-                       val_better=int((v.dice_ref - v.dice_m0 > 0.01).sum()), val_worse=int((v.dice_ref - v.dice_m0 < -0.01).sum()))
+                       val_better=int((v.dice_ref - v.dice_m0 > 0.01).sum()), val_worse=int((v.dice_ref - v.dice_m0 < -0.01).sum()),
+                       val_add_helpful=int(v.add_helpful.sum()), val_add_harmful=int(v.add_harmful.sum()),
+                       val_rem_helpful=int(v.rem_helpful.sum()), val_rem_harmful=int(v.rem_harmful.sum()),
+                       train_check_m0=float(tc.dice_m0.mean()), train_check_ref=float(tc.dice_ref.mean()))
             if rec["val_dice"] > best:
                 best = rec["val_dice"]; torch.save(model.state_dict(), out / "best.pt")
                 v.to_csv(out / "val_best_per_case.csv", index=False)
             msg += (f" | val Dice {rec['val_dice']:.4f} (M0 {v.dice_m0.mean():.4f}) better/worse {rec['val_better']}/"
-                    f"{rec['val_worse']} changed vox {rec['val_changed_mean']:.0f} | best {best:.4f}")
+                    f"{rec['val_worse']} changed vox {rec['val_changed_mean']:.0f} | best {best:.4f}"
+                    f"\n   val edits (voxels): added {rec['val_add_helpful']} helpful / {rec['val_add_harmful']} harmful, "
+                    f"removed {rec['val_rem_helpful']} helpful / {rec['val_rem_harmful']} harmful"
+                    f" | train-check ({len(check_metas)} cases, unaugmented): {rec['train_check_m0']:.4f} -> "
+                    f"{rec['train_check_ref']:.4f}")
         print(msg, flush=True)
         log.append(rec); pd.DataFrame(log).to_csv(out / "train_log.csv", index=False)
         ep_t.append(time.time() - te)
         if (time.time() - t0) / 3600 + 1.5 * np.mean(ep_t[-3:]) / 3600 > a.time_budget_h:
             print(f"time budget reached after epoch {epoch}; testing best.pt"); break
+
+    if a.skip_test:
+        json.dump(dict(mode=a.mode, best_val_dice=best, val_dice_m0=float(v0.dice_m0.mean()), log=log,
+                       config=vars(a), minutes=(time.time() - t0) / 60), open(out / "pilot_summary.json", "w"), indent=2)
+        print(f"pilot done (test skipped): best val Dice {best:.4f} vs M0 {v0.dice_m0.mean():.4f} -> {out}")
+        return
 
     # 4. test once
     model.load_state_dict(torch.load(out / "best.pt", map_location=DEV, weights_only=False))
