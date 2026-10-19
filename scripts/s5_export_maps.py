@@ -10,7 +10,10 @@ Saved per case at the 1 mm cache grid: <out>/<cache_id>.npz with
              jury's P(real tumour), so SegResNet's false blobs enter the council weak (no ground truth used;
              training cases get a cross-fitted jury that never saw them)
 Train cases use sliding-window overlap 0.25 (faster), val/test 0.5. Existing files are skipped
-(resumable). Prints a sanity table for val/test: Dice of finder (rel20) and checker (rel20).
+(resumable) -- but only if <out>/_maps_manifest.json says they were made by the SAME models and settings
+(content hashes); otherwise the run stops (use a new --out). Files are written atomically; a split is marked
+complete in the manifest when all its cases exist (S6 checks this). Prints a sanity table for val/test:
+Dice of finder (rel20) and checker (rel20).
 
 Example
   python scripts/s5_export_maps.py --cache_root <cache> --seg_ckpt segresnet_img_e100_best.pt \\
@@ -19,6 +22,7 @@ Example
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -37,8 +41,38 @@ from cids.eval.metrics import dice  # noqa: E402
 from cids.eval.postproc import rel20  # noqa: E402
 from cids.fcouncil.adapter import SamFreqAdapter  # noqa: E402
 from cids.models.sam_med3d import download_turbo  # noqa: E402
+from cids.provenance import PREPROC_VERSION, file_digest, require_cases, save_npz_atomic  # noqa: E402
 
 DEV = s3.DEV
+MAPS_VERSION = 1
+MANIFEST = "_maps_manifest.json"
+
+
+def maps_manifest(a, turbo) -> dict:
+    return dict(version=MAPS_VERSION, seg=file_digest(a.seg_ckpt), sam=file_digest(a.sam_ckpt),
+                adapter=file_digest(a.adapter_ckpt), jury=file_digest(a.jury), turbo=file_digest(turbo),
+                random_weights=a.random_weights, top_k=a.top_k, overlap=dict(train=0.25, val=0.5, test=0.5),
+                preproc=PREPROC_VERSION)
+
+
+def check_out_dir(out: Path, man: dict) -> dict:
+    """Existing maps may only be continued by the same experiment. Returns the stored 'complete' record."""
+    mf = out / MANIFEST
+    have = any(out.glob("*.npz"))
+    if mf.exists():
+        old = json.loads(mf.read_text())
+        if old.get("experiment") != man:
+            raise SystemExit(f"{out} holds maps from different models/settings ({mf}); use a new --out")
+        return old.get("complete", {})
+    if have:
+        raise SystemExit(f"{out} holds maps without {MANIFEST} (unknown models); use a new --out")
+    return {}
+
+
+def write_manifest(out: Path, man: dict, complete: dict):
+    tmp = out / (MANIFEST + ".partial")
+    tmp.write_text(json.dumps(dict(experiment=man, complete=complete), indent=2))
+    tmp.replace(out / MANIFEST)
 
 
 def main():
@@ -78,13 +112,14 @@ def main():
     print(f"cache {root}\nfinder {a.seg_ckpt}\nchecker {a.sam_ckpt} + adapter: {a.adapter_ckpt or 'none'}\n{DEV}")
 
     sp = pd.read_csv(a.splits)
+    man = maps_manifest(a, turbo)
+    complete = check_out_dir(out, man)
+    write_manifest(out, man, complete)
     rows, out_of_time = [], False
     for split in a.only.split(","):
         if out_of_time:
             break
-        r = sp[sp.split == split]
-        cases = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
-        cases = [x for x in cases if x[1].exists()]
+        cases = require_cases(sp, root, split)                     # every requested case must exist
         if a.limit:
             cases = cases[:a.limit]
         todo = [x for x in cases if not (out / f"{x[0]}.npz").exists()]
@@ -104,8 +139,8 @@ def main():
                 w = jury.predict(cid, feats)
                 by_k = dict(zip(feats.k, w)); w = [by_k[d["k"]] for d in refined]
             sam_p = np.max([wi * d["prob"] for wi, d in zip(w, refined)], 0) if refined else np.zeros_like(sprob)
-            np.savez_compressed(out / f"{cid}.npz", seg=(np.clip(sprob, 0, 1) * 255).round().astype(np.uint8),
-                                sam=(np.clip(sam_p, 0, 1) * 255).round().astype(np.uint8))
+            save_npz_atomic(out / f"{cid}.npz", seg=(np.clip(sprob, 0, 1) * 255).round().astype(np.uint8),
+                            sam=(np.clip(sam_p, 0, 1) * 255).round().astype(np.uint8))
             if split != "train":
                 gt = lbl > 0
                 rows.append(dict(cache_id=cid, split=split, collection=cid.split("_")[0].upper(),
@@ -115,6 +150,9 @@ def main():
                 out_of_time = True
                 print("time budget reached; re-run the same command to continue (finished cases are skipped)")
                 break
+        if all((out / f"{c}.npz").exists() for c, _ in cases):
+            complete[split] = sorted(c for c, _ in cases)
+            write_manifest(out, man, complete)
     if rows:
         df = pd.DataFrame(rows); df.to_csv(out / "_export_check.csv", index=False)
         print("\nsanity check (cases exported in this run):")

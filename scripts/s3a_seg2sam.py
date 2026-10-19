@@ -32,6 +32,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cids.data.cache import SAM_SIZE, crop_pad, find_cache_root, load_case, resample, znorm  # noqa: E402
+from cids.provenance import require_cases  # noqa: E402
 from cids.data.volumes import VolumeDataset, unpad  # noqa: E402
 from cids.eval.metrics import all_metrics, dice  # noqa: E402
 from cids.eval.postproc import rel20  # noqa: E402
@@ -221,9 +222,7 @@ def main():
 
     sp = pd.read_csv(a.splits)
     def items(split):
-        r = sp[sp.split == split]
-        lst = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
-        lst = [x for x in lst if x[1].exists()]
+        lst = require_cases(sp, root, split)                  # every requested case must exist
         return lst[:a.limit_eval] if a.limit_eval else lst
 
     def run(cases, desc, full, save_rule=None):

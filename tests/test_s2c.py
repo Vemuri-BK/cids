@@ -131,14 +131,18 @@ def test_feature_cache_is_reused_only_with_the_same_manifest(tmp_path):
     import s3d_learned_jury as jury
     f, mf = tmp_path / "train_features.csv", tmp_path / "train_features.manifest.json"
     cases = [("duke_001", Path("a")), ("duke_002", Path("b"))]
-    m1 = jury.split_manifest("train", cases, 0.5, dict(seg=dict(name="seg.pt", bytes=1)))
+    ck = tmp_path / "seg.pt"; ck.write_bytes(b"weights-A")
+    m1 = jury.split_manifest("train", cases, 0.5, dict(seg=jury.file_sig(ck)))
     f.write_text("x\n1\n")
     assert not jury.cache_ok([f], m1, mf)                     # legacy table without manifest -> recompute
-    assert (tmp_path / "train_features.csv.stale").exists() and not f.exists()
+    assert len(list(tmp_path.glob("train_features.csv.stale-*"))) == 1 and not f.exists()
     f.write_text("x\n1\n"); mf.write_text(__import__("json").dumps(m1))
     assert jury.cache_ok([f], m1, mf)                         # same experiment -> reuse
-    m2 = jury.split_manifest("train", cases, 0.5, dict(seg=dict(name="seg.pt", bytes=2)))   # other checkpoint
-    assert not jury.cache_ok([f], m2, mf) and not f.exists()
+    ck.write_bytes(b"weights-B")                              # SAME size, different weights
+    m2 = jury.split_manifest("train", cases, 0.5, dict(seg=jury.file_sig(ck)))
+    assert m2 != m1
+    assert not jury.cache_ok([f], m2, mf) and not f.exists()  # second invalidation: no name clash
+    assert len(list(tmp_path.glob("train_features.csv.stale-*"))) == 2
 
 
 def test_s2c_selection_rejects_epochs_that_drop_real_tumours():
@@ -165,3 +169,36 @@ def test_council_teacher_maps_are_not_augmented(tmp_path):
     b = CouncilPatchDataset([("duke_001", path)], maps, patch=32, n_patches=1, augment=False, map_aug=False)[0]
     assert torch.equal(a["teacher"], b["image"][:, 3:5])      # targets = clean maps
     assert not torch.equal(a["image"][:, 3:5], b["image"][:, 3:5])   # inputs = augmented maps
+
+
+def test_maps_manifest_blocks_mixing_and_incomplete_exports(tmp_path):
+    import s5_export_maps as s5
+    import s6_freq_council as s6
+    from types import SimpleNamespace
+    ck = tmp_path / "seg.pt"; ck.write_bytes(b"A")
+    a = SimpleNamespace(seg_ckpt=ck, sam_ckpt=ck, adapter_ckpt="", jury="", random_weights=True, top_k=5)
+    out = tmp_path / "maps"; out.mkdir()
+    m1 = s5.maps_manifest(a, None)
+    assert s5.check_out_dir(out, m1) == {}
+    s5.write_manifest(out, m1, {"val": ["duke_001"]})
+    np.savez(out / "duke_001.npz", seg=np.zeros(1), sam=np.zeros(1))
+    assert s5.check_out_dir(out, m1) == {"val": ["duke_001"]}             # same experiment: continue
+    ck.write_bytes(b"B")                                                     # other finder weights
+    with pytest.raises(SystemExit, match="different models"):
+        s5.check_out_dir(out, s5.maps_manifest(a, None))
+    legacy = tmp_path / "legacy"; legacy.mkdir(); np.savez(legacy / "x.npz", a=np.zeros(1))
+    with pytest.raises(SystemExit, match="without"):
+        s5.check_out_dir(legacy, m1)
+    assert s6.check_maps(out, {"val": [("duke_001", None)]}) == m1
+    with pytest.raises(SystemExit, match="not completely exported"):
+        s6.check_maps(out, {"val": [("duke_001", None), ("duke_002", None)]})
+
+
+def test_memory_preflight():
+    import s3e_memory_jury as mem
+    ok = pd.DataFrame(dict(cache_id=["a", "b"], k=[1, 1], on_tumour=[1, 0]))
+    mem.check_memory(ok)
+    with pytest.raises(SystemExit):
+        mem.check_memory(ok.assign(cache_id=["a", "a"]))                  # one patient
+    with pytest.raises(SystemExit):
+        mem.check_memory(ok.assign(on_tumour=[1, 1]))                     # one class

@@ -50,6 +50,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cids.data.cache import find_cache_root, load_case  # noqa: E402
+from cids.provenance import require_paths  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.models.sam_lora import (BoxCorners, add_lora, decode, gt_boxes, interactive,  # noqa: E402
                                   negative_box, messy_box, realistic_boxes, sample_clicks, upsample)
@@ -538,7 +539,7 @@ def main():
         rows = sp[sp[args.split_col] == split]
         sub = lambda off: "train" if off == "train" else "test"          # S0 folder names
         lst = [(c, emb_root / sub(o) / f"{c}.npz") for c, o in zip(rows.cache_id, rows.official)]
-        return [x for x in lst if x[1].exists()]
+        return require_paths(lst, split, "SAM embeddings")
 
     tr, va, te = items("train"), items("val"), items("test")
     if args.limit_train:

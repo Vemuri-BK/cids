@@ -77,6 +77,15 @@ def run_split(split, cases, seg, sam, box, amp, overlap, out, manifest=None):
 
 
 # ---------------------------------------------------------------------------- memory scores
+def check_memory(tr):
+    """The memory needs >= 2 patients with candidates (patient-grouped folds) and both classes (probe)."""
+    r = tr[tr.k >= 0]
+    n_pat, classes = r.cache_id.nunique(), set(r.on_tumour.astype(int))
+    if n_pat < 2 or classes != {0, 1}:
+        raise SystemExit(f"memory unusable: {n_pat} patients with candidates, classes {sorted(classes)} "
+                         f"(need >= 2 patients and both real and false candidates)")
+
+
 def knn_score(query, mem, mem_y, k=10):
     """Similarity-weighted share of real tumours among the k nearest memories (cosine; descriptors are unit)."""
     sims = query.astype(np.float32) @ mem.astype(np.float32).T
@@ -155,10 +164,11 @@ def main():
     print(f"cache {root}\nfinder {a.seg_ckpt}\nchecker {a.sam_ckpt}\n{s3.DEV}")
     sp = pd.read_csv(a.splits)
 
-    def items(split):
-        r = sp[sp.split == split]
-        lst = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
-        return [x for x in lst if x[1].exists()][:a.limit or None]
+    def items(split):                                # every requested case must exist (no silent shrinking)
+        return s3d.require_cases(sp, root, split)[:a.limit or None]
+
+    if a.k < 1 or len(items("train")) < 2:
+        raise SystemExit(f"need k >= 1 and >= 2 training patients (k = {a.k}, {len(items('train'))} patients)")
 
     base = dict(seg=s3d.file_sig(a.seg_ckpt), sam=s3d.file_sig(a.sam_ckpt), turbo=s3d.file_sig(turbo),
                 random_weights=a.random_weights, top_k=5)
@@ -168,6 +178,7 @@ def main():
         return run_split(split, c, seg, sam, box, amp, 0.5, out, s3d.split_manifest(split, c, 0.5, base))
 
     tr, Dtr = run("train")
+    check_memory(tr)
     va, Dva = run("val")
     te, Dte = run("test")
     n_true = int(tr[tr.k >= 0].on_tumour.sum()); n_all = int((tr.k >= 0).sum())
@@ -212,6 +223,8 @@ def main():
     coll = dict(zip(sp.cache_id, sp.collection))
     per = pd.DataFrame(test_case); per["collection"] = per.index.map(coll)
     summary["test_per_collection"] = per.groupby("collection").mean().round(4).to_dict(orient="index")
+    summary["cases"] = {k: int(d.cache_id.nunique()) for k, d in (("train", tr), ("val", va), ("test", te))}
+    summary["limit"] = a.limit
     summary["minutes"] = (time.time() - t0) / 60
     json.dump(summary, open(out / "summary.json", "w"), indent=2, default=float)
 

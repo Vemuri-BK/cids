@@ -20,12 +20,15 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | S3a: SegResNet-60 → SAM-S2a, rule-based jury | ✅ done | test 0.675 |
 | S3b: SegResNet-100 → SAM-S2b, rule `segjury_0.7` | ✅ done | test **0.699** |
 | S2c: SAM trained on SegResNet's real false candidates | ✅ done — **negative result** | rejection ↑ but real tumours lost; AUC not improved |
-| **S3d: learned jury (gradient boosting on candidate clues)** | ✅ done — **current best** | **test 0.735**, HD95 3.6, NSD 0.783, p = 0.0008 vs S3b |
+| S3d: learned jury (gradient boosting on 11 candidate clues) | ✅ done | test 0.735, HD95 3.6, NSD 0.783, p = 0.0008 vs S3b |
+| **S3e: jury + memory of known candidates (13 clues)** | ✅ done — **current best** | **test 0.7495** (+0.014 vs S3d, bootstrap CI [0.004, 0.026], p = 0.053); notebook 11 |
 | Frequency council code (S4 adapter, S5 maps, S6 council) | ✅ built, tested | `cids/fcouncil/`, `scripts/s4–s6`, notebooks 07, 08 |
-| S4: SAM frequency adapter (60 epochs) | 🏃 running (notebook 07) | decides whether 08 uses the adapter |
-| S5 + S6: frequency council, dual supervision (main method) | ⏳ next (notebook 08) | must beat 0.735 |
+| S4: SAM frequency adapter (60 epochs) | ✅ done — not used | messy +0.013, clean −0.008 vs S2b |
+| S5 + S6: frequency council, dual supervision | ⛔ stopped — no gain | val council 0.7236 ≈ finder 0.7238 (Day 11–16) |
+| Code review fixes (vbk review 2026-10-14) | ✅ done | 10 fixes, 45 tests (Day 11–16) |
+| **Frequency boundary refinement of the jury mask** | ⏳ **next** | refine the kept mask only; must beat 0.7495 |
 | One-file pipeline export (S3d as `.pt`) | 🛠 code ready, uncommitted | `cids/pipeline.py`, `scripts/s3d_export_pipeline.py` |
-| Acquisition-metadata token (geometry → band weights) | ⏳ after S6 | `cond_dim` slot already in adapter / gate |
+| Acquisition-metadata token (geometry → band weights) | ⏳ later | `cond_dim` slot already in adapter / gate |
 | Ablations, LOCO, 3 seeds, fairness, faster full-res metrics | ⏳ | — |
 | Paper (IEEE JBHI / TMI) | ⏳ | — |
 
@@ -36,9 +39,86 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | SegResNet-100, rel20 | 0.724 | 0.684 | 7.3 | 0.716 | 14 |
 | S3a: SegResNet-60 + SAM-S2a, rules | – | 0.675 | – | – | – |
 | S3b: SegResNet-100 + SAM-S2b, `segjury_0.7` | 0.747 | 0.699 | 4.1 | 0.744 | 26 |
-| **S3d: SegResNet-100 + SAM-S2b + learned jury** | **0.766** | **0.735** | **3.6** | **0.783** | **17** |
-| perfect candidate choice (upper bound, all touching candidates) | 0.812 | 0.787 | – | – | – |
+| S3d: SegResNet-100 + SAM-S2b + learned jury (11 clues) | 0.766 | 0.735 | 3.6 | 0.783 | 17 |
+| **S3e: + memory + probe clues (13 clues)** | **0.774** | **0.7495** | – | – | – |
+| best candidate subset (oracle, upper bound of any jury) | 0.812 | 0.790 | – | – | – |
+| keep all touching candidates (old 'oracle') | 0.812 | 0.787 | – | – | – |
 | SAM-S2a / S2b with GT box (oracle prompt, not automatic) | – / 0.729 crop | 0.708 / 0.698 | 4.4 / – | 0.729 / – | – |
+
+---
+
+## Days 11–16 — 2026-10-14 → 2026-10-19
+
+### S4 frequency adapter (notebook 07, 60 epochs) — small, mixed effect
+- Messy-box Dice +0.013 over S2b, clean-box Dice −0.008. Did not meet the bar ("messy clearly better and HD95/NSD not worse") → notebook 08 ran **without** the adapter (`ADAPTER_CKPT = ''`).
+
+### S5 + S6 frequency council (notebook 08) — stopped, no gain
+- S5 maps took ~3.3 h; S6 then trained for its full 10 h budget (run > 14 h in total).
+- Val council ≈ finder (0.7236 vs 0.7238). Possible explanation (not proven by similar mean Dice): the council relied on the finder map instead of improving on it.
+- Likely causes: (1) training-case finder maps are in-sample (SegResNet saw those cases) → maps look cleaner than on new cases (stacking leak); (2) patches are tumour-centred; (3) distillation targets were the *augmented* maps (fixed Day 16).
+- Decision (vbk, 2026-10-14): drop this run; the frequency idea moves to **boundary refinement of the jury mask** (see Next).
+
+### Code review by vbk (2026-10-14) — `docs/CODEBASE_REVIEW_2026-10-14.md`, `docs/review_2026-10-14/`
+- Checked against our numbers:
+  - "Oracle" (keep all touching candidates) is not the true maximum → best candidate subset (all ≤ 31 subsets per case): **test 0.7901**, val 0.812 (touching: 0.7873 / 0.8119). Report **0.790**.
+  - S3's `seg_rel20` (rel20 among top-5 candidates) ≠ shared rel20 — but identical on our data (test 0.6835 both). Results stand.
+  - S2c selection bug is real, but the actual run selected ≈ S2b, so its conclusion stands.
+
+### Second review (vbk, `docs/CODE_REVIEW_2026-10-19.txt`) — provenance fixes (52 tests pass)
+- `cids/provenance.py`: content hash (sha256) of every checkpoint; cases digest (ids + cache file sizes + preprocessing version); unique `*.stale-<time>` archives (2nd invalidation failed on Windows); atomic `.npz` writes; required-case checks.
+- Cached S3d/S3e tables: manifest now uses content hashes + cases digest.
+- S5 maps: `_maps_manifest.json` (models by hash, settings); a folder with other or unknown maps is refused; a split is marked complete only when all its cases exist; S6 refuses incomplete / foreign map folders.
+- S6 resume: `best.pt` hash stored in `last.pt` and checked on every resume (same or new folder); the maps identity must match; a recorded best is never replaced by current weights.
+- All scripts: missing cases → error with a list (no silent smaller evaluation); summaries record case counts and `--limit`.
+- S3e preflight: ≥ 2 patients, both classes, k ≥ 1.
+- Notebooks 08, 11: shell steps via `sh()` (checked subprocess) → Run All stops on any failed step (pip, pytest, smoke, runs).
+- Overlap: S6 validation 0.25 / test 0.5 kept for speed; finder and council always compared at the same overlap (documented).
+- Open (next step): S3e bundle + integration into S5 / pipeline; full S3e metrics (HD95/NSD).
+- S3e run files kept in `outputs/s3e_run_2026-10-19/` (summary, feature tables, train descriptors) for re-checking 0.7495.
+
+### Bug fixes from the review (2026-10-19, 45 tests pass)
+| Fix | Scripts |
+|---|---|
+| S2c: epoch 0 (= S2b) saved as fallback best; an epoch keeping < `--min_real_keep` of real tumours can never be best | s2a |
+| S4: epoch 0 (= S2b, zero adapter) saved as best; the adapter must beat it | s4 |
+| S6: resuming into a new folder copies the old `best.pt` (error if missing) | s6 |
+| Cached feature tables carry a manifest (checkpoints, cases, overlap, version); mismatch → old files renamed `*.stale`, split recomputed | s3d, s3e |
+| `seg_rel20` = shared rel20 everywhere; old rule kept as `cand_rel20` | s3a, s3d, s3e |
+| `oracle` = best candidate subset; old one kept as `oracle_touching` | s3d, s3e |
+| LOCO full-res metrics read the cache folder of the *official* split | s2a |
+| Council distillation targets = clean maps (inputs stay augmented) | fcouncil/data.py, s6 |
+| S5 time budget stops all splits and exits non-zero (S6 can't start with missing maps) | s5 |
+| scikit-learn, tqdm in requirements | requirements.txt |
+
+### S3e — memory clue for the learned jury (notebook 11) — **new best, test 0.7495**
+- Idea (vbk, from cache-augmented generation): compare each candidate with a memory of KNOWN training candidates.
+- Descriptor per candidate: SAM's frozen embedding (384×8³), mean over the box tokens ‖ mean over the crop → 768-d, L2-normalised (`s3a.embedding_descriptor`).
+- Memory = 2561 training candidates (1246 real / 1315 false).
+- Two new clues:
+  - `mem_knn`: similarity-weighted share of real tumours among the 10 nearest memories (cosine, softmax T 0.05).
+  - `mem_probe`: logistic regression on the descriptor (C 0.1).
+- Both are cross-fitted by patient on train (5 folds, never the candidate's own patient; unit test). Val/test use the full memory.
+- Same gradient-boosting jury and val-chosen cut-off as S3d.
+
+| Variant (test 306) | Val Dice | Test Dice | Δ vs jury11 | better / worse (>0.05) | Wilcoxon p | test AUC |
+|---|---|---|---|---|---|---|
+| jury11 (= S3d, reproduced) | 0.766 | 0.7352 | — | — | — | 0.916 |
+| jury11 + memory | 0.773 | 0.7404 | +0.005 | 14 / 9 | 0.39 | 0.931 |
+| **jury11 + memory + probe (13 clues)** | **0.774** | **0.7495** | **+0.014** | **17 / 4** | **0.053** | **0.938** |
+
+- Robustness (reproduced locally from the CSVs):
+  - Better than jury11 at every cut-off 0.3–0.9 (0.741–0.751 vs 0.729–0.741).
+  - 95 % bootstrap CI of the gain [+0.004, +0.026].
+- Per collection (jury11 → 13 clues): DUKE 0.674 → 0.701, ISPY1 0.733 → 0.741, ISPY2 0.793 → 0.798, NACT 0.626 → 0.668.
+- Single-clue AUC (test): mem_knn 0.795, mem_probe 0.762, sam_soft_ml 0.822, agree 0.834. Weak alone, but complementary.
+- Biggest losses: ispy2_894673 −0.76, duke_560 −0.36, duke_567 −0.22, duke_099 −0.15.
+- Gap to the oracle (0.790) closed from 0.055 to 0.041.
+- Run: 113 min (T4). Memory version B (richer descriptor) skipped: little headroom left in candidate selection.
+
+### Next
+1. **Frequency boundary refinement** of the 13-clue jury mask (vbk): frequency bands refine the kept mask's boundary before the final output — no new masks. The only way past the 0.790 selection ceiling. Read `docs/review_2026-10-14/04_FREQUENCY_MASK_REFINEMENT_RESEARCH.txt` first.
+2. Full metrics (HD95/NSD, missed) for the 13-clue jury; S5/pipeline use the 13-clue jury.
+3. Later: one-file pipeline export, LOCO, 3 seeds, paper update (oracle 0.790, S3e).
 
 ---
 

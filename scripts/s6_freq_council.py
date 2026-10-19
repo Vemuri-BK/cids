@@ -7,7 +7,8 @@ of the 4 expert probabilities is the uncertainty.
 Loss (cids/fcouncil/losses.py): GT on the final mask and on each expert + agreement-gated distillation from
 the finder and the checker (--no_teachers = ablation without dual supervision) + gate balance.
 
-Validation every --val_every epochs (120 cases) -> best.pt by council Dice after rel20.
+Validation every --val_every epochs (120 cases) -> best.pt by council Dice after rel20. Validation uses
+sliding-window overlap 0.25 (speed), test 0.5; finder and council are always compared at the SAME overlap.
 Test (306, once): council vs finder vs checker (rel20; Dice/HD95/NSD for council and finder), Wilcoxon
 council vs finder, each expert alone, gate weight per expert inside the tumour, and how well the
 uncertainty predicts failure (Spearman between mean uncertainty and Dice).
@@ -42,6 +43,7 @@ from cids.fcouncil import GROUP_NAMES  # noqa: E402
 from cids.fcouncil.data import CouncilPatchDataset, CouncilVolumeDataset  # noqa: E402
 from cids.fcouncil.losses import council_loss  # noqa: E402
 from cids.fcouncil.model import FreqCouncil  # noqa: E402
+from cids.provenance import file_digest, require_cases  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 K = len(GROUP_NAMES)
@@ -56,9 +58,26 @@ def _worker_init(_):
 
 
 def cases_for(sp, split, root):
-    r = sp[sp.split == split]
-    lst = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
-    return [x for x in lst if x[1].exists()]
+    return require_cases(sp, root, split)                  # every requested case must exist
+
+
+def check_maps(maps_dir, cases_by_split) -> dict:
+    """Maps must come from ONE complete S5 export (manifest) that covers every case used here."""
+    mf = Path(maps_dir) / "_maps_manifest.json"
+    if not mf.exists():
+        raise SystemExit(f"{maps_dir}: no _maps_manifest.json -> not a (complete) S5 export; re-run s5_export_maps.py")
+    m = json.loads(mf.read_text())
+    for split, cases in cases_by_split.items():
+        done = set(m.get("complete", {}).get(split, []))
+        miss = [c for c, _ in cases if c not in done]
+        if miss:
+            raise SystemExit(f"{maps_dir}: split {split} not completely exported ({len(miss)} cases missing, "
+                             f"e.g. {miss[:3]}); finish s5_export_maps.py first")
+    return m["experiment"]
+
+
+def best_matches(path: Path, sha) -> bool:
+    return path.exists() and (sha is None or file_digest(path).get("sha256") == sha)
 
 
 @torch.no_grad()
@@ -156,8 +175,7 @@ def main():
         tr = tr[:a.limit_train]
     if a.limit_eval:
         va, te = va[:a.limit_eval], te[:a.limit_eval]
-    missing = [c for c, _ in tr + va + te if not (Path(a.maps_dir) / f"{c}.npz").exists()]
-    assert not missing, f"{len(missing)} cases have no maps (e.g. {missing[:3]}); run s5_export_maps.py first"
+    maps_exp = check_maps(a.maps_dir, dict(train=tr, val=va, test=te))
     print(f"cache {root} | maps {a.maps_dir}\ntrain {len(tr)} | val {len(va)} | test {len(te)} | "
           f"dual supervision: {'off' if a.no_teachers else 'on'}")
 
@@ -167,23 +185,29 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda e: lr_factor(e, a))
     scaler = torch.amp.GradScaler(DEV, enabled=a.amp)
-    start, best, log = 0, -1.0, []
+    start, best, log, best_sha = 0, -1.0, [], None
     ck = Path(a.resume_from) if a.resume_from else out / "last.pt"
     if ck.exists():
         s = torch.load(ck, map_location=DEV, weights_only=False)
+        if s.get("maps") not in (None, maps_exp):
+            raise SystemExit(f"{ck} was trained on maps from other models/settings than {a.maps_dir}")
         model.load_state_dict(s["model"]); opt.load_state_dict(s["opt"])
         sched.load_state_dict(s["sched"]); scaler.load_state_dict(s["scaler"])
-        start, best, log = s["epoch"] + 1, s["best"], s["log"]
+        start, best, log, best_sha = s["epoch"] + 1, s["best"], s["log"], s.get("best_sha")
         for g, b in zip(opt.param_groups, sched.base_lrs):
             g["lr"] = b * lr_factor(start, a)
         print(f"resumed at epoch {start}, best {best:.4f}")
-        if ck.parent.resolve() != out.resolve():                    # resuming into a NEW folder: bring the
-            for f in ("best.pt", "val_best_per_case.csv"):          # old best along, or it would be lost
-                if (ck.parent / f).exists() and not (out / f).exists():
-                    shutil.copy(ck.parent / f, out / f)
-            if best > -1 and not (out / "best.pt").exists():
-                raise SystemExit(f"{ck} says best {best:.4f}, but there is no best.pt next to it; attach the "
-                                 f"whole previous output folder")
+        if best > -1:                                   # the recorded best must be THIS run's best.pt
+            src, dst = ck.parent / "best.pt", out / "best.pt"
+            if ck.parent.resolve() != out.resolve() and not dst.exists() and best_matches(src, best_sha):
+                for f in ("best.pt", "val_best_per_case.csv"):          # resuming into a new folder
+                    if (ck.parent / f).exists():
+                        shutil.copy(ck.parent / f, out / f)
+            if not best_matches(dst, best_sha):
+                raise SystemExit(f"{ck} records best {best:.4f}, but {dst} is missing or is a different file; "
+                                 f"attach the whole previous output folder (or start a new run)")
+            if best_sha is None:
+                print("[warn] old last.pt without best.pt hash: cannot verify that best.pt belongs to it")
     ck = out / "last.pt"
 
     ds = CouncilPatchDataset(tr, a.maps_dir, a.patch, a.n_patches, map_aug=not a.no_map_aug, seed=a.seed)
@@ -225,6 +249,7 @@ def main():
             if rec["val_council"] > best:
                 best = rec["val_council"]
                 torch.save(model.state_dict(), out / "best.pt")
+                best_sha = file_digest(out / "best.pt")["sha256"]
                 v.to_csv(out / "val_best_per_case.csv", index=False)
             msg += (f" | val council {rec['val_council']:.4f} finder {rec['val_finder']:.4f} checker "
                     f"{rec['val_checker']:.4f} | experts " + " ".join(f"{rec[f'val_{n}']:.3f}" for n in GROUP_NAMES)
@@ -233,13 +258,16 @@ def main():
         log.append(rec)
         pd.DataFrame(log).to_csv(out / "train_log.csv", index=False)
         torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
-                        scaler=scaler.state_dict(), epoch=epoch, best=best, log=log), ck)
+                        scaler=scaler.state_dict(), epoch=epoch, best=best, best_sha=best_sha, log=log,
+                        maps=maps_exp), ck)
         ep_times.append(time.time() - t0)
         if (time.time() - t_start) / 3600 + 1.5 * np.mean(ep_times[-3:]) / 3600 > a.time_budget_h:
             print(f"time budget reached after epoch {epoch + 1}; re-run with --resume_from {ck} to continue")
             break
     if not (out / "best.pt").exists():
-        torch.save(model.state_dict(), out / "best.pt")
+        if best > -1:                                   # never substitute current weights for a recorded best
+            raise SystemExit(f"best {best:.4f} was recorded but {out / 'best.pt'} is missing")
+        torch.save(model.state_dict(), out / "best.pt")             # no validation ran (e.g. --epochs 0)
     if a.skip_test:
         return
 

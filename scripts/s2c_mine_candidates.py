@@ -41,6 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "scripts"))
 import s3a_seg2sam as s3  # noqa: E402
 from cids.data.cache import find_cache_root, load_case  # noqa: E402
+from cids.provenance import require_cases  # noqa: E402
 from cids.data.volumes import VolumeDataset, unpad  # noqa: E402
 from cids.models.sam_med3d import download_turbo, load_sam_med3d  # noqa: E402
 from cids.models.segresnet_text import TextSegResNet  # noqa: E402
@@ -96,9 +97,7 @@ def main():
     stop = False
     for split in a.only.split(","):
         (out / split).mkdir(parents=True, exist_ok=True)
-        r = sp[sp.split == split]
-        cases = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
-        cases = [x for x in cases if x[1].exists()][:a.limit or None]
+        cases = require_cases(sp, root, split)[:a.limit or None]       # every requested case must exist
         todo = [x for x in cases if not (out / split / f"{x[0]}.npz").exists()]
         thr, top_k = (a.thr_train, a.top_k_train) if split == "train" else (a.thr_eval, a.top_k_eval)
         print(f"{split}: {len(cases)} cases, {len(cases) - len(todo)} already mined | threshold {thr}, top {top_k}")

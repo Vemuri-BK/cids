@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "scripts"))
 import s2a_sam_finetune as s2a  # noqa: E402
 from cids.data.cache import find_cache_root, load_case  # noqa: E402
+from cids.provenance import require_paths  # noqa: E402
 from cids.fcouncil.adapter import SamFreqAdapter  # noqa: E402
 from cids.fcouncil.sam_crops import sam_crop_from_case  # noqa: E402
 from cids.models.sam_lora import (BoxCorners, add_lora, decode, realistic_boxes, sample_clicks,  # noqa: E402
@@ -252,7 +253,7 @@ def main():
         r = sp[sp.split == split]
         lst = [(c, emb_root / ("train" if o == "train" else "test") / f"{c}.npz",
                 cache_root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
-        return [x for x in lst if x[1].exists() and x[2].exists()]
+        return require_paths(lst, split, "SAM embeddings / cache files")
 
     tr, va, te = items("train"), items("val"), items("test")
     if a.limit_train:

@@ -24,7 +24,6 @@ Example
 from __future__ import annotations
 
 import argparse
-import hashlib
 import itertools
 import json
 import pickle
@@ -44,6 +43,7 @@ from cids.data.cache import find_cache_root, load_case  # noqa: E402
 from cids.data.volumes import VolumeDataset, unpad  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.eval.postproc import rel20  # noqa: E402
+from cids.provenance import archive, cases_digest, file_digest, require_cases  # noqa: E402
 from cids.models.sam_med3d import download_turbo  # noqa: E402
 
 FEATURES = ["log_seg_ml", "rel_size", "is_largest", "rank", "n_cand", "seg_prob_mean", "seg_prob_max",
@@ -54,20 +54,19 @@ FEATURE_VERSION = 2          # bump whenever candidate_rows / run_split change -
 
 # ---------------------------------------------------------------------------- cache manifests
 def file_sig(path) -> dict:
-    """Identity of a checkpoint for the cache manifest (name + size; cheap, catches a swapped checkpoint)."""
-    p = Path(path) if path else None
-    return dict(name=p.name, bytes=p.stat().st_size) if p is not None and p.exists() else dict(name=str(path))
+    """Identity of a checkpoint for the cache manifest: name, size and sha256 of the full content."""
+    return file_digest(path)
 
 
 def split_manifest(split, cases, overlap, base: dict) -> dict:
-    ids = "\n".join(c for c, _ in cases)
-    return dict(version=FEATURE_VERSION, split=split, n_cases=len(cases), overlap=overlap,
-                cases_md5=hashlib.md5(ids.encode()).hexdigest(), **base)
+    """Everything that decides a split's feature table: code version, models (content hashes), the exact
+    input cases (ids + cache file sizes + preprocessing version) and the inference settings."""
+    return dict(version=FEATURE_VERSION, split=split, overlap=overlap, **cases_digest(cases), **base)
 
 
 def cache_ok(files, manifest: dict, mfile: Path) -> bool:
     """Cached tables are reused only if they were made by the SAME experiment (manifest equal). Otherwise
-    they are renamed *.stale (never deleted) and the split is recomputed."""
+    they are moved aside under unique names (*.stale-<time>, never deleted) and the split is recomputed."""
     files = [Path(f) for f in files]
     if not all(f.exists() for f in files):
         return False
@@ -75,9 +74,9 @@ def cache_ok(files, manifest: dict, mfile: Path) -> bool:
     if old == manifest:
         return True
     print(f"[cache] {', '.join(f.name for f in files)}: made by a different experiment "
-          f"({'no manifest' if old is None else 'manifest differs'}) -> recomputing; old files renamed *.stale")
+          f"({'no manifest' if old is None else 'manifest differs'}) -> recomputing; old files moved to *.stale-*")
     for f in files + ([mfile] if mfile.exists() else []):
-        f.rename(f.with_name(f.name + ".stale"))
+        archive(f)
     return False
 
 
@@ -270,10 +269,8 @@ def main():
     print(f"cache {root}\nfinder {a.seg_ckpt}\nchecker {a.sam_ckpt}\n{s3.DEV}")
     sp = pd.read_csv(a.splits)
 
-    def items(split):
-        r = sp[sp.split == split]
-        lst = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
-        return [x for x in lst if x[1].exists()][:a.limit or None]
+    def items(split):                                # every requested case must exist (no silent shrinking)
+        return require_cases(sp, root, split)[:a.limit or None]
 
     coll = dict(zip(sp.cache_id, sp.collection))
     base = dict(seg=file_sig(a.seg_ckpt), sam=file_sig(a.sam_ckpt), turbo=file_sig(turbo),
@@ -354,7 +351,8 @@ def main():
     print("paired Wilcoxon p (learned vs ...):", {k: round(v, 4) for k, v in pv.items()})
     print("\nper collection Dice:\n" + fr.pivot_table(index="collection", columns="rule", values="dice").round(3).to_string())
     print("\nAUC (true vs false candidates):", {k: round(v, 3) for k, v in summary["auc"].items()})
-    summary.update(chosen_model=name, threshold=t, val_dice=vdice, wilcoxon_p=pv,
+    n_cases = {k: int(d.cache_id.nunique()) for k, d in (("train", tr), ("val", va), ("test", te))}
+    summary.update(cases=n_cases, limit=a.limit, chosen_model=name, threshold=t, val_dice=vdice, wilcoxon_p=pv,
                    test={r: {k: (round(float(v), 4) if pd.notna(v) else None) for k, v in row.items()}
                          for r, row in agg.iterrows()},
                    minutes=(time.time() - t0) / 60)
