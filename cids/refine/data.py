@@ -59,19 +59,23 @@ def prepare_case(cid, cache_path, mask_path, work: Path, margin: int = 16):
         np.savez(tmp, img=three_channel(img2[(slice(None),) + sl]).astype(np.float16), m0=m[sl].astype(np.uint8),
                  gt=g.astype(np.uint8))
         tmp.replace(out)
-        meta.update(empty=False, bbox=[lo.tolist(), hi.tolist()], gt_out=int(gt.sum() - g.sum()))
+        mc = m[sl]
+        den = int(mc.sum()) + int(gt.sum())
+        meta.update(empty=False, bbox=[lo.tolist(), hi.tolist()], gt_out=int(gt.sum() - g.sum()),
+                    m0_dice=float(2 * (mc & g).sum() / den) if den else 1.0)
     meta_f.write_text(json.dumps(meta))
     return meta
 
 
-def perturb_mask(m: np.ndarray, rng) -> np.ndarray:
-    """Smooth random boundary change: shift (grow/shrink up to 2 voxels) + low-frequency wobble."""
-    if not m.any() or rng.random() < 0.2:
+def perturb_mask(m: np.ndarray, rng, p: float = 0.8, scale: float = 1.0) -> np.ndarray:
+    """With probability p: smooth random boundary change -- shift (grow/shrink up to 2*scale voxels) +
+    low-frequency wobble (amplitude 0.5-2 voxels * scale). v1 used p = 0.8, scale = 1."""
+    if not m.any() or rng.random() >= p:
         return m
     sdf = signed_distance(m)
     noise = ndimage.gaussian_filter(rng.standard_normal(m.shape).astype(np.float32), sigma=rng.uniform(3, 6))
-    noise *= rng.uniform(0.5, 2.0) / (noise.std() + 1e-6)
-    out = (sdf + noise + rng.uniform(-2.0, 2.0)) < 0
+    noise *= scale * rng.uniform(0.5, 2.0) / (noise.std() + 1e-6)
+    out = (sdf + noise + scale * rng.uniform(-2.0, 2.0)) < 0
     return out if out.any() else m
 
 
@@ -86,8 +90,10 @@ def pad_min(x: np.ndarray, size: int):
 
 
 class RefinePatchDataset(Dataset):
-    def __init__(self, cids, work: Path, patch: int = 64, n_patches: int = 4, augment: bool = True, seed: int = 42):
+    def __init__(self, cids, work: Path, patch: int = 64, n_patches: int = 4, augment: bool = True, seed: int = 42,
+                 p_perturb: float = 0.8, perturb_scale: float = 1.0):
         self.cids, self.work, self.patch, self.n, self.augment, self.seed = list(cids), Path(work), patch, n_patches, augment, seed
+        self.p_perturb, self.perturb_scale = p_perturb, perturb_scale
         self.epoch = 0
 
     def set_epoch(self, e):
@@ -102,7 +108,7 @@ class RefinePatchDataset(Dataset):
         d = np.load(self.work / f"{cid}.npz")
         m0 = d["m0"].astype(bool)
         if self.augment:
-            m0 = perturb_mask(m0, rng)
+            m0 = perturb_mask(m0, rng, self.p_perturb, self.perturb_scale)
         x = channels(d["img"], m0)
         y = d["gt"][None].astype(np.float32)
         P = self.patch

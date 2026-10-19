@@ -40,6 +40,7 @@ sys.path.insert(0, str(ROOT))
 from cids.data.cache import find_cache_root, load_case  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.provenance import file_digest, require_cases, save_npz_atomic  # noqa: E402
+from cids.refine.source import find_s3f  # noqa: E402
 from cids.refine.data import RefinePatchDataset, channels, pad_min, prepare_case  # noqa: E402
 from cids.refine.model import BoundaryRefiner  # noqa: E402
 
@@ -52,44 +53,6 @@ def _identity(x):
 
 def _prep(args):
     return prepare_case(*args)
-
-
-def find_s3f(path: str, unpack_to: Path) -> Path:
-    """Folder with summary.json + masks/<cid>.npz. Accepts every way Kaggle ships notebook 12's masks:
-    masks/ with the files, masks.zip (unpacked here), or a zip that Kaggle already extracted into a folder
-    (masks/masks/*.npz, masks.zip/masks/*.npz, ...). Nested layouts are linked to <unpack_to>/masks."""
-    import shutil
-    import zipfile
-    p = Path(path)
-    cands = [q.parent for q in p.rglob("summary.json")] if p.exists() else []
-    if p.name == "summary.json":
-        cands = [p.parent]
-    for c in cands:
-        if (c / "masks").is_dir() and any((c / "masks").glob("*.npz")):
-            return c
-    dst = Path(unpack_to)
-    for c in cands:
-        for name in ("masks", "masks.zip"):
-            q = c / name
-            if q.is_dir():                                   # extracted by Kaggle, possibly nested
-                hit = next(q.rglob("*.npz"), None)
-                if hit is not None:
-                    dst.mkdir(parents=True, exist_ok=True)
-                    if not (dst / "masks").exists():
-                        (dst / "masks").symlink_to(hit.parent.resolve(), target_is_directory=True)
-                    shutil.copy(c / "summary.json", dst / "summary.json")
-                    print(f"masks found in {hit.parent} ({len(list(hit.parent.glob('*.npz')))} files)")
-                    return dst
-            elif q.is_file() and zipfile.is_zipfile(q):
-                if not (dst / "masks").is_dir():
-                    dst.mkdir(parents=True, exist_ok=True)
-                    with zipfile.ZipFile(q) as z:
-                        z.extractall(dst)
-                    print(f"unpacked {q} -> {dst / 'masks'} ({len(list((dst / 'masks').glob('*.npz')))} masks)")
-                shutil.copy(c / "summary.json", dst / "summary.json")
-                return dst
-    listing = [str(x.relative_to(p)) for x in list(p.rglob("*"))[:30]] if p.exists() else []
-    raise SystemExit(f"no notebook 12 output (summary.json + masks) under {path}; found: {listing}")
 
 
 def dice_bce(z, y, allow):
@@ -162,6 +125,13 @@ def main():
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--p_perturb", type=float, default=0.8, help="share of training masks randomly roughened (v1 0.8)")
+    ap.add_argument("--perturb_scale", type=float, default=1.0, help="roughening strength (v1 1.0)")
+    ap.add_argument("--min_m0_dice", type=float, default=0.0,
+                    help="train only on cases whose jury mask already overlaps the tumour (Dice >= this): wrong-blob "
+                         "cases cannot be fixed by a boundary refiner and only add noise (v1 0)")
+    ap.add_argument("--weight_hard", action="store_true",
+                    help="sample training cases in proportion to their boundary error (1 - Dice of the jury mask)")
     ap.add_argument("--time_budget_h", type=float, default=10.0)
     ap.add_argument("--limit", type=int, default=0, help="cases per split (tests)")
     ap.add_argument("--no_amp", action="store_true")
@@ -191,7 +161,17 @@ def main():
         with Pool(max(1, a.workers)) as pool:
             metas[s] = list(tqdm(pool.imap(_prep, jobs), total=len(jobs), desc=f"ROIs {s}", file=sys.stdout, mininterval=30))
         print(f"{s}: {len(cs)} cases, {sum(m['empty'] for m in metas[s])} with empty M0 (kept as is)")
-    train_ids = [m["cid"] for m in metas["train"] if not m["empty"]]
+    def m0_dice(meta):                                   # older ROI folders have no m0_dice in the meta
+        if "m0_dice" not in meta:
+            d = np.load(work / f"{meta['cid']}.npz"); mm, gg = d["m0"].astype(bool), d["gt"].astype(bool)
+            meta["m0_dice"] = float(2 * (mm & gg).sum() / max(mm.sum() + meta["gt_total"], 1))
+        return meta["m0_dice"]
+    train_metas = [m for m in metas["train"] if not m["empty"] and m0_dice(m) >= a.min_m0_dice]
+    train_ids = [m["cid"] for m in train_metas]
+    td = np.array([m["m0_dice"] for m in train_metas])
+    print(f"training cases: {len(train_ids)} (jury-mask Dice >= {a.min_m0_dice}; mean {td.mean():.3f}) | "
+          f"roughening p={a.p_perturb} scale={a.perturb_scale} | hard-case weighting {'on' if a.weight_hard else 'off'}")
+    sample_w = np.clip(1 - td, 0.05, 0.5) if a.weight_hard else None
 
     # 2. model + identity check
     model = BoundaryRefiner(a.mode, a.width).to(DEV)
@@ -202,7 +182,8 @@ def main():
     print(f"epoch 0 (= M0): val Dice {v0.dice_m0.mean():.4f} (S3f val {s3f_summary.get('val_dice', float('nan')):.4f})")
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
-    ds = RefinePatchDataset(train_ids, work, a.patch, a.n_patches, augment=True, seed=a.seed)
+    ds = RefinePatchDataset(train_ids, work, a.patch, a.n_patches, augment=True, seed=a.seed,
+                            p_perturb=a.p_perturb, perturb_scale=a.perturb_scale)
     total, warm = a.epochs * len(ds), 2 * len(ds)
     best, log, step, ep_t = float(v0.dice_m0.mean()), [dict(epoch=0, val_dice=float(v0.dice_m0.mean()))], 0, []
     torch.save(model.state_dict(), out / "best.pt")                    # M0 itself is the fallback
@@ -210,8 +191,11 @@ def main():
     for epoch in range(1, a.epochs + 1):
         te = time.time()
         ds.set_epoch(epoch)
-        dl = DataLoader(ds, batch_size=None, shuffle=True, num_workers=a.workers, collate_fn=_identity,
-                        prefetch_factor=2 if a.workers else None, generator=torch.Generator().manual_seed(a.seed + epoch))
+        g = torch.Generator().manual_seed(a.seed + epoch)
+        sampler = (torch.utils.data.WeightedRandomSampler(torch.as_tensor(sample_w, dtype=torch.double), len(ds),
+                                                          replacement=True, generator=g) if sample_w is not None else None)
+        dl = DataLoader(ds, batch_size=None, shuffle=sampler is None, sampler=sampler, num_workers=a.workers,
+                        collate_fn=_identity, prefetch_factor=2 if a.workers else None, generator=g)
         losses = []
         for item in tqdm(dl, desc=f"epoch {epoch}/{a.epochs}", unit="case", file=sys.stdout, mininterval=60):
             for g in opt.param_groups:

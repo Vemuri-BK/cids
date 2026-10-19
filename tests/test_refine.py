@@ -83,3 +83,21 @@ def test_loss_is_zero_for_a_perfect_boundary_and_ignores_fixed_voxels():
     perfect = torch.where(x[:, 5:6] > 0, (2 * y - 1) * 20.0, z0)          # exact inside the band
     assert dice_bce(perfect, y, x[:, 5:6]).item() < 0.01                  # old loss gave ~0.97 here
     assert dice_bce(z0, y, x[:, 5:6]).item() > dice_bce(perfect, y, x[:, 5:6]).item() + 0.3
+
+
+def test_band_oracle_fixes_band_errors_only():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import s7_oracle as orc
+    from cids.eval.metrics import dice
+    g = _ball((48, 48, 48), (24, 24, 24), 10)
+    m0 = _ball((48, 48, 48), (24, 24, 24), 7)                         # 3 voxels too small
+    far = np.zeros_like(g); far[2:6, 2:6, 2:6] = True                  # a tumour part far from M0
+    d = orc.band_distance(m0, 12)
+    for r, expect_perfect in ((4, True), (2, False)):
+        a = d <= r
+        o = (m0 & ~a) | (g & a)
+        assert (dice(o, g) == 1.0) == expect_perfect
+    a = d <= 8
+    o = (m0 & ~a) | ((g | far) & a)
+    assert not o[far].any()                                            # unreachable: stays missed
