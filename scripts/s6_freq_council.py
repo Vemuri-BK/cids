@@ -21,6 +21,7 @@ import argparse
 import json
 import math
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -176,6 +177,13 @@ def main():
         for g, b in zip(opt.param_groups, sched.base_lrs):
             g["lr"] = b * lr_factor(start, a)
         print(f"resumed at epoch {start}, best {best:.4f}")
+        if ck.parent.resolve() != out.resolve():                    # resuming into a NEW folder: bring the
+            for f in ("best.pt", "val_best_per_case.csv"):          # old best along, or it would be lost
+                if (ck.parent / f).exists() and not (out / f).exists():
+                    shutil.copy(ck.parent / f, out / f)
+            if best > -1 and not (out / "best.pt").exists():
+                raise SystemExit(f"{ck} says best {best:.4f}, but there is no best.pt next to it; attach the "
+                                 f"whole previous output folder")
     ck = out / "last.pt"
 
     ds = CouncilPatchDataset(tr, a.maps_dir, a.patch, a.n_patches, map_aug=not a.no_map_aug, seed=a.seed)
@@ -194,7 +202,8 @@ def main():
             y = item["label"].to(DEV, non_blocking=True)
             with torch.autocast(DEV, dtype=torch.float16, enabled=a.amp):
                 o = model(x)
-            L = council_loss(o, y, x[:, 3:4].float(), x[:, 4:5].float(), a.lam_exp, a.lam_kd, a.lam_bal,
+            tch = item["teacher"].to(DEV, non_blocking=True)        # CLEAN maps (no map augmentation)
+            L = council_loss(o, y, tch[:, 0:1].float(), tch[:, 1:2].float(), a.lam_exp, a.lam_kd, a.lam_bal,
                              use_teachers=not a.no_teachers)
             opt.zero_grad(set_to_none=True)
             scaler.scale(L["total"]).backward()

@@ -70,7 +70,7 @@ class CouncilPatchDataset(Dataset):
         lbl, _ = pad_to(lbl, (P, P, P))
         tum = np.argwhere(lbl > 0)
         body = None
-        xs, ys = [], []
+        xs, ys, ts = [], [], []
         for _ in range(self.n):
             if len(tum) and rng.random() < self.pos_ratio:
                 c = tum[rng.integers(len(tum))]
@@ -92,11 +92,13 @@ class CouncilPatchDataset(Dataset):
                 scale = rng.uniform(0.9, 1.1, size=(3, 1, 1, 1)).astype(np.float32)
                 shift = rng.uniform(-0.05, 0.05, size=(3, 1, 1, 1)).astype(np.float32)
                 x[:3] = x[:3] * scale + shift
+            ts.append(x[3:5].copy())                  # distillation targets: the maps BEFORE map augmentation
             if self.map_aug:
                 x = augment_maps(x, rng)
             xs.append(np.ascontiguousarray(x))
             ys.append(np.ascontiguousarray(y))
-        return dict(cid=cid, image=torch.from_numpy(np.stack(xs)), label=torch.from_numpy(np.stack(ys)[:, None]))
+        return dict(cid=cid, image=torch.from_numpy(np.stack(xs)), label=torch.from_numpy(np.stack(ys)[:, None]),
+                    teacher=torch.from_numpy(np.ascontiguousarray(np.stack(ts))))
 
 
 class CouncilVolumeDataset(Dataset):

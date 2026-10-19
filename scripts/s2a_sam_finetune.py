@@ -360,7 +360,25 @@ def validate(model, box, data, args, vcands=None):
     return m
 
 
+# ---------------------------------------------------------------------------- selection
+INELIGIBLE = -1.0
+
+
+def selection_score(m, min_real_keep):
+    """Val score used to pick best.pt. With real candidates (S2c), an epoch that throws away real tumours
+    (real_keep < min_real_keep) is INELIGIBLE: it can never become best, whatever its score."""
+    if m.get("real_keep", 1.0) < min_real_keep:
+        return INELIGIBLE
+    return float(m["score"])
+
+
 # ---------------------------------------------------------------------------- test
+def case_path(cache_root, cid, args):
+    """1 mm cache file of a case: the cache folder follows the OFFICIAL split (train/ = official train,
+    val/ = official test), not the experiment split -- under LOCO a test case can sit in train/."""
+    return cache_root / ("train" if args.official.get(cid) == "train" else "val") / f"{cid}.npz"
+
+
 def full_res_metrics(prob_crop, origin, shape15, cache_path):
     """Paste the 128^3 crop probability (1.5 mm) into the case volume, resample to the 1 mm cache grid."""
     _, lbl = load_case(cache_path)
@@ -408,11 +426,11 @@ def test(models, test_items, coll, args, cache_root, out, tcands=None):
                 if name == next(iter(models)):         # resampling ceiling: GT crop pasted back to 1 mm
                     for j, c in enumerate(chunk):
                         m = full_res_metrics(gt[j].float().cpu(), c["origin"], c["shape15"],
-                                             cache_root / "val" / f"{c['cid']}.npz")
+                                             case_path(cache_root, c["cid"], args))
                         full_rows.append(dict(cache_id=c["cid"], collection=coll[c["cid"]],
                                               model="gt_crop_ceiling", prompt="-", **m))
                 for j, c in enumerate(chunk):
-                    path = cache_root / "val" / f"{c['cid']}.npz"
+                    path = case_path(cache_root, c["cid"], args)
                     for key in FULL_RES_PROMPTS:
                         if key not in outs:
                             continue
@@ -514,6 +532,7 @@ def main():
             print("[warn] no 2-channel cache -> crop-level metrics only.", e)
     sp = pd.read_csv(args.splits)
     coll = dict(zip(sp.cache_id, sp.collection))
+    args.official = dict(zip(sp.cache_id, sp.official))
 
     def items(split):
         rows = sp[sp[args.split_col] == split]
@@ -562,8 +581,15 @@ def main():
                                  f"-> run s2c_mine_candidates.py first (did it fail?)")
             if start_epoch == 1:                                    # epoch 0 = the starting model (S2b)
                 m = validate(model, box, val_data, args, vcand)
+                m["select"] = selection_score(m, args.min_real_keep)
                 log.append(dict(epoch=0, **{f"val_{k}": v for k, v in m.items()}))
                 print("epoch 0 (start):", {k: round(v, 4) for k, v in m.items()})
+                # the starting model is the fallback best: an epoch must beat it AND be eligible to replace it
+                best = m["select"]
+                torch.save(trainable_state(model, box), out / "best.pt")
+                if best == INELIGIBLE:
+                    print(f"[warn] the starting model keeps only {m.get('real_keep', 1):.3f} of real tumours "
+                          f"(< --min_real_keep {args.min_real_keep}); it is only kept if no epoch is eligible")
         nb = len(train_data) // args.batch
         total = nb * args.epochs
         args.warmup_steps = nb * args.warmup
@@ -576,9 +602,9 @@ def main():
             if epoch % args.val_every == 0 or epoch == args.epochs:
                 m = validate(model, box, val_data, args, vcand)
                 row.update({f"val_{k}": v for k, v in m.items()})
-                sel = m["score"] - (1.0 if m.get("real_keep", 1.0) < args.min_real_keep else 0.0)
+                sel = selection_score(m, args.min_real_keep)
                 m["select"] = sel
-                if sel > best:
+                if sel != INELIGIBLE and sel > best:
                     best = sel
                     torch.save(trainable_state(model, box), out / "best.pt")
                 print(f"epoch {epoch}: loss {loss:.4f} | val click1 {m['click1']:.4f} click5 {m['click5']:.4f} "

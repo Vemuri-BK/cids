@@ -101,3 +101,67 @@ def test_memory_knn_and_no_same_patient_leakage():
     tr = pd.DataFrame(dict(cache_id=["a", "a", "b", "b"], k=[1, 2, 1, 2], on_tumour=[1, 1, 0, 0]))
     tr2, _ = mem.memory_scores(tr, D, [], k=2, n_folds=2)
     assert np.allclose(tr2.mem_knn.to_numpy(), [0, 0, 1, 1])
+
+
+def test_true_oracle_is_best_subset_and_rel20_is_shared():
+    import s3d_learned_jury as jury
+    from cids.eval.postproc import rel20
+    from cids.eval.metrics import dice
+    gt = np.zeros((40, 40, 40), bool); gt[5:10, 5:10, 5:10] = True                  # 125 voxels
+    lab = np.zeros((40, 40, 40), np.int32)
+    lab[5:10, 5:10, 5:10] = 1                                                        # exact tumour
+    lab[9:11, 20:40, 0:40] = 2; lab[9, 9, 9] = 2                                     # huge blob touching it
+    lab[30:35, 30:35, 30:35] = 0
+    lab[0:2, 30:32, 30:32] = 3                                                       # tiny far blob
+    cands = [(k, float((lab == k).sum())) for k in (2, 1, 3)]
+    refined = [dict(k=k, agree=0.5, sam_ml=1.0, sam_soft_ml=1.0) for k in (2, 1, 3)]
+    rows = jury.case_columns(jury.candidate_rows("duke_001", np.full(gt.shape, .9), lab, cands, refined, gt), lab, gt)
+    df = pd.DataFrame(rows)
+    tab = jury.rule_tables(df)
+    assert np.isclose(tab["oracle_touching"].iloc[0], dice(np.isin(lab, [1, 2]), gt))   # keeps the huge blob
+    assert np.isclose(tab["oracle"].iloc[0], dice(lab == 1, gt))                          # best subset drops it
+    assert tab["oracle"].iloc[0] > tab["oracle_touching"].iloc[0]
+    assert np.isclose(tab["seg_rel20"].iloc[0], dice(rel20(lab > 0), gt))
+    # old tables without the shared-rel20 columns fall back to the candidate rel20
+    old = jury.rule_tables(df.drop(columns=["rel20_inter", "rel20_size"]))
+    assert np.isclose(old["seg_rel20"].iloc[0], old["cand_rel20"].iloc[0])
+
+
+def test_feature_cache_is_reused_only_with_the_same_manifest(tmp_path):
+    import s3d_learned_jury as jury
+    f, mf = tmp_path / "train_features.csv", tmp_path / "train_features.manifest.json"
+    cases = [("duke_001", Path("a")), ("duke_002", Path("b"))]
+    m1 = jury.split_manifest("train", cases, 0.5, dict(seg=dict(name="seg.pt", bytes=1)))
+    f.write_text("x\n1\n")
+    assert not jury.cache_ok([f], m1, mf)                     # legacy table without manifest -> recompute
+    assert (tmp_path / "train_features.csv.stale").exists() and not f.exists()
+    f.write_text("x\n1\n"); mf.write_text(__import__("json").dumps(m1))
+    assert jury.cache_ok([f], m1, mf)                         # same experiment -> reuse
+    m2 = jury.split_manifest("train", cases, 0.5, dict(seg=dict(name="seg.pt", bytes=2)))   # other checkpoint
+    assert not jury.cache_ok([f], m2, mf) and not f.exists()
+
+
+def test_s2c_selection_rejects_epochs_that_drop_real_tumours():
+    assert s2.selection_score(dict(score=0.7, real_keep=0.99), 0.95) == 0.7
+    assert s2.selection_score(dict(score=0.9, real_keep=0.80), 0.95) == s2.INELIGIBLE      # never best
+    assert s2.selection_score(dict(score=0.6), 0.95) == 0.6                                 # S2a/S2b: no candidates
+
+
+def test_full_res_path_follows_official_split_not_experiment_split(tmp_path):
+    from types import SimpleNamespace
+    a = SimpleNamespace(official={"duke_001": "train", "duke_002": "test"})
+    assert s2.case_path(tmp_path, "duke_001", a) == tmp_path / "train" / "duke_001.npz"    # LOCO test case
+    assert s2.case_path(tmp_path, "duke_002", a) == tmp_path / "val" / "duke_002.npz"
+
+
+def test_council_teacher_maps_are_not_augmented(tmp_path):
+    from cids.fcouncil.data import CouncilPatchDataset
+    path, lbl = _case(tmp_path)
+    maps = tmp_path / "maps"; maps.mkdir()
+    rng = np.random.default_rng(0)
+    seg = (rng.random(lbl.shape) * 255).astype(np.uint8); sam = (rng.random(lbl.shape) * 255).astype(np.uint8)
+    np.savez(maps / "duke_001.npz", seg=seg, sam=sam)
+    a = CouncilPatchDataset([("duke_001", path)], maps, patch=32, n_patches=1, augment=False, map_aug=True)[0]
+    b = CouncilPatchDataset([("duke_001", path)], maps, patch=32, n_patches=1, augment=False, map_aug=False)[0]
+    assert torch.equal(a["teacher"], b["image"][:, 3:5])      # targets = clean maps
+    assert not torch.equal(a["image"][:, 3:5], b["image"][:, 3:5])   # inputs = augmented maps

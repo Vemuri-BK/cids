@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cids.data.cache import SAM_SIZE, crop_pad, find_cache_root, load_case, resample, znorm  # noqa: E402
 from cids.data.volumes import VolumeDataset, unpad  # noqa: E402
 from cids.eval.metrics import all_metrics, dice  # noqa: E402
+from cids.eval.postproc import rel20  # noqa: E402
 from cids.models.sam_lora import BoxCorners, add_lora, decode, upsample  # noqa: E402
 from cids.models.sam_med3d import download_turbo, load_sam_med3d  # noqa: E402
 from cids.models.segresnet_text import TextSegResNet  # noqa: E402
@@ -174,8 +175,8 @@ def predict_rules(sprob, refined, lab, cands):
     size = {k: s for k, s in cands}
     keep20 = [k for k, s in cands if s >= 0.2 * max(size.values())]
     by_k = {d["k"]: d for d in refined}
-    seg20 = np.isin(lab, keep20)
-    preds["seg_rel20"] = seg20
+    seg20 = np.isin(lab, keep20)                    # rel20 among the candidates (input of the SAM rules)
+    preds["seg_rel20"] = rel20(smask)               # the SHARED rel20 baseline (all components, as S1/S5/S6)
     sam20 = np.max([by_k[k]["prob"] for k in keep20], 0)
     preds["sam_rel20"] = sam20 > 0.5
     preds["avg_rel20"] = (0.5 * sprob * seg20 + 0.5 * sam20) > 0.5

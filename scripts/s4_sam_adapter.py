@@ -279,6 +279,9 @@ def main():
     m0 = validate(sam, box, adapter, val_data, a)                      # = S2b (adapter is zero at start)
     print(f"epoch 0 (= S2b): box {m0['box1']:.4f} messy {m0['messy1']:.4f} neg_reject {m0['neg_reject']:.3f} score {m0['score']:.4f}")
     log.append(dict(epoch=0, **{f"val_{k}": v for k, v in m0.items()}))
+    best = m0["score"]                                               # an epoch must beat S2b to be kept
+    torch.save(dict(adapter=adapter.state_dict(), mask_decoder=sam.mask_decoder.state_dict(),
+                    box=box.state_dict()), out / "best.pt")
     nb = len(train_data) // a.batch
     a.warmup_steps = nb * a.warmup
     for epoch in range(1, a.epochs + 1):

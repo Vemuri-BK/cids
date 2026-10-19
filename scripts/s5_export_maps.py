@@ -78,8 +78,10 @@ def main():
     print(f"cache {root}\nfinder {a.seg_ckpt}\nchecker {a.sam_ckpt} + adapter: {a.adapter_ckpt or 'none'}\n{DEV}")
 
     sp = pd.read_csv(a.splits)
-    rows = []
+    rows, out_of_time = [], False
     for split in a.only.split(","):
+        if out_of_time:
+            break
         r = sp[sp.split == split]
         cases = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
         cases = [x for x in cases if x[1].exists()]
@@ -110,6 +112,7 @@ def main():
                                  finder_rel20=dice(rel20(sprob > 0.5), gt), checker_rel20=dice(rel20(sam_p > 0.5), gt),
                                  n_cand=len(cands)))
             if (time.time() - t0) / 3600 > a.time_budget_h:
+                out_of_time = True
                 print("time budget reached; re-run the same command to continue (finished cases are skipped)")
                 break
     if rows:
@@ -118,6 +121,8 @@ def main():
         print(df.groupby(["split", "collection"])[["finder_rel20", "checker_rel20"]].mean().round(4).to_string())
         print(df.groupby("split")[["finder_rel20", "checker_rel20", "n_cand"]].mean().round(4).to_string())
     print(f"{len(list(out.glob('*.npz')))} map files in {out} ({(time.time() - t0) / 60:.1f} min)")
+    if out_of_time:                                  # non-zero exit: a notebook must not go on to S6 with
+        raise SystemExit("S5 stopped by --time_budget_h before all maps were exported")   # missing maps
 
 
 if __name__ == "__main__":

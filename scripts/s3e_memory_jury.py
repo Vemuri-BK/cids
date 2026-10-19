@@ -48,10 +48,13 @@ THRESHOLDS = s3d.THRESHOLDS
 
 
 # ---------------------------------------------------------------------------- pipeline + descriptors
-def run_split(split, cases, seg, sam, box, amp, overlap, out):
+def run_split(split, cases, seg, sam, box, amp, overlap, out, manifest=None):
     f, fd = out / f"{split}_features.csv", out / f"{split}_desc.npy"
-    if f.exists() and fd.exists():
-        print(f"{split}: using cached {f.name} + {fd.name}")
+    mf = out / f"{split}_features.manifest.json"
+    manifest = dict(manifest if manifest is not None else s3d.split_manifest(split, cases, overlap, {}),
+                    descriptor="box|crop mean, 768-d")
+    if s3d.cache_ok([f, fd], manifest, mf):
+        print(f"{split}: using cached {f.name} + {fd.name} (same manifest)")
         return pd.read_csv(f), np.load(fd)
     rows, descs, ds = [], [], VolumeDataset(cases, 96)
     for i in tqdm(range(len(ds)), desc=split, unit="case", file=sys.stdout, mininterval=20):
@@ -60,15 +63,16 @@ def run_split(split, cases, seg, sam, box, amp, overlap, out):
         sprob = unpad(s3.seg_prob(seg, item["image"], amp, overlap=overlap), item["pads"])
         lab, cands = s3.components(sprob > 0.5, top_k=5)
         if not cands:
-            rows.append(dict(cache_id=cid, k=-1, size_vox=0, inter_vox=0, gt_vox=int(gt.sum()), on_tumour=0))
+            rows.extend(s3d.case_columns([dict(cache_id=cid, k=-1, size_vox=0, inter_vox=0, gt_vox=int(gt.sum()),
+                                               on_tumour=0)], lab, gt))
             descs.append(np.zeros(768, np.float32))
             continue
         refined = s3.sam_refine(sam, box, img, lab, cands, amp, descriptors=True)
         by_k = {d["k"]: d["desc"] for d in refined}
-        r = s3d.candidate_rows(cid, sprob, lab, cands, refined, gt)
+        r = s3d.case_columns(s3d.candidate_rows(cid, sprob, lab, cands, refined, gt), lab, gt)
         rows.extend(r); descs.extend(by_k[x["k"]] for x in r)
     df, D = pd.DataFrame(rows), np.stack(descs).astype(np.float16)
-    df.to_csv(f, index=False); np.save(fd, D)
+    df.to_csv(f, index=False); np.save(fd, D); mf.write_text(json.dumps(manifest, indent=2))
     return df, D
 
 
@@ -156,9 +160,16 @@ def main():
         lst = [(c, root / ("train" if o == "train" else "val") / f"{c}.npz") for c, o in zip(r.cache_id, r.official)]
         return [x for x in lst if x[1].exists()][:a.limit or None]
 
-    tr, Dtr = run_split("train", items("train"), seg, sam, box, amp, 0.5, out)
-    va, Dva = run_split("val", items("val"), seg, sam, box, amp, 0.5, out)
-    te, Dte = run_split("test", items("test"), seg, sam, box, amp, 0.5, out)
+    base = dict(seg=s3d.file_sig(a.seg_ckpt), sam=s3d.file_sig(a.sam_ckpt), turbo=s3d.file_sig(turbo),
+                random_weights=a.random_weights, top_k=5)
+
+    def run(split):
+        c = items(split)
+        return run_split(split, c, seg, sam, box, amp, 0.5, out, s3d.split_manifest(split, c, 0.5, base))
+
+    tr, Dtr = run("train")
+    va, Dva = run("val")
+    te, Dte = run("test")
     n_true = int(tr[tr.k >= 0].on_tumour.sum()); n_all = int((tr.k >= 0).sum())
     print(f"memory: {n_all} training candidates ({n_true} real tumours, {n_all - n_true} false), "
           f"descriptor {Dtr.shape[1]}-d, k = {a.k}")
@@ -189,7 +200,8 @@ def main():
             val_auc=round(s3d.auc(pv[(va.k >= 0).to_numpy()], va[va.k >= 0].on_tumour.to_numpy()), 4),
             test_auc=round(s3d.auc(pt[(te.k >= 0).to_numpy()], te[te.k >= 0].on_tumour.to_numpy()), 4))
         if name == "jury11":
-            summary["reference"] = {c: round(float(tt[c].mean()), 4) for c in ("seg_rel20", "segjury_0.7", "oracle")}
+            refs = ("seg_rel20", "segjury_0.7", "oracle", "oracle_touching")
+            summary["reference"] = {c: round(float(tt[c].mean()), 4) for c in refs}
     from scipy.stats import wilcoxon
     base = test_case["jury11"]
     for name in list(variants)[1:]:

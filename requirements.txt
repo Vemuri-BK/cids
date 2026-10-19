@@ -4,6 +4,8 @@ pandas>=2.0
 openpyxl
 pyyaml
 pytest
+scikit-learn  # S3d/S3e learned jury
+tqdm
 # models (Kaggle already has torch/transformers/monai-compatible versions)
 torch
 monai
