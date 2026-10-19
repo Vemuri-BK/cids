@@ -77,10 +77,17 @@ def find_s3f(path: str, unpack_to: Path) -> Path:
     raise SystemExit(f"no notebook 12 output (summary.json + masks/ or masks.zip) under {path}")
 
 
-def dice_bce(z, y):
-    p = torch.sigmoid(z)
-    inter = (p * y).sum((1, 2, 3, 4)); den = p.sum((1, 2, 3, 4)) + y.sum((1, 2, 3, 4))
-    return (1 - (2 * inter + 1) / (den + 1)).mean() + F.binary_cross_entropy_with_logits(z, y)
+def dice_bce(z, y, allow):
+    """Dice + BCE over the voxels the refiner can change (allow band) only. Outside the band the output is
+    fixed at M0 (p = 0.25 / 0.75): counting those voxels flooded the Dice denominator (a perfect boundary
+    still scored loss ~0.97) and diluted BCE ~8x -- review REFINEMENT_BUGS_AND_FIXES.txt, bugs 1-3."""
+    m = allow > 0.5
+    if not m.any():
+        return z.sum() * 0.0
+    za, ya = z[m], y[m]
+    pa = torch.sigmoid(za)
+    dice = 1 - (2 * (pa * ya).sum() + 1) / (pa.sum() + ya.sum() + 1)
+    return dice + F.binary_cross_entropy_with_logits(za, ya)
 
 
 @torch.no_grad()
@@ -197,7 +204,7 @@ def main():
             x, y = item["x"].to(DEV, non_blocking=True), item["y"].to(DEV, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
                 z = model(x)
-            loss = dice_bce(z.float(), y)
+            loss = dice_bce(z.float(), y, x[:, 5:6])                      # x[:, 5] = allow band
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward(); scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)

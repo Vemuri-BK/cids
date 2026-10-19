@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -60,9 +61,25 @@ def test_roi_counts_and_training_learns_to_grow(tmp_path):
         g = d["gt"].astype(bool)
         return 2 * (p & g).sum() / (p.sum() + g.sum())
     d0 = dice()
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from s7_refine import dice_bce
     for _ in range(60):
         b = ds[0]
         z = net(b["x"])
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(z, b["y"])
+        loss = dice_bce(z, b["y"], b["x"][:, 5:6])                     # the loss used in training
         opt.zero_grad(); loss.backward(); opt.step()
     assert dice() > d0 + 0.05
+
+
+def test_loss_is_zero_for_a_perfect_boundary_and_ignores_fixed_voxels():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from s7_refine import dice_bce
+    gt, m0 = _ball((48, 48, 48), (24, 24, 24), 10), _ball((48, 48, 48), (24, 24, 24), 8)
+    x = torch.from_numpy(channels(np.zeros((3, 48, 48, 48), np.float32), m0))[None]
+    y = torch.from_numpy(gt[None, None].astype(np.float32))
+    z0 = (2 * x[:, 3:4] - 1) * np.log(3)
+    perfect = torch.where(x[:, 5:6] > 0, (2 * y - 1) * 20.0, z0)          # exact inside the band
+    assert dice_bce(perfect, y, x[:, 5:6]).item() < 0.01                  # old loss gave ~0.97 here
+    assert dice_bce(z0, y, x[:, 5:6]).item() > dice_bce(perfect, y, x[:, 5:6]).item() + 0.3
