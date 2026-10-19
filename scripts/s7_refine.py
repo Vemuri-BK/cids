@@ -68,6 +68,31 @@ def dice_bce(z, y, allow):
     return dice + F.binary_cross_entropy_with_logits(za, ya)
 
 
+def balanced_loss(z, y, x, w_fix=1.0, w_keep=1.0):
+    """Masked Dice + group-balanced BCE over the allow band (training labels only). Groups:
+    correctable missed tumour (GT & ~M0), correctable extra (M0 & ~GT), already-correct band voxels.
+    Each non-empty group's BCE is its own mean, so the few error voxels are not outvoted by the many
+    correct ones; the preservation group stays in so the model does not edit everywhere."""
+    band, m0 = x[:, 5:6] > 0.5, x[:, 3:4] > 0.5
+    if not band.any():
+        return z.sum() * 0.0
+    yb = y > 0.5
+    bce = F.binary_cross_entropy_with_logits(z, y, reduction="none")
+    groups = [(band & yb & ~m0, w_fix), (band & ~yb & m0, w_fix), (band & (yb == m0), w_keep)]
+    num, den = 0.0, 0.0
+    for g, w in groups:
+        if g.any():
+            num = num + w * bce[g].mean(); den += w
+    za, ya = z[band], y[band]
+    pa = torch.sigmoid(za)
+    dice = 1 - (2 * (pa * ya).sum() + 1) / (pa.sum() + ya.sum() + 1)
+    return dice + num / den
+
+
+def refine_loss(name, z, y, x, w_keep=1.0):
+    return balanced_loss(z, y, x, w_keep=w_keep) if name == "balanced" else dice_bce(z, y, x[:, 5:6])
+
+
 @torch.no_grad()
 def refine_case(model, work, meta, patch, amp):
     """Refined ROI mask (bool, ROI shape) or None for an empty M0."""
@@ -114,7 +139,7 @@ def lr_factor(step, total, warm):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["freq", "spatial"], required=True)
+    ap.add_argument("--mode", choices=["freq", "freq_lll", "spatial"], required=True)
     ap.add_argument("--s3f_dir", required=True, help="notebook 12 output (contains summary.json, masks/)")
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
@@ -139,6 +164,10 @@ def main():
     ap.add_argument("--error_sampling", action="store_true",
                     help="patch centres 25%% correctable missed / 25%% correctable extra / 50%% boundary (training GT only)")
     ap.add_argument("--skip_test", action="store_true", help="pilot runs: no test-set evaluation")
+    ap.add_argument("--loss", choices=["dice_bce", "balanced"], default="dice_bce",
+                    help="balanced = masked Dice + BCE averaged per group (missed / extra / already correct)")
+    ap.add_argument("--w_keep", type=float, default=1.0, help="balanced loss: weight of the already-correct group")
+    ap.add_argument("--no_gate", action="store_true", help="ablation: z = z0 + allow * delta (no output gate)")
     ap.add_argument("--train_check", type=int, default=120, help="fixed training cases evaluated (unaugmented) at each val")
     ap.add_argument("--time_budget_h", type=float, default=10.0)
     ap.add_argument("--limit", type=int, default=0, help="cases per split (tests)")
@@ -195,9 +224,9 @@ def main():
     sample_w = np.clip(1 - td, 0.05, 0.5) if a.weight_hard else None
 
     # 2. model + identity check
-    model = BoundaryRefiner(a.mode, a.width).to(DEV)
+    model = BoundaryRefiner(a.mode, a.width, gate=not a.no_gate).to(DEV)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"refiner ({a.mode}): {n_par:,} parameters")
+    print(f"refiner ({a.mode}, output gate {'off' if a.no_gate else 'on'}, loss {a.loss}): {n_par:,} parameters")
     v0 = evaluate(model, work, metas["val"], a.patch, amp)
     assert (v0.dice_ref == v0.dice_m0).all() and (v0.changed == 0).all(), "refiner at init must reproduce M0 exactly"
     vm = s3f / "val_metrics.csv"                         # per-case parity with notebook 12 (not just the mean)
@@ -236,7 +265,7 @@ def main():
             x, y = item["x"].to(DEV, non_blocking=True), item["y"].to(DEV, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
                 z = model(x)
-            loss = dice_bce(z.float(), y, x[:, 5:6])                      # x[:, 5] = allow band
+            loss = refine_loss(a.loss, z.float(), y, x, a.w_keep)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward(); scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -269,8 +298,23 @@ def main():
         if (time.time() - t0) / 3600 + 1.5 * np.mean(ep_t[-3:]) / 3600 > a.time_budget_h:
             print(f"time budget reached after epoch {epoch}; testing best.pt"); break
 
-    if a.skip_test:
+    if a.skip_test:                                     # boundary metrics of the best model on val (full volumes)
+        model.load_state_dict(torch.load(out / "best.pt", map_location=DEV, weights_only=False))
+        vp, vrows = dict(cases["val"]), []
+        for meta in metas["val"]:
+            cid = meta["cid"]
+            _, lbl = load_case(vp[cid]); gt = lbl > 0
+            m0 = np.load(s3f / "masks" / f"{cid}.npz")["mask"].astype(bool)
+            ref = m0.copy(); r = refine_case(model, work, meta, a.patch, amp)
+            if r is not None:
+                ref[tuple(slice(p_, q_) for p_, q_ in zip(*meta["bbox"]))] = r
+            for name, m in (("m0", m0), ("refined", ref)):
+                vrows.append(dict(cache_id=cid, rule=name, **all_metrics(m, gt)))
+        vb = pd.DataFrame(vrows); vb.to_csv(out / "val_best_metrics.csv", index=False)
+        vbs = vb.groupby("rule").agg(dice=("dice", "mean"), nsd=("nsd", "mean"), hd95_median=("hd95", "median"))
+        print("val, best model (full volumes):\n" + vbs.round(4).to_string())
         json.dump(dict(mode=a.mode, best_val_dice=best, val_dice_m0=float(v0.dice_m0.mean()), log=log,
+                       val_boundary=vbs.round(4).to_dict(orient="index"),
                        config=vars(a), minutes=(time.time() - t0) / 60), open(out / "pilot_summary.json", "w"), indent=2)
         print(f"pilot done (test skipped): best val Dice {best:.4f} vs M0 {v0.dice_m0.mean():.4f} -> {out}")
         return

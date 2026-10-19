@@ -12,8 +12,11 @@ maps are in-sample on training cases).
 Two variants with IDENTICAL architecture and parameter count except one fixed/learned layer:
   mode="freq"     the image is split by a fixed 3D Haar transform into LLL (context, 3 ch) and 7 signed
                   high-frequency bands x 3 ch (detail, 21 ch) at half resolution
+  mode="freq_lll" the same Haar split, but the 7 high-frequency bands are zeroed (low-frequency context only;
+                  identical parameter count): tests whether the high-frequency detail adds anything
   mode="spatial"  the same 24 half-resolution channels come from a learned stride-2 convolution
                   (spatial-only twin: same capacity, no frequency decomposition)
+gate=False drops the output gate (ablation):  z_final = z0 + allow * delta  (delta still zero-initialised).
 Detail features enter the encoder through a context-guided gate (high frequency is evidence, not a label):
     c = proj([down(features), ctx]);  h = proj(detail);  e2 = c + sigmoid(W[c, h]) * h
 """
@@ -35,14 +38,14 @@ def block(cin, cout):
 
 
 class BoundaryRefiner(nn.Module):
-    def __init__(self, mode: str = "freq", width: int = 16, img_ch: int = 3):
+    def __init__(self, mode: str = "freq", width: int = 16, img_ch: int = 3, gate: bool = True):
         super().__init__()
-        assert mode in ("freq", "spatial")
-        self.mode, w = mode, width
+        assert mode in ("freq", "freq_lll", "spatial")
+        self.mode, w, self.use_gate = mode, width, gate
         self.n_ctx, self.n_det = img_ch, img_ch * 7
         self.enc1 = block(img_ch + 2, w)
         self.down1 = nn.Conv3d(w, 2 * w, 3, stride=2, padding=1)
-        if mode == "freq":
+        if mode in ("freq", "freq_lll"):
             self.split = HaarDWT3D()
         else:
             self.split = nn.Conv3d(img_ch, self.n_ctx + self.n_det, 2, stride=2)
@@ -57,14 +60,17 @@ class BoundaryRefiner(nn.Module):
         self.up1 = nn.ConvTranspose3d(2 * w, w, 2, stride=2)
         self.dec1 = block(2 * w, w)
         self.delta = nn.Conv3d(w, 1, 1)
-        self.gate = nn.Conv3d(w, 1, 1)
+        self.gate = nn.Conv3d(w, 1, 1) if gate else None
         for m in (self.delta, self.gate):          # delta = 0, g = 0.5 at start -> output == M0
-            nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+            if m is not None:
+                nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
 
     def bands(self, img):
         s = self.split(img)
         if self.mode == "freq":                    # (B, C, 8, ...): band 0 = LLL
             return s[:, :, 0], s[:, :, 1:].flatten(1, 2)
+        if self.mode == "freq_lll":                # high-frequency bands removed
+            return s[:, :, 0], torch.zeros_like(s[:, :, 1:].flatten(1, 2))
         return s[:, :self.n_ctx], s[:, self.n_ctx:]
 
     def forward(self, x):
@@ -79,4 +85,7 @@ class BoundaryRefiner(nn.Module):
         u2 = self.dec2(torch.cat([self.up2(e3), e2], 1))
         u1 = self.dec1(torch.cat([self.up1(u2), e1], 1))
         z0 = (2 * m0 - 1) * LOG3
-        return z0 + allow * torch.sigmoid(self.gate(u1)) * self.delta(u1)
+        r = self.delta(u1)
+        if self.gate is not None:
+            r = torch.sigmoid(self.gate(u1)) * r
+        return z0 + allow * r

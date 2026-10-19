@@ -138,3 +138,33 @@ def test_error_sampling_centres_patches_on_correctable_errors(tmp_path):
         m, g, band = b["x"][:, 3] > 0.5, b["y"][:, 0] > 0.5, b["x"][:, 5] > 0.5
         return ((m ^ g) & band).float().mean().item()
     assert err_frac(True) > err_frac(False)                            # more error voxels per patch
+
+
+@pytest.mark.parametrize("mode,gate", [("freq_lll", True), ("freq", False), ("spatial", False)])
+def test_variants_start_as_identity_and_lll_matches_freq_size(mode, gate):
+    net = BoundaryRefiner(mode, gate=gate)
+    m = _ball((32, 32, 32), (16, 16, 16), 7)
+    x = torch.from_numpy(channels(np.random.rand(3, 32, 32, 32).astype(np.float32), m))[None]
+    assert torch.equal((net(x) > 0)[0, 0], torch.from_numpy(m))
+    n = lambda k: sum(p.numel() for p in BoundaryRefiner(k).parameters())
+    assert n("freq_lll") == n("freq")
+
+
+def test_freq_lll_ignores_high_frequency_detail():
+    net = BoundaryRefiner("freq_lll")
+    ctx, det = net.bands(torch.rand(1, 3, 16, 16, 16))
+    assert ctx.abs().sum() > 0 and det.abs().sum() == 0 and det.shape[1] == 21
+
+
+def test_balanced_loss_counts_each_error_group_equally():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from s7_refine import balanced_loss
+    shape = (1, 1, 8, 8, 8)
+    m0 = torch.zeros(shape); m0[..., :4] = 1
+    y = m0.clone(); y[..., 0, 0, 4] = 1                                # one missed voxel among many correct
+    x = torch.cat([torch.zeros((1, 3, 8, 8, 8)), m0, torch.zeros(shape), torch.ones(shape)], 1)
+    z = (2 * m0 - 1) * 3.0
+    base = balanced_loss(z, y, x).item()
+    z2 = z.clone(); z2[..., 0, 0, 4] = 3.0                              # fix the single missed voxel
+    assert base - balanced_loss(z2, y, x).item() > 1.0                  # its group weighs as much as all correct ones
