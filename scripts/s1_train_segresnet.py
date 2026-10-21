@@ -79,11 +79,11 @@ def predict_volume(model, image, t, patch, amp, overlap=0.5):
     with torch.autocast(DEV, dtype=torch.float16, enabled=amp):
         logits = sliding_window_inference(x, (patch,) * 3, sw_batch_size=4, predictor=pred_fn,
                                           overlap=overlap, mode="gaussian")
-    return (torch.sigmoid(logits.float())[0, 0] > 0.5).cpu().numpy()
+    return torch.sigmoid(logits.float())[0, 0].cpu().numpy()          # probability; callers threshold at 0.5
 
 
 def evaluate(model, loader, prompts, args, text_enc, full_metrics, save_dir=None, column=None, desc="eval",
-             overlap=0.5):
+             overlap=0.5, save_prob=False):
     model.eval()
     rows = []
     for item in tqdm(loader, desc=desc, unit="case", file=sys.stdout, dynamic_ncols=True, mininterval=10):
@@ -92,12 +92,14 @@ def evaluate(model, loader, prompts, args, text_enc, full_metrics, save_dir=None
         if text_enc is not None:
             txt = pick_prompt(prompts[cid], "S", 0.0, column=column)
             t = text_enc.encode([txt])
-        pred = unpad(predict_volume(model, item["image"], t, args.patch, args.amp, overlap), item["pads"])
+        prob = unpad(predict_volume(model, item["image"], t, args.patch, args.amp, overlap), item["pads"])
+        pred = prob > 0.5
         gt = item["label"].numpy() > 0
         m = all_metrics(pred, gt) if full_metrics else dict(dice=dice(pred, gt))
         rows.append(dict(cache_id=cid, **m))
         if save_dir is not None:
-            np.savez_compressed(Path(save_dir) / f"{cid}.npz", mask=pred.astype(np.uint8))
+            extra = dict(prob=np.round(prob * 255).astype(np.uint8)) if save_prob else {}   # prob = value / 255
+            np.savez_compressed(Path(save_dir) / f"{cid}.npz", mask=pred.astype(np.uint8), **extra)
     return pd.DataFrame(rows)
 
 
@@ -132,6 +134,10 @@ def main():
     ap.add_argument("--limit_eval", type=int, default=0)
     ap.add_argument("--eval_only", action="store_true")
     ap.add_argument("--skip_test", action="store_true")
+    ap.add_argument("--eval_split", default="test",
+                    help="split value(s) of --split_col evaluated at the end, comma-separated (e.g. heldout for an "
+                         "out-of-fold run, or val,test); default test")
+    ap.add_argument("--save_prob", action="store_true", help="also save the probability map (uint8, prob*255)")
     ap.add_argument("--no_amp", action="store_true")
     a = ap.parse_args()
     a.amp = (not a.no_amp) and DEV == "cuda"
@@ -144,10 +150,16 @@ def main():
     tr = cases_for(sp[sp[a.split_col] == "train"], "train", root)
     va = cases_for(sp[sp[a.split_col] == "val"], "val", root)
     te = cases_for(sp[sp[a.split_col] == "test"], "test", root)
+    ev = {s: cases_for(sp[sp[a.split_col] == s], s, root) for s in a.eval_split.split(",")}
+    for s, cs in ev.items():
+        n_exp = int((sp[a.split_col] == s).sum())
+        if len(cs) != n_exp:
+            raise SystemExit(f"eval split '{s}': {len(cs)} of {n_exp} cases found in the cache")
     if a.limit_train:
         tr = tr[: a.limit_train]
     if a.limit_eval:
         va, te = va[: a.limit_eval], te[: a.limit_eval]
+        ev = {s: cs[: a.limit_eval] for s, cs in ev.items()}
     print(f"cache {root}\ntrain {len(tr)} | val {len(va)} | test {len(te)} | text {a.text} ({a.prompt_mode})")
     (out / "config.json").write_text(json.dumps(vars(a), indent=2))
 
@@ -249,17 +261,20 @@ def main():
     if a.skip_test:
         return
     model.load_state_dict(torch.load(out / "best.pt", map_location=DEV, weights_only=False))
-    pred_dir = out / "test_pred"; pred_dir.mkdir(exist_ok=True)
-    tm = evaluate(model, vol_loader(te), prompts, a, text_enc, True, save_dir=pred_dir, desc="test")
-    tm["collection"] = tm.cache_id.str.split("_").str[0].str.upper()
-    tm.to_csv(out / "test_metrics.csv", index=False)
-    summ = {"cases": len(tm), "dice_mean": tm.dice.mean(), "dice_median": tm.dice.median(),
-            "hd95_mean": tm.hd95.mean(), "nsd_mean": tm.nsd.mean(), "missed(<0.1)": (tm.dice < 0.1).mean(),
-            "best_val_dice": best}
-    print("\nTEST (official 306, evaluated once):")
-    print(json.dumps({k: round(float(v), 4) for k, v in summ.items()}, indent=2))
-    print(tm.groupby("collection")[["dice", "hd95", "nsd"]].mean().round(4).to_string())
-    (out / "test_summary.json").write_text(json.dumps({k: float(v) for k, v in summ.items()}, indent=2))
+    for split, cases in ev.items():
+        pred_dir = out / f"{split}_pred"; pred_dir.mkdir(exist_ok=True)
+        tm = evaluate(model, vol_loader(cases), prompts, a, text_enc, True, save_dir=pred_dir, desc=split,
+                      save_prob=a.save_prob)
+        tm["collection"] = tm.cache_id.str.split("_").str[0].str.upper()
+        tm.to_csv(out / f"{split}_metrics.csv", index=False)
+        summ = {"cases": len(tm), "dice_mean": tm.dice.mean(), "dice_median": tm.dice.median(),
+                "hd95_mean": tm.hd95.mean(), "nsd_mean": tm.nsd.mean(), "missed(<0.1)": (tm.dice < 0.1).mean(),
+                "best_val_dice": best}
+        title = "official 306, evaluated once" if split == "test" else f"{len(tm)} cases"
+        print(f"\n{split.upper()} ({title}, raw mask, no post-processing):")
+        print(json.dumps({k: round(float(v), 4) for k, v in summ.items()}, indent=2))
+        print(tm.groupby("collection")[["dice", "hd95", "nsd"]].mean().round(4).to_string())
+        (out / f"{split}_summary.json").write_text(json.dumps({k: float(v) for k, v in summ.items()}, indent=2))
 
 
 if __name__ == "__main__":

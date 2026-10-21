@@ -168,3 +168,18 @@ def test_balanced_loss_counts_each_error_group_equally():
     base = balanced_loss(z, y, x).item()
     z2 = z.clone(); z2[..., 0, 0, 4] = 3.0                              # fix the single missed voxel
     assert base - balanced_loss(z2, y, x).item() > 1.0                  # its group weighs as much as all correct ones
+
+
+def test_fold_columns_hold_out_every_training_patient_once():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import pandas as pd
+    from make_folds import fold_columns
+    sp = fold_columns(pd.read_csv(Path(__file__).resolve().parents[1] / "configs" / "splits.csv"))
+    tr = sp.split == "train"
+    held = sum((sp[f"fold3_{k}"] == "heldout").astype(int) for k in range(3))
+    assert (held[tr] == 1).all() and (held[~tr] == 0).all()
+    for k in range(3):
+        assert (sp.loc[~tr, f"fold3_{k}"] == sp.loc[~tr, "split"]).all()        # val / test untouched
+        share = sp[sp[f"fold3_{k}"] == "heldout"].collection.value_counts() / sp[tr].collection.value_counts()
+        assert share.between(0.30, 0.37).all()                                    # stratified by collection
