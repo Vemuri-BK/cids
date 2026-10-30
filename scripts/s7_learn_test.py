@@ -38,7 +38,7 @@ from cids.data.cache import find_cache_root  # noqa: E402
 from cids.provenance import require_cases  # noqa: E402
 from cids.refine.data import R_ALLOW, RefinePatchDataset, signed_distance  # noqa: E402
 from cids.refine.model import LOG3, BoundaryRefiner  # noqa: E402
-from cids.refine.source import find_s3f  # noqa: E402
+from cids.refine.source import find_s3f, index_maps  # noqa: E402
 from s7_refine import DEV, _prep, evaluate, refine_loss  # noqa: E402
 
 
@@ -104,6 +104,7 @@ def main():
     ap.add_argument("--w_keep", type=float, default=1.0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--prob_dirs", default="", help="refiner v2: SegResNet map folders (adds the probability channel)")
     a = ap.parse_args()
     t0 = time.time()
     amp = DEV == "cuda"
@@ -115,8 +116,15 @@ def main():
     train = require_cases(sp, root, "train")
     rng = np.random.default_rng(a.seed)
     pool = [train[i] for i in rng.permutation(len(train))[:a.pool]]
+    maps = index_maps(a.prob_dirs.split(","), unpack_to=work.parent / "prob_unpacked") if a.prob_dirs else {}
+    if maps and any(c not in maps for c, _ in pool):
+        raise SystemExit("some training cases have no SegResNet probability map")
     with Pool(max(1, a.workers)) as p:
-        metas = list(p.imap(_prep, [(c, q, s3f / "masks" / f"{c}.npz", work) for c, q in pool]))
+        metas = list(p.imap(_prep, [(c, q, s3f / "masks" / f"{c}.npz", work, 16, maps.get(c)) for c, q in pool]))
+    if maps:                                             # ROIs cached by an earlier v1 run have no probability
+        stale = [m["cid"] for m in metas if not m["empty"] and "prob" not in np.load(work / f"{m['cid']}.npz").files]
+        if stale:
+            raise SystemExit(f"{work} holds ROIs without probability maps (e.g. {stale[:3]}); use a new --work")
     rows = []
     for m in metas:
         if m["empty"]:
@@ -144,7 +152,7 @@ def main():
     for cfg in a.configs.split(","):
         mode, loss, gate = cfg.split(":")
         torch.manual_seed(a.seed)
-        model = BoundaryRefiner(mode, a.width, gate=(gate == "gate")).to(DEV)
+        model = BoundaryRefiner(mode, a.width, gate=(gate == "gate"), extra_ch=1 if maps else 0).to(DEV)
         opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.0)
         scaler = torch.amp.GradScaler("cuda", enabled=amp)
         g = torch.Generator().manual_seed(a.seed)

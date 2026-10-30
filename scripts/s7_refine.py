@@ -40,8 +40,8 @@ sys.path.insert(0, str(ROOT))
 from cids.data.cache import find_cache_root, load_case  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.provenance import file_digest, require_cases, save_npz_atomic  # noqa: E402
-from cids.refine.source import find_s3f  # noqa: E402
-from cids.refine.data import R_ALLOW, RefinePatchDataset, channels, pad_min, prepare_case  # noqa: E402
+from cids.refine.source import find_s3f, index_maps  # noqa: E402
+from cids.refine.data import R_ALLOW, RefinePatchDataset, pad_min, prepare_case, roi_channels  # noqa: E402
 from cids.refine.model import BoundaryRefiner  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -100,7 +100,7 @@ def refine_case(model, work, meta, patch, amp):
         return None
     from monai.inferers import sliding_window_inference
     d = np.load(work / f"{meta['cid']}.npz")
-    x, pads = pad_min(channels(d["img"], d["m0"].astype(bool)), patch)
+    x, pads = pad_min(roi_channels(d), patch)
     with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
         z = sliding_window_inference(torch.from_numpy(x)[None].to(DEV), (patch,) * 3, sw_batch_size=4,
                                      predictor=model, overlap=0.5, mode="gaussian")[0, 0].float().cpu().numpy()
@@ -168,6 +168,9 @@ def main():
                     help="balanced = masked Dice + BCE averaged per group (missed / extra / already correct)")
     ap.add_argument("--w_keep", type=float, default=1.0, help="balanced loss: weight of the already-correct group")
     ap.add_argument("--no_gate", action="store_true", help="ablation: z = z0 + allow * delta (no output gate)")
+    ap.add_argument("--prob_dirs", default="",
+                    help="refiner v2: comma-separated SegResNet map folders (out-of-fold seg_fold0..2 for training "
+                         "patients + seg_foldfull for val/test); adds the probability map as an input channel")
     ap.add_argument("--train_check", type=int, default=120, help="fixed training cases evaluated (unaugmented) at each val")
     ap.add_argument("--time_budget_h", type=float, default=10.0)
     ap.add_argument("--limit", type=int, default=0, help="cases per split (tests)")
@@ -192,8 +195,18 @@ def main():
     h = hashlib.md5()
     for c, _ in sorted(x for s_ in cases.values() for x in s_):
         h.update(c.encode()); h.update((s3f / "masks" / f"{c}.npz").read_bytes())
-    roi_manifest = dict(version=2, masks_md5=h.hexdigest(), n_cases=sum(len(v) for v in cases.values()), margin=16,
-                        r_allow=R_ALLOW, s3f_threshold=s3f_summary.get("threshold"))
+    maps = {}
+    if a.prob_dirs:
+        maps = index_maps(a.prob_dirs.split(","), unpack_to=Path(a.work).parent / "prob_unpacked")
+        miss = [c for s_ in cases.values() for c, _ in s_ if c not in maps]
+        if miss:
+            raise SystemExit(f"{len(miss)} cases have no SegResNet probability map (e.g. {miss[:5]})")
+        hp = hashlib.md5()
+        for c, _ in sorted(x for s_ in cases.values() for x in s_):
+            hp.update(c.encode()); hp.update(Path(maps[c]).read_bytes())
+    roi_manifest = dict(version=3, masks_md5=h.hexdigest(), n_cases=sum(len(v) for v in cases.values()), margin=16,
+                        r_allow=R_ALLOW, s3f_threshold=s3f_summary.get("threshold"),
+                        prob_md5=hp.hexdigest() if maps else None)
     mf = work / "rois_manifest.json"
     if mf.exists() and json.loads(mf.read_text()) != roi_manifest:
         raise SystemExit(f"{work} holds ROIs from other masks/settings ({mf}); use a new --work")
@@ -207,7 +220,7 @@ def main():
     # 1. ROIs
     metas = {}
     for s, cs in cases.items():
-        jobs = [(c, p, s3f / "masks" / f"{c}.npz", work) for c, p in cs]
+        jobs = [(c, p, s3f / "masks" / f"{c}.npz", work, 16, maps.get(c)) for c, p in cs]
         with Pool(max(1, a.workers)) as pool:
             metas[s] = list(tqdm(pool.imap(_prep, jobs), total=len(jobs), desc=f"ROIs {s}", file=sys.stdout, mininterval=30))
         print(f"{s}: {len(cs)} cases, {sum(m['empty'] for m in metas[s])} with empty M0 (kept as is)")
@@ -224,9 +237,10 @@ def main():
     sample_w = np.clip(1 - td, 0.05, 0.5) if a.weight_hard else None
 
     # 2. model + identity check
-    model = BoundaryRefiner(a.mode, a.width, gate=not a.no_gate).to(DEV)
+    model = BoundaryRefiner(a.mode, a.width, gate=not a.no_gate, extra_ch=1 if maps else 0).to(DEV)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"refiner ({a.mode}, output gate {'off' if a.no_gate else 'on'}, loss {a.loss}): {n_par:,} parameters")
+    print(f"refiner ({a.mode}, output gate {'off' if a.no_gate else 'on'}, loss {a.loss}, inputs: MRI + M0"
+          f"{' + SegResNet probability map (v2)' if maps else ' (v1)'}): {n_par:,} parameters")
     v0 = evaluate(model, work, metas["val"], a.patch, amp)
     assert (v0.dice_ref == v0.dice_m0).all() and (v0.changed == 0).all(), "refiner at init must reproduce M0 exactly"
     vm = s3f / "val_metrics.csv"                         # per-case parity with notebook 12 (not just the mean)

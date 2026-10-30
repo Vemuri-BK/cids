@@ -31,15 +31,27 @@ def signed_distance(m: np.ndarray) -> np.ndarray:
     return (ndimage.distance_transform_edt(~m) - ndimage.distance_transform_edt(m)).astype(np.float32)
 
 
-def channels(img3: np.ndarray, m0: np.ndarray, r_allow: float = R_ALLOW) -> np.ndarray:
-    """(6, ...) float32: img 3 ch, M0, sdf/clip (clipped to [-1, 1]), allow band."""
+def channels(img3: np.ndarray, m0: np.ndarray, r_allow: float = R_ALLOW, prob: np.ndarray = None) -> np.ndarray:
+    """(6 or 7, ...) float32: img 3 ch, M0, sdf/clip (clipped to [-1, 1]), allow band
+    [+ SegResNet probability in [0, 1] (refiner v2): where the finder hesitated]."""
     sdf = signed_distance(m0.astype(bool))
     allow = (np.abs(sdf) <= r_allow).astype(np.float32)
-    return np.concatenate([img3.astype(np.float32), m0[None].astype(np.float32),
-                           np.clip(sdf / SDF_CLIP, -1, 1)[None], allow[None]])
+    parts = [img3.astype(np.float32), m0[None].astype(np.float32), np.clip(sdf / SDF_CLIP, -1, 1)[None], allow[None]]
+    if prob is not None:
+        parts.append(np.asarray(prob, np.float32)[None])
+    return np.concatenate(parts)
 
 
-def prepare_case(cid, cache_path, mask_path, work: Path, margin: int = 16):
+def roi_channels(d, m0=None) -> np.ndarray:
+    """Channels of a prepared ROI file (d = np.load(<work>/<cid>.npz)); the probability is used if stored."""
+    m0 = d["m0"].astype(bool) if m0 is None else m0
+    prob = d["prob"].astype(np.float32) / 255.0 if "prob" in d.files else None
+    return channels(d["img"], m0, prob=prob)
+
+
+def prepare_case(cid, cache_path, mask_path, work: Path, margin: int = 16, prob_path=None):
+    """prob_path: optional SegResNet map (<cid>.npz with 'prob' = probability x 255, full cache grid), cropped
+    to the same ROI and stored as 'prob' (refiner v2)."""
     out = work / f"{cid}.npz"
     meta_f = work / f"{cid}.json"
     if out.exists() and meta_f.exists():
@@ -56,8 +68,14 @@ def prepare_case(cid, cache_path, mask_path, work: Path, margin: int = 16):
         sl = tuple(slice(a, b) for a, b in zip(lo, hi))
         g = gt[sl]
         tmp = work / f"{cid}.partial.npz"
+        extra = {}
+        if prob_path is not None:
+            pr = np.load(prob_path)["prob"]
+            if pr.shape != m.shape:
+                raise ValueError(f"{cid}: probability map {pr.shape} vs mask {m.shape}")
+            extra["prob"] = pr[sl].astype(np.uint8)
         np.savez(tmp, img=three_channel(img2[(slice(None),) + sl]).astype(np.float16), m0=m[sl].astype(np.uint8),
-                 gt=g.astype(np.uint8))
+                 gt=g.astype(np.uint8), **extra)
         tmp.replace(out)
         mc = m[sl]
         den = int(mc.sum()) + int(gt.sum())
@@ -113,7 +131,7 @@ class RefinePatchDataset(Dataset):
         m0 = d["m0"].astype(bool)
         if self.augment:
             m0 = perturb_mask(m0, rng, self.p_perturb, self.perturb_scale)
-        x = channels(d["img"], m0)
+        x = roi_channels(d, m0)
         y = d["gt"][None].astype(np.float32)
         P = self.patch
         x, _ = pad_min(x, P); y, _ = pad_min(y, P)

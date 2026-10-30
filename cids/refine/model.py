@@ -38,12 +38,14 @@ def block(cin, cout):
 
 
 class BoundaryRefiner(nn.Module):
-    def __init__(self, mode: str = "freq", width: int = 16, img_ch: int = 3, gate: bool = True):
+    def __init__(self, mode: str = "freq", width: int = 16, img_ch: int = 3, gate: bool = True, extra_ch: int = 0):
+        """extra_ch: extra input channels after [img, M0, sdf, allow] (refiner v2: 1 = SegResNet probability);
+        they enter the full-resolution encoder with M0 and sdf. The Haar split still sees the image only."""
         super().__init__()
         assert mode in ("freq", "freq_lll", "spatial")
-        self.mode, w, self.use_gate = mode, width, gate
+        self.mode, w, self.use_gate, self.extra_ch = mode, width, gate, extra_ch
         self.n_ctx, self.n_det = img_ch, img_ch * 7
-        self.enc1 = block(img_ch + 2, w)
+        self.enc1 = block(img_ch + 2 + extra_ch, w)
         self.down1 = nn.Conv3d(w, 2 * w, 3, stride=2, padding=1)
         if mode in ("freq", "freq_lll"):
             self.split = HaarDWT3D()
@@ -74,9 +76,12 @@ class BoundaryRefiner(nn.Module):
         return s[:, :self.n_ctx], s[:, self.n_ctx:]
 
     def forward(self, x):
-        """x: (B, 6, D, H, W) = [img 3 ch, M0, signed distance (clipped, /R), allow]; D, H, W divisible by 4."""
+        """x: (B, 6 + extra_ch, D, H, W) = [img 3 ch, M0, signed distance (clipped, /R), allow, extra...];
+        D, H, W divisible by 4."""
         img, m0, sdf, allow = x[:, :3], x[:, 3:4], x[:, 4:5], x[:, 5:6]
-        e1 = self.enc1(torch.cat([img, m0, sdf], 1))
+        extra = x[:, 6:6 + self.extra_ch]
+        assert extra.shape[1] == self.extra_ch, f"refiner expects {self.extra_ch} extra channel(s), got {extra.shape[1]}"
+        e1 = self.enc1(torch.cat([img, m0, sdf, extra], 1))
         ctx, det = self.bands(img)
         c = self.ctx_proj(torch.cat([self.down1(e1), ctx], 1))
         h = self.det_proj(det)

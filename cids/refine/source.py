@@ -44,3 +44,31 @@ def find_s3f(path: str, unpack_to: Path) -> Path:
                 return dst
     listing = [str(x.relative_to(p)) for x in list(p.rglob("*"))[:30]] if p.exists() else []
     raise SystemExit(f"no notebook 12 output (summary.json + masks) under {path}; found: {listing}")
+
+
+def index_maps(dirs, subs=("heldout_pred", "val_pred", "test_pred"), unpack_to=None) -> dict:
+    """{cid: npz path} of SegResNet probability maps (notebook 20 / s1_train_segresnet --save_prob) found as
+    <dir>/<sub>/ folders or <dir>/<sub>.zip (unpacked once under unpack_to). A case in two folders -> error."""
+    import zipfile
+    idx = {}
+    for d in [Path(x).expanduser() for x in dirs if str(x).strip()]:
+        found = False
+        for sub in subs:
+            folder, zp = d / sub, d / f"{sub}.zip"
+            if not folder.is_dir() and zp.exists():
+                if unpack_to is None:
+                    raise SystemExit(f"{zp} is zipped: pass unpack_to")
+                folder = Path(unpack_to) / d.name / sub
+                if not folder.is_dir():
+                    with zipfile.ZipFile(zp) as z:
+                        z.extractall(Path(unpack_to) / d.name)
+            if not folder.is_dir():
+                continue
+            found = True
+            for q in folder.glob("*.npz"):
+                if q.stem in idx:
+                    raise SystemExit(f"{q.stem} has maps in two places ({idx[q.stem]}, {q}): folds must not overlap")
+                idx[q.stem] = q
+        if not found:
+            raise SystemExit(f"no map folder ({', '.join(subs)}) in {d}")
+    return idx

@@ -183,3 +183,47 @@ def test_fold_columns_hold_out_every_training_patient_once():
         assert (sp.loc[~tr, f"fold3_{k}"] == sp.loc[~tr, "split"]).all()        # val / test untouched
         share = sp[sp[f"fold3_{k}"] == "heldout"].collection.value_counts() / sp[tr].collection.value_counts()
         assert share.between(0.30, 0.37).all()                                    # stratified by collection
+
+
+def test_probability_channel_roundtrip_and_identity(tmp_path):
+    from cids.refine.data import roi_channels
+    shape = (40, 40, 40)
+    gt = _ball(shape, (20, 20, 20), 8); m0 = _ball(shape, (21, 20, 20), 7)
+    img = np.random.default_rng(0).random((2,) + shape).astype(np.float16)
+    np.savez(tmp_path / "duke_001.npz", image=img, label=gt[None].astype(np.uint8))
+    np.savez(tmp_path / "m.npz", mask=m0.astype(np.uint8))
+    prob = np.round(np.clip(0.9 * gt + 0.05, 0, 1) * 255).astype(np.uint8)
+    np.savez(tmp_path / "p.npz", prob=prob, mask=(prob > 127).astype(np.uint8))
+    work = tmp_path / "work"; work.mkdir()
+    meta = prepare_case("duke_001", tmp_path / "duke_001.npz", tmp_path / "m.npz", work, margin=4,
+                        prob_path=tmp_path / "p.npz")
+    d = np.load(work / "duke_001.npz")
+    lo, hi = meta["bbox"]
+    sl = tuple(slice(a, b) for a, b in zip(lo, hi))
+    assert np.array_equal(d["prob"], prob[sl])                          # same crop as image and mask
+    x = roi_channels(d)
+    assert x.shape[0] == 7 and np.allclose(x[6], prob[sl] / 255.0)
+    net = BoundaryRefiner("freq", width=8, extra_ch=1)
+    pad = [(0, (-s) % 4) for s in x.shape[1:]]
+    xt = torch.nn.functional.pad(torch.from_numpy(x)[None], [q for p_ in reversed(pad) for q in p_])
+    out = (net(xt) > 0)[0, 0, : x.shape[1], : x.shape[2], : x.shape[3]].numpy()
+    assert np.array_equal(out, d["m0"].astype(bool))                  # v2 still starts exactly at M0
+    ds = RefinePatchDataset(["duke_001"], work, patch=24, n_patches=2, augment=True)
+    assert ds[0]["x"].shape[1] == 7
+    with pytest.raises(AssertionError):                                 # v2 model refuses v1 inputs
+        net(xt[:, :6])
+
+
+def test_index_maps_rejects_overlapping_folds(tmp_path):
+    from cids.refine.source import index_maps
+    for k in (0, 1):
+        d = tmp_path / f"seg_fold{k}" / "heldout_pred"; d.mkdir(parents=True)
+        np.savez(d / f"duke_00{k}.npz", prob=np.zeros(1, np.uint8))
+    full = tmp_path / "seg_foldfull"
+    for sub in ("val_pred", "test_pred"):
+        (full / sub).mkdir(parents=True); np.savez(full / sub / f"x_{sub}.npz", prob=np.zeros(1, np.uint8))
+    idx = index_maps([tmp_path / "seg_fold0", tmp_path / "seg_fold1", full])
+    assert set(idx) == {"duke_000", "duke_001", "x_val_pred", "x_test_pred"}
+    np.savez(tmp_path / "seg_fold1" / "heldout_pred" / "duke_000.npz", prob=np.zeros(1, np.uint8))
+    with pytest.raises(SystemExit, match="two places"):
+        index_maps([tmp_path / "seg_fold0", tmp_path / "seg_fold1"])
