@@ -83,6 +83,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=10, help="nearest memories (as S3f)")
     ap.add_argument("--limit", type=int, default=0, help="training cases (tests)")
+    ap.add_argument("--parity_tol", type=float, default=0.01,
+                    help="max |Dice difference| between the refitted jury's training masks and notebook 12's "
+                         "(scikit-learn version differences give ~0.003)")
     a = ap.parse_args()
     t0 = time.time()
     out = Path(a.out).expanduser(); out.mkdir(parents=True, exist_ok=True)
@@ -109,11 +112,23 @@ def main():
         raise SystemExit("S3f train_features.csv and train_desc.npy differ in length")
     cross = CrossFitMemoryJury(old_tr, old_D, k=a.k, allow_tiny=bool(a.limit))
     import s3d_learned_jury as s3d
-    old_tab = s3d.rule_tables(old_tr, cross.proba(old_tr, old_D))[f"learned_t{t:.2f}"]
+    old_p = cross.proba(old_tr, old_D)
+    old_tab = s3d.rule_tables(old_tr, old_p)[f"learned_t{t:.2f}"]
     ref = s3f_summary.get("train_oof_table_dice")
-    print(f"S3f training masks (in-sample finder): table Dice {old_tab.mean():.4f} (notebook 12: {ref})")
-    if ref is not None and not a.limit and abs(old_tab.mean() - ref) > 1e-6:
-        raise SystemExit("cross-fitted jury does not reproduce notebook 12's training masks: different S3f files?")
+    # same kept candidates as notebook 12's saved training masks? (the jury is refitted here; scikit-learn
+    # versions differ between Kaggle and this machine, so tiny differences are expected)
+    old_keep = keep_candidates(old_tr, old_p, t)
+    same = n_cmp = 0
+    for cid, ks in old_keep.items():
+        f = s3f / "masks" / f"{cid}.npz"
+        if f.exists() and "kept" in np.load(f).files:
+            n_cmp += 1; same += sorted(ks) == sorted(np.load(f)["kept"].tolist())
+    import sklearn
+    print(f"S3f training masks (in-sample finder): table Dice {old_tab.mean():.4f} (notebook 12: {ref}) | "
+          f"same kept candidates as notebook 12 in {same}/{n_cmp} patients | scikit-learn {sklearn.__version__}")
+    if ref is not None and not a.limit and abs(old_tab.mean() - ref) > a.parity_tol:
+        raise SystemExit(f"refitted jury differs from notebook 12 by {abs(old_tab.mean() - ref):.4f} Dice "
+                         f"(> --parity_tol {a.parity_tol}): different S3f files?")
 
     # 2. OOF candidates -> SAM -> rows (resumable per case)
     import s3a_seg2sam as s3
@@ -173,6 +188,7 @@ def main():
     summary = dict(s3f_summary)                                     # threshold, val/test results: unchanged
     summary.update(
         s3g=dict(train_cases=len(train), train_table_dice_s3f=float(old_tab.reindex(new_dice.index).mean()),
+                 train_table_dice_s3f_notebook12=ref, same_kept_as_notebook12=f"{same}/{n_cmp}",
                  train_table_dice_oof=float(new_dice.mean()),
                  train_seg_rel20_dice_oof=float(new_tab["seg_rel20"].mean()),
                  train_oracle_dice_oof=float(new_tab["oracle"].mean()),
