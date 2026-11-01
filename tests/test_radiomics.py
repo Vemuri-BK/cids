@@ -157,6 +157,10 @@ def _fake_s3f(tmp: Path, n=(40, 10, 10)):
         np.save(s3f / f"{split}_desc.npy", np.stack(descs).astype(np.float16))
     sp = tmp / "splits.csv"
     pd.DataFrame(split_rows).to_csv(sp, index=False)
+    import pickle                                                   # a saved S3f jury bundle (memory_jury.pkl)
+    trd = pd.read_csv(s3f / "train_features.csv")
+    jury = MemoryJury(k=3).fit(trd, np.load(s3f / "train_desc.npy"))
+    pickle.dump(dict(jury=jury, threshold=0.5), open(s3f / "memory_jury.pkl", "wb"))
     return cache, s3f, sp
 
 
@@ -168,7 +172,13 @@ def test_s3h_end_to_end(tmp_path):
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     v = pd.read_csv(out / "variants.csv").set_index("variant")
-    assert {"finder_only", "jury11", "jury13", "finder_rad", "jury13_rad_rel", "-shape"} <= set(v.index)
+    assert {"finder_only", "jury11", "jury13", "finder_rad", "jury13_rad_rel", "-shape", "s3f_published"} <= set(v.index)
+    assert v.loc["s3f_published", "t_val"] == 0.5 and np.isnan(v.loc["s3f_published", "t_train"])
+    assert v.loc["jury13_rad_rel", "train_oof_dice"] > 0.9            # cut-off chosen on train out-of-fold scores
+    cv = pd.read_csv(out / "curves.csv")
+    assert set(cv.split) == {"train_oof", "val", "test"} and cv.threshold.nunique() == 19
+    s = __import__("json").loads((out / "summary.json").read_text())
+    assert "jury13_rad_rel" in s["curve_wins"]["jury13"] and "jury13_rad_rel" in s["paired_test"]["s3f_published"]
     # the false tube is the largest candidate and the finder / SAM clues are random: only radiomics can tell
     assert v.loc["finder_rad", "auc_test"] > 0.95 and v.loc["finder_rad", "test_dice"] == pytest.approx(1.0)
     assert v.loc["jury13", "auc_test"] < 0.9                         # without radiomics it cannot
