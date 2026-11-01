@@ -48,9 +48,16 @@ def _real(df):
 
 
 class MemoryJury:
-    def __init__(self, k: int = 10, temp: float = 0.05, n_folds: int = 5, features=JURY13):
+    def __init__(self, k: int = 10, temp: float = 0.05, n_folds: int = 5, features=JURY13, post=None):
+        """post: optional function rows -> rows applied after the memory clues (S3h: within-patient relative
+        clues, cids.radiomics.add_relative). None (default) = the S3e/S3f jury unchanged."""
         self.k, self.temp, self.n_folds, self.features = k, temp, n_folds, list(features)
+        self.post = post
         self.threshold = None
+
+    def _post(self, rows):
+        p = getattr(self, "post", None)              # juries pickled before S3h have no `post`
+        return p(rows) if p is not None else rows
 
     # ---------------------------------------------------------------- training
     def fit(self, rows: pd.DataFrame, desc: np.ndarray):
@@ -68,7 +75,7 @@ class MemoryJury:
             mk[held] = knn_score(D[held], D[fit], y[fit], self.k, self.temp)
             pr = _probe().fit(D[fit], y[fit]) if len(set(y[fit])) > 1 else None
             mp[held] = pr.predict_proba(D[held])[:, 1] if pr is not None else 0.5
-        tr = tr.assign(mem_knn=mk, mem_probe=mp)
+        tr = self._post(tr.assign(mem_knn=mk, mem_probe=mp))
         self.mem, self.mem_y = D.astype(np.float16), y
         self.probe = _probe().fit(D, y)
         self.trees = _trees().fit(tr[self.features].to_numpy(float), y.astype(int))
@@ -83,7 +90,7 @@ class MemoryJury:
             D = np.asarray(desc)[r].astype(np.float32)
             rows.loc[r, "mem_knn"] = knn_score(D, self.mem, self.mem_y, self.k, self.temp)
             rows.loc[r, "mem_probe"] = self.probe.predict_proba(D)[:, 1]
-        return rows
+        return self._post(rows)
 
     def proba(self, rows: pd.DataFrame, desc: np.ndarray) -> np.ndarray:
         """P(real tumour) per row (0 for the k = -1 'no candidate' rows)."""

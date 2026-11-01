@@ -20,3 +20,5 @@ einops
 appdirs
 huggingface_hub
 scipy
+scikit-image  # S3h radiomics (surface mesh)
+requests  # medim download
