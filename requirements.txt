@@ -4,7 +4,7 @@ pandas>=2.0
 openpyxl
 pyyaml
 pytest
-scikit-learn  # S3d/S3e learned jury
+scikit-learn==1.9.1  # learned juries: pickled models only load with the same version (S3f Kaggle 1.6.1 bundle fails on 1.9.1)
 tqdm
 # models (Kaggle already has torch/transformers/monai-compatible versions)
 torch

@@ -12,14 +12,17 @@ Cache facts that shaped the feature set (checked on the server, 2026-11-01):
     local (4 mm ring, 15 mm box). Exact zeros (padding) and voxels of any SegResNet component (other
     candidates, satellites) are excluded from the reference regions (v2).
   * field of view differs strongly between and within hospitals -> no absolute position features (they would
-    identify the hospital); only the distance to the patient's dominant candidate.
+    identify the hospital); only the distance to the patient's ANCHOR candidate (v3: the candidate SegResNet is
+    most confident about -- highest mean probability, ties -> larger; v1/v2 used the largest candidate, which
+    fails when a large background-enhancement blob is the biggest component).
 
 Groups (1 mm isotropic voxels, so voxel units = mm):
   RAD_SHAPE     elongation, flatness (inertia eigenvalues), sphericity, solidity (convex hull), surface / volume
   RAD_CONTRAST  ring contrast-to-noise (subtraction), lesion / ring ratio (post1), rim - core (subtraction),
                 z-score of the lesion against its 15 mm box (subtraction), enhancement relative to the local box
   RAD_TEXTURE   entropy, IQR, skewness of the subtraction inside the candidate; edge sharpness
-  RAD_POS       distance to the patient's dominant (largest) candidate
+  RAD_POS       distance to the patient's anchor (most confident) candidate; extraction stores the candidate
+                centre (cx, cy, cz), the distance is computed from the candidate table (add_position)
   REL           within-patient relative clues (added after the memory clues: cids.radiomics.add_relative)
 """
 from __future__ import annotations
@@ -28,13 +31,15 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-RAD_VERSION = 2          # bump whenever a feature definition changes -> cached radiomics tables are recomputed
+RAD_VERSION = 3          # bump whenever a feature definition changes -> cached radiomics tables are recomputed
 
 RAD_SHAPE = ["rad_elongation", "rad_flatness", "rad_sphericity", "rad_solidity", "rad_surf_to_vol"]
 RAD_CONTRAST = ["rad_ring_cnr", "rad_ring_ratio", "rad_rim_minus_core", "rad_local_z_sub", "rad_rel_enh"]
 RAD_TEXTURE = ["rad_sub_entropy", "rad_sub_iqr", "rad_sub_skew", "rad_edge_sharpness"]
 RAD_POS = ["rad_dist_to_dom_mm"]
 RAD_ALL = RAD_SHAPE + RAD_CONTRAST + RAD_TEXTURE + RAD_POS
+CENTRE = ["cx", "cy", "cz"]
+RAD_EXTRACTED = RAD_SHAPE + RAD_CONTRAST + RAD_TEXTURE + CENTRE     # columns written by the extraction step
 REL = ["rel_seg_prob", "rel_sam_soft", "rel_agree", "rel_mem_knn", "rel_ring_cnr"]
 GROUPS = dict(shape=RAD_SHAPE, contrast=RAD_CONTRAST, texture=RAD_TEXTURE, position=RAD_POS, relative=REL)
 
@@ -143,18 +148,32 @@ def candidate_features(img: np.ndarray, lab: np.ndarray, k: int) -> dict:
 
 
 def case_features(cid: str, img: np.ndarray, lab: np.ndarray, ks) -> list:
-    """Rows (cache_id, k, RAD_ALL) for the candidates ks of one patient. ks[0] must be the dominant (largest)
-    candidate (S3 tables list candidates by size: rank 0 = largest)."""
-    rows, cents = [], {}
+    """Rows (cache_id, k, RAD_EXTRACTED) for the candidates ks of one patient: shape / contrast / texture features
+    and the candidate centre (voxels = mm). The distance clue is computed later from the table (add_position)."""
+    rows = []
     for k in ks:
         r = dict(cache_id=cid, k=int(k), **candidate_features(img, lab, int(k)))
-        cents[k] = np.argwhere(lab == k).mean(0) if (lab == k).any() else None
+        idx = np.argwhere(lab == k)
+        c = idx.mean(0) if len(idx) else np.full(3, np.nan)
+        r.update(cx=float(c[0]), cy=float(c[1]), cz=float(c[2]))
         rows.append(r)
-    dom = cents.get(ks[0]) if ks else None
-    for r in rows:
-        c = cents[r["k"]]
-        r["rad_dist_to_dom_mm"] = float(np.linalg.norm(c - dom)) if c is not None and dom is not None else np.nan
     return rows
+
+
+def add_position(df: pd.DataFrame) -> pd.DataFrame:
+    """rad_dist_to_dom_mm = distance (mm) from each real candidate's centre to the patient's ANCHOR candidate:
+    highest seg_prob_mean (ties -> larger size_vox). Needs columns seg_prob_mean, size_vox, cx, cy, cz."""
+    df = df.copy()
+    df["rad_dist_to_dom_mm"] = np.nan
+    r = (df.k >= 0).to_numpy()
+    if not r.any():
+        return df
+    real = df[r]
+    order = real.sort_values(["cache_id", "seg_prob_mean", "size_vox"], ascending=[True, False, False])
+    anchor = order.groupby("cache_id")[CENTRE].first()
+    a = anchor.reindex(real.cache_id).to_numpy()
+    df.loc[r, "rad_dist_to_dom_mm"] = np.linalg.norm(real[CENTRE].to_numpy() - a, axis=1)
+    return df
 
 
 def extract_case(args):
@@ -169,6 +188,36 @@ def extract_case(args):
 
 
 # ---------------------------------------------------------------------------- relative clues
+def versions() -> dict:
+    """Library versions a saved jury depends on (pickled scikit-learn models do not load across versions)."""
+    import platform
+    import sklearn
+    import scipy
+    return dict(python=platform.python_version(), numpy=np.__version__, pandas=pd.__version__,
+                scikit_learn=sklearn.__version__, scipy=scipy.__version__)
+
+
+def load_bundle(path) -> dict:
+    """Load a saved jury bundle (s3h --final). Refuses with a clear message when the scikit-learn version
+    differs from the one that saved it (S3f's Kaggle bundle failed on the server with a cryptic error);
+    the bundle's score CSVs remain the version-independent record."""
+    import pickle
+    import sklearn
+    path = str(path)
+    meta_v = None
+    try:
+        with open(path, "rb") as fh:
+            b = pickle.load(fh)
+        meta_v = b.get("versions", {}).get("scikit_learn")
+    except Exception as e:
+        raise RuntimeError(f"cannot load {path} with scikit-learn {sklearn.__version__} ({type(e).__name__}: {e});"
+                           f" install the version recorded at save time or use the saved score CSVs") from e
+    if meta_v and meta_v != sklearn.__version__:
+        raise RuntimeError(f"{path} was saved with scikit-learn {meta_v}, this environment has "
+                           f"{sklearn.__version__}: results may differ -- install scikit-learn=={meta_v}")
+    return b
+
+
 def add_relative(df: pd.DataFrame) -> pd.DataFrame:
     """Within-patient relative clues over real candidates (k >= 0): the candidate compared with the strongest
     candidate of the SAME patient. Applied after the memory clues (cids.jury.MemoryJury post hook)."""

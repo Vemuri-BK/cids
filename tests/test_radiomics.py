@@ -7,8 +7,8 @@ import pandas as pd
 import pytest
 
 from cids.jury import JURY13, MemoryJury
-from cids.radiomics import (RAD_ALL, REL, add_relative, candidate_features, case_features, icc_31, lins_ccc,
-                            shape_features)
+from cids.radiomics import (RAD_EXTRACTED, REL, add_position, add_relative, candidate_features, case_features,
+                            icc_31, lins_ccc, shape_features)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -75,14 +75,43 @@ def test_other_candidates_excluded_from_reference():
     assert abs(with_sat["rad_ring_cnr"] - alone["rad_ring_cnr"]) / alone["rad_ring_cnr"] < 0.2
 
 
-def test_case_features_distance_to_dominant():
+def test_position_anchor_is_most_confident_candidate():
     shape = (64, 40, 40)
     lab = np.zeros(shape, np.int32)
-    lab[_ball(shape, (15, 20, 20), 6)] = 1
-    lab[_ball(shape, (45, 20, 20), 3)] = 2
+    lab[_ball(shape, (15, 20, 20), 8)] = 1                 # largest, but SegResNet is less sure (e.g. BPE)
+    lab[_ball(shape, (45, 20, 20), 3)] = 2                 # small, confident
     rows = case_features("duke_001", _image(shape, lab > 0, 0.8), lab, [1, 2])
-    assert rows[0]["rad_dist_to_dom_mm"] == 0.0 and abs(rows[1]["rad_dist_to_dom_mm"] - 30) < 1
-    assert set(RAD_ALL) <= set(rows[0])
+    assert {"cx", "cy", "cz"} <= set(rows[0]) and "rad_dist_to_dom_mm" not in rows[0]
+    df = pd.DataFrame(rows).assign(seg_prob_mean=[0.6, 0.9], size_vox=[(lab == 1).sum(), (lab == 2).sum()])
+    df = pd.concat([df, pd.DataFrame([dict(cache_id="duke_002", k=-1)])], ignore_index=True)
+    out = add_position(df)
+    assert out.loc[1, "rad_dist_to_dom_mm"] == 0.0 and abs(out.loc[0, "rad_dist_to_dom_mm"] - 30) < 1
+    assert np.isnan(out.loc[2, "rad_dist_to_dom_mm"])
+    tie = add_position(df.assign(seg_prob_mean=[0.9, 0.9, np.nan]))   # tie -> the larger candidate is the anchor
+    assert tie.loc[0, "rad_dist_to_dom_mm"] == 0.0
+
+
+def test_plateau_cut_is_centre_of_flat_top():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("s3h", ROOT / "scripts" / "s3h_radiomics_jury.py")
+    s3h = importlib.util.module_from_spec(spec); spec.loader.exec_module(s3h)
+    th = np.round(np.arange(0.05, 0.96, 0.05), 2)
+    c = pd.Series(0.80 - 0.05 * np.abs(th - 0.5), index=th)
+    assert s3h.plateau_cut(c) == 0.5
+    flat = pd.Series(np.r_[np.linspace(0.70, 0.80, 6), np.full(13, 0.8155)], index=th)
+    flat[0.80] = 0.8169                                     # noisy maximum at the end of a flat plateau
+    assert 0.40 <= s3h.plateau_cut(flat) <= 0.70 and s3h.plateau_cut(flat) != 0.80
+
+
+def test_bundle_version_check(tmp_path):
+    import pickle
+    from cids.radiomics import load_bundle, versions
+    v = versions()
+    pickle.dump(dict(jury=None, versions=v), open(tmp_path / "ok.pkl", "wb"))
+    assert load_bundle(tmp_path / "ok.pkl")["versions"] == v
+    pickle.dump(dict(jury=None, versions=dict(v, scikit_learn="0.0.1")), open(tmp_path / "old.pkl", "wb"))
+    with pytest.raises(RuntimeError, match="scikit-learn"):
+        load_bundle(tmp_path / "old.pkl")
 
 
 def test_add_relative_within_patient_only():
@@ -165,25 +194,41 @@ def _fake_s3f(tmp: Path, n=(40, 10, 10)):
 
 
 def test_s3h_end_to_end(tmp_path):
+    import json
     cache, s3f, sp = _fake_s3f(tmp_path)
     out = tmp_path / "out"
     cmd = [sys.executable, str(ROOT / "scripts" / "s3h_radiomics_jury.py"), "--s3f_dir", str(s3f),
            "--cache_root", str(cache), "--splits", str(sp), "--out", str(out), "--workers", "2", "--k", "3"]
+    # DEV (default): test tables are never loaded
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    assert not (out / "test_radiomics.csv").exists() and not (out / "variants.csv").exists()
+    dv = pd.read_csv(out / "dev_variants.csv").set_index("variant")
+    assert "test_dice" not in dv and dv.loc["jury13_rad_rel", "train_oof_dice"] > 0.9
+    assert set(pd.read_csv(out / "dev_curves.csv").split) == {"train_oof", "val"}
+    # FINAL: + test once, bundles, masks, full metrics
+    r = subprocess.run(cmd + ["--final"], capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    assert "using cached train_radiomics.csv" in r.stdout
     v = pd.read_csv(out / "variants.csv").set_index("variant")
-    assert {"finder_only", "jury11", "jury13", "finder_rad", "jury13_rad_rel", "-shape", "s3f_published"} <= set(v.index)
-    assert v.loc["s3f_published", "t_val"] == 0.5 and np.isnan(v.loc["s3f_published", "t_train"])
-    assert v.loc["jury13_rad_rel", "train_oof_dice"] > 0.9            # cut-off chosen on train out-of-fold scores
-    cv = pd.read_csv(out / "curves.csv")
-    assert set(cv.split) == {"train_oof", "val", "test"} and cv.threshold.nunique() == 19
-    s = __import__("json").loads((out / "summary.json").read_text())
-    assert "jury13_rad_rel" in s["curve_wins"]["jury13"] and "jury13_rad_rel" in s["paired_test"]["s3f_published"]
+    assert {"finder_only", "jury11", "jury13", "finder_rad", "jury13_rad_rel", "-shape"} <= set(v.index)
     # the false tube is the largest candidate and the finder / SAM clues are random: only radiomics can tell
     assert v.loc["finder_rad", "auc_test"] > 0.95 and v.loc["finder_rad", "test_dice"] == pytest.approx(1.0)
-    assert v.loc["jury13", "auc_test"] < 0.9                         # without radiomics it cannot
+    assert v.loc["jury13", "auc_test"] < 0.9
+    assert set(pd.read_csv(out / "curves.csv").split) == {"train_oof", "val", "test"}
+    sc = pd.read_csv(out / "scores.csv")
+    assert set(sc.split) == {"train_oof", "val", "test"} and sc.p.between(0, 1).all()
     rad = pd.read_csv(out / "test_radiomics.csv")
-    assert len(rad) == 20 and rad[RAD_ALL].notna().all().all()
-    # second run re-uses the cached radiomics tables
-    r2 = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
-    assert r2.returncode == 0 and "using cached test_radiomics.csv" in r2.stdout
+    assert len(rad) == 20 and rad[RAD_EXTRACTED].notna().all().all()
+    for name in ("jury13_rad_rel", "jury13"):
+        d = out / "final" / name
+        from cids.radiomics import load_bundle
+        b = load_bundle(d / f"{name}.pkl")
+        assert b["threshold"] == v.loc[name, "t_train"] and b["versions"]["scikit_learn"]
+        met = pd.read_csv(d / "metrics.csv")
+        assert set(met.split) == {"val", "test"} and len(met) == 20 and {"hd95", "nsd"} <= set(met)
+        s = json.loads((d / "summary.json").read_text())
+        assert max(s["parity_max_abs_diff"].values()) < 1e-6
+        assert len(list((d / "masks").glob("*.npz"))) == 20
+    assert pd.read_csv(out / "final" / "jury13_rad_rel" / "metrics.csv").query("split == 'test'").dice.mean() \
+        == pytest.approx(v.loc["jury13_rad_rel", "test_dice"])
