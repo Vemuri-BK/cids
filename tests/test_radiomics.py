@@ -120,7 +120,7 @@ def test_icc_ccc():
 # ---------------------------------------------------------------------------- end to end (synthetic S3f)
 def _fake_s3f(tmp: Path, n=(40, 10, 10)):
     cache, s3f = tmp / "cache", tmp / "s3f"
-    for d in (cache / "train", cache / "val", s3f / "cases"):
+    for d in (cache / "train", cache / "val", s3f / "cases" / "cases"):   # nested, as Kaggle unpacks it
         d.mkdir(parents=True)
     rng = np.random.default_rng(0)
     split_rows = []
@@ -138,7 +138,7 @@ def _fake_s3f(tmp: Path, n=(40, 10, 10)):
             gt = (lab == 1).astype(np.uint8)
             off = "val" if split == "test" else "train"
             np.savez_compressed(cache / off / f"{cid}.npz", image=img.astype(np.float16), label=gt[None])
-            np.savez_compressed(s3f / "cases" / f"{cid}.npz", seg=np.zeros(shape, np.uint8), lab=lab)
+            np.savez_compressed(s3f / "cases" / "cases" / f"{cid}.npz", seg=np.zeros(shape, np.uint8), lab=lab)
             split_rows.append(dict(cache_id=cid, split=split, official="test" if split == "test" else "train",
                                    collection=cid.split("_")[0].upper()))
             sizes = {k: int((lab == k).sum()) for k in (1, 2)}

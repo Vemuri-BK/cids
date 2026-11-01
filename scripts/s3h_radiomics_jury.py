@@ -74,7 +74,18 @@ def load_tables(s3f: Path, split: str, limit: int):
     return df, D
 
 
-def extract_split(split, df, cache_paths, s3f, out, workers, manifest):
+def find_cases_dir(s3f: Path) -> Path:
+    """S3f's cases/<cid>.npz; Kaggle zips may unpack one level deeper (cases/cases/*.npz) -> follow it."""
+    top = s3f / "cases"
+    if any(top.glob("*.npz")):
+        return top
+    hit = next(top.rglob("*.npz"), None) if top.is_dir() else None
+    if hit is None:
+        raise SystemExit(f"no case files (*.npz) under {top}: S3f cases/ missing or still zipped")
+    return hit.parent
+
+
+def extract_split(split, df, cache_paths, cases_dir, out, workers, manifest):
     f, mf = out / f"{split}_radiomics.csv", out / f"{split}_radiomics.manifest.json"
     if s3d.cache_ok([f], manifest, mf):
         print(f"{split}: using cached {f.name} (same manifest)")
@@ -82,9 +93,9 @@ def extract_split(split, df, cache_paths, s3f, out, workers, manifest):
     jobs = []
     for cid, g in df[df.k >= 0].groupby("cache_id", sort=False):
         ks = g.sort_values("rank").k.astype(int).tolist()          # rank 0 = largest = dominant
-        case = s3f / "cases" / f"{cid}.npz"
+        case = cases_dir / f"{cid}.npz"
         if not case.exists():
-            raise SystemExit(f"{split}: missing {case} (S3f cases/ incomplete or still zipped)")
+            raise SystemExit(f"{split}: missing {case} (S3f cases/ incomplete)")
         jobs.append((cid, str(cache_paths[cid]), str(case), ks))
     rows, t0 = [], time.time()
     if workers > 1:
@@ -164,7 +175,8 @@ def main():
     root = find_cache_root(str(Path(a.cache_root).expanduser()) if a.cache_root else "")
     sp = pd.read_csv(a.splits)
     coll = dict(zip(sp.cache_id, sp.collection))
-    print(f"S3f {s3f}\ncache {root}\nout {out}")
+    cases_dir = find_cases_dir(s3f)
+    print(f"S3f {s3f}\ncases {cases_dir} ({len(list(cases_dir.glob('*.npz')))} files)\ncache {root}\nout {out}")
 
     data = {}
     for split in ("train", "val", "test"):
@@ -174,7 +186,7 @@ def main():
             raise SystemExit(f"{split}: {df.cache_id.nunique()} cases in the table, {len(cases)} in the cache")
         manifest = dict(rad_version=RAD_VERSION, split=split, limit=a.limit,
                         table=file_digest(s3f / f"{split}_features.csv"), **cases_digest(cases))
-        rad = extract_split(split, df, dict(cases), s3f, out, a.workers, manifest)
+        rad = extract_split(split, df, dict(cases), cases_dir, out, a.workers, manifest)
         data[split] = (merge(df, rad), D)
     (tr, Dtr), (va, Dva), (te, Dte) = data["train"], data["val"], data["test"]
 
