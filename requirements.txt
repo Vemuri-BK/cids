@@ -21,4 +21,5 @@ appdirs
 huggingface_hub
 scipy
 scikit-image  # S3h radiomics (surface mesh)
+matplotlib  # figures (s3h_figures.py)
 requests  # medim download
