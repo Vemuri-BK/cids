@@ -9,7 +9,8 @@ Cache facts that shaped the feature set (checked on the server, 2026-11-01):
     enhancement values are not quantitative; every intensity feature is a CONTRAST against the candidate's own
     surroundings (ring / local box) or a within-patient comparison.
   * background is not reliably 0 (0.4-29 % exact zeros) -> no whole-body / whole-breast mask; the reference is
-    local (4 mm ring, 15 mm box). Exact zeros (padding) are excluded from the reference regions.
+    local (4 mm ring, 15 mm box). Exact zeros (padding) and voxels of any SegResNet component (other
+    candidates, satellites) are excluded from the reference regions (v2).
   * field of view differs strongly between and within hospitals -> no absolute position features (they would
     identify the hospital); only the distance to the patient's dominant candidate.
 
@@ -27,7 +28,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-RAD_VERSION = 1          # bump whenever a feature definition changes -> cached radiomics tables are recomputed
+RAD_VERSION = 2          # bump whenever a feature definition changes -> cached radiomics tables are recomputed
 
 RAD_SHAPE = ["rad_elongation", "rad_flatness", "rad_sphericity", "rad_solidity", "rad_surf_to_vol"]
 RAD_CONTRAST = ["rad_ring_cnr", "rad_ring_ratio", "rad_rim_minus_core", "rad_local_z_sub", "rad_rel_enh"]
@@ -131,7 +132,9 @@ def candidate_features(img: np.ndarray, lab: np.ndarray, k: int) -> dict:
     sl = _crop(lab.shape, idx)
     comp = full[sl]
     pre, post = img[0][sl], img[1][sl]
-    valid = (pre != 0) | (post != 0)
+    non_pad = (pre != 0) | (post != 0)
+    bg = non_pad & (lab[sl] == 0)                   # reference = tissue outside EVERY SegResNet component
+    valid = bg if bg.any() else non_pad             # (a nearby satellite / other blob must not brighten the ring)
     out = shape_features(comp)
     c, (ring, d_in) = contrast_features(pre, post, comp, valid)
     out.update(c)

@@ -9,6 +9,8 @@ Reads the S3f outputs (same candidates as the 13-clue jury, test 0.7495) and the
      better / worse), per hospital, AUC, and permutation importance of the proposed jury on val
 
 Variants (features):
+  finder_only            finder clues only (size, rank, SegResNet probability)
+  jury11                 + SAM checker clues (= S3d)
   jury13                 the S3f jury (reproduces its numbers; sanity check)
   finder_rad             finder clues + radiomics + relative (no SAM, no memory)  -> "radiomics instead of SAM?"
   jury13_rel             jury13 + within-patient relative clues
@@ -47,7 +49,9 @@ assert set(FINDER) < set(JURY11)
 
 def variants() -> dict:
     prop = JURY13 + RAD_ALL + REL
-    v = {"jury13": JURY13,
+    v = {"finder_only": FINDER,
+         "jury11": JURY11,
+         "jury13": JURY13,
          "finder_rad": FINDER + RAD_ALL + ["rel_seg_prob", "rel_ring_cnr"],
          "jury13_rel": JURY13 + [c for c in REL if c != "rel_ring_cnr"],   # no radiomics-derived clue
          "jury13_rad": JURY13 + RAD_ALL,

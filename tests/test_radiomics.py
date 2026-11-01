@@ -64,6 +64,17 @@ def test_padding_zeros_excluded_from_reference():
     assert abs(a["rad_local_z_sub"] - b["rad_local_z_sub"]) / a["rad_local_z_sub"] < 0.2
 
 
+def test_other_candidates_excluded_from_reference():
+    shape = (48, 48, 48)
+    les = _ball(shape, (24, 24, 24), 6)
+    sat = _ball(shape, (24, 24, 36), 3)                # bright satellite 6 mm away, inside the ring / box
+    img = _image(shape, les | sat, 0.9)
+    lab = les.astype(np.int32); lab[sat] = 2
+    alone = candidate_features(_image(shape, les, 0.9), les.astype(np.int32), 1)
+    with_sat = candidate_features(img, lab, 1)
+    assert abs(with_sat["rad_ring_cnr"] - alone["rad_ring_cnr"]) / alone["rad_ring_cnr"] < 0.2
+
+
 def test_case_features_distance_to_dominant():
     shape = (64, 40, 40)
     lab = np.zeros(shape, np.int32)
@@ -157,7 +168,7 @@ def test_s3h_end_to_end(tmp_path):
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     v = pd.read_csv(out / "variants.csv").set_index("variant")
-    assert {"jury13", "finder_rad", "jury13_rad_rel", "-shape"} <= set(v.index)
+    assert {"finder_only", "jury11", "jury13", "finder_rad", "jury13_rad_rel", "-shape"} <= set(v.index)
     # the false tube is the largest candidate and the finder / SAM clues are random: only radiomics can tell
     assert v.loc["finder_rad", "auc_test"] > 0.95 and v.loc["finder_rad", "test_dice"] == pytest.approx(1.0)
     assert v.loc["jury13", "auc_test"] < 0.9                         # without radiomics it cannot
