@@ -21,12 +21,19 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | S3b: SegResNet-100 → SAM-S2b, rule `segjury_0.7` | ✅ done | test **0.699** |
 | S2c: SAM trained on SegResNet's real false candidates | ✅ done — **negative result** | rejection ↑ but real tumours lost; AUC not improved |
 | S3d: learned jury (gradient boosting on 11 candidate clues) | ✅ done | test 0.735, HD95 3.6, NSD 0.783, p = 0.0008 vs S3b |
-| **S3e: jury + memory of known candidates (13 clues)** | ✅ done — **current best** | **test 0.7495** (+0.014 vs S3d, bootstrap CI [0.004, 0.026], p = 0.053); notebook 11 |
+| **S3e/S3f: jury + memory of known candidates (13 clues)** | ✅ done — **final pipeline** | **test 0.7495**, HD95 med 3.32, NSD 0.799, missed 10; +0.066 vs SegResNet (p = 5e-13); notebooks 11, 12 |
 | Frequency council code (S4 adapter, S5 maps, S6 council) | ✅ built, tested | `cids/fcouncil/`, `scripts/s4–s6`, notebooks 07, 08 |
 | S4: SAM frequency adapter (60 epochs) | ✅ done — not used | messy +0.013, clean −0.008 vs S2b |
 | S5 + S6: frequency council, dual supervision | ⛔ stopped — no gain | val council 0.7236 ≈ finder 0.7238 (Day 11–16) |
-| Code review fixes (vbk review 2026-10-14) | ✅ done | 10 fixes, 45 tests (Day 11–16) |
-| **Frequency boundary refinement of the jury mask** | ⏳ **next** | refine the kept mask only; must beat 0.7495 |
+| Code review fixes (vbk review 2026-10-14) | ✅ done | 10 fixes, 45 tests (Day 11–16); 73 tests now |
+| S7: frequency boundary refiner of the jury mask (v1, arms A/B, learning test, run C) | ✅ done — no gain | val ≈ M0 0.7742; learns on fitted cases, not on unseen ones (Days 17–33) |
+| Lab server (~/CIDS, `user@iiser`, 2× A5000; runs on **GPU 0 only**) | ✅ done | reproduces Kaggle SegResNet exactly (test raw 0.671) |
+| Out-of-fold SegResNet maps (3 folds + full) | ✅ done | `outputs/seg_oof/{fold0,fold1,fold2,full}`; held-out Dice ≈ 0.70 |
+| s3g: honest (out-of-fold) jury masks for training | ✅ done | train M0 Dice 0.808 (in-sample) → **0.742** (OOF); `outputs/s3g_oof_masks` |
+| S7 refiner v1-new / v2 (OOF masks, ± SegResNet probability) | ✅ done — not significant | val 0.7752 / 0.7761 vs M0 0.7742; probability channel no help (p = 0.48) |
+| Frequency ablation of the refiner (spatial / LLL / all / minus HHH) | ⏳ next (optional) | `spatial`, `freq_lll` ready; minus-HHH needs code |
+| Calibration study of the refiner checkpoint | 💡 proposed | reliability/ECE, temperature, confident edits, case-level safety rule |
+| nnU-Net baseline on our split (guide's SOTA question) | ⏳ after guide meeting | ~1–2 days on GPU 0 |
 | One-file pipeline export (S3d as `.pt`) | 🛠 code ready, uncommitted | `cids/pipeline.py`, `scripts/s3d_export_pipeline.py` |
 | Acquisition-metadata token (geometry → band weights) | ⏳ later | `cond_dim` slot already in adapter / gate |
 | Ablations, LOCO, 3 seeds, fairness, faster full-res metrics | ⏳ | — |
@@ -40,10 +47,84 @@ Times are IST. Commit ids refer to `github.com/Vemuri-BK/cids`.
 | S3a: SegResNet-60 + SAM-S2a, rules | – | 0.675 | – | – | – |
 | S3b: SegResNet-100 + SAM-S2b, `segjury_0.7` | 0.747 | 0.699 | 4.1 | 0.744 | 26 |
 | S3d: SegResNet-100 + SAM-S2b + learned jury (11 clues) | 0.766 | 0.735 | 3.6 | 0.783 | 17 |
-| **S3e: + memory + probe clues (13 clues)** | **0.774** | **0.7495** | – | – | – |
+| **S3e/S3f: + memory + probe clues (13 clues) = final** | **0.774** | **0.7495** | **3.32** | **0.799** | **10** |
+| S7 refiner v1-new on S3f mask (val only, best epoch) | 0.7752 | not run | 3.00 (val) | 0.8225 (val) | – |
+| S7 refiner v2 (+ SegResNet probability, val only) | 0.7761 | not run | 2.91 (val) | 0.8244 (val) | – |
 | best candidate subset (oracle, upper bound of any jury) | 0.812 | 0.790 | – | – | – |
 | keep all touching candidates (old 'oracle') | 0.812 | 0.787 | – | – | – |
 | SAM-S2a / S2b with GT box (oracle prompt, not automatic) | – / 0.729 crop | 0.708 / 0.698 | 4.4 / – | 0.729 / – | – |
+
+---
+
+## Days 17–33 — 2026-10-20 → 2026-11-01: frequency boundary refiner, out-of-fold maps, lab server
+
+### Summary
+- Final pipeline stays **SegResNet-100 → SAM-S2b → 13-clue memory jury (S3f)**: test Dice 0.7495, HD95 median 3.32 mm, NSD 0.799, missed 10, +0.066 vs SegResNet alone (p = 5e-13).
+- The frequency boundary refiner (S7) was tested in 7 runs. With honest training masks it learns on training cases, but on new patients the gain is not significant (≤ +0.002 Dice). **The jury mask remains the final output.**
+- Project moved to the lab server; out-of-fold SegResNet maps and honest training masks built there.
+
+### S7 refiner design (`cids/refine/`, `scripts/s7_refine.py`)
+- Edits only the jury mask M0, within **8 mm** of its boundary. Output z = z0 + allow · sigmoid(gate) · delta, with z0 = ±log 3 and zero-init delta/gate → epoch 0 = M0 exactly (checked: per-case parity with notebook 12 `val_metrics.csv`, max |diff| 0).
+- Input: MRI (3 ch) + M0 + allowed band (+ optional SegResNet probability = v2).
+- Modes: `freq` (3D Haar, all 8 bands, learn per band, inverse), `freq_lll` (detail bands zeroed), `spatial` (same network, no wavelet split). Optional output gate (`--no_gate`). Losses: masked dice_bce or `balanced` (helpful vs harmful edit groups).
+- Training: ROI crops, error-aware patch sampling (25/25/50), 8 patches/case, 60 epochs; val every 3 epochs with edit diagnostics (added/removed × helpful/harmful voxels) and a train-check on 120 unaugmented training cases.
+- S7 oracle (commit e1d859b): upper bound of an editable band of 4 / 8 / 12 mm → 8 mm chosen.
+
+### S7 experiments and results (val 120; M0 = 0.7742)
+| Run | Training masks | Inputs | Key result | Verdict |
+|---|---|---|---|---|
+| v1 arms A / B (Kaggle) | in-sample (S3f refit) | MRI + M0 | val ≈ M0 | no gain |
+| Learning test (16 fitted + 16 unseen cases) | in-sample | MRI + M0, ± gate, dice_bce / balanced | fitted ROI 0.837 → **0.887**; unseen 0.796 → **0.761**; gate no effect; balanced loss over-edits at w_keep = 1 | can learn, does not transfer |
+| Run C (60 ep, 8 patches, error sampling) | in-sample | MRI + M0 | best val 0.7747; train-check +0.002 | no gain |
+| **v1-new** (60 ep, server) | **OOF (s3g)** | MRI + M0 | best val **0.7752** (ep 48); train-check 0.7165 → 0.7322 (+0.016); NSD 0.8204 → 0.8225; HD95 med 3.00 → 3.00 | tiny, not significant |
+| **v2** (60 ep, server) | **OOF (s3g)** | MRI + M0 + SegResNet prob | best val **0.7761** (ep 48); train-check 0.7165 → 0.7291 (+0.013); NSD 0.8244; HD95 med 2.91 | not significant |
+
+Per-case statistics at the best epoch (bootstrap 10 000, Wilcoxon signed-rank):
+
+| | Mean gain | 95 % CI | Median | Wilcoxon p | improved / worsened (any) | > 0.01 better / worse |
+|---|---|---|---|---|---|---|
+| v1-new | +0.0011 | [−0.0021, +0.0039] | +0.0010 | 0.002 | 77 / 40 | 12 / 10 |
+| v2 | +0.0019 | [−0.0021, +0.0058] | +0.0003 | 0.24 | 64 / 53 | 15 / 16 |
+| v2 − v1-new | +0.0008 | [−0.0022, +0.0042] | 0.000 | 0.48 | 57 / 60 | 12 / 15 |
+
+- Counterfactual on v2 (exact from voxel counts): removals only 0.7753, additions only 0.7750, both 0.7761 → no edit-type filter rescues it.
+- Same largest losses in both runs (gains correlate, r = 0.61): ispy2_775346 (−0.09/−0.10), ispy2_788149 (−0.08/−0.06), duke_132 (−0.07, v1-new) → the refiner removes real tumour where tumour and parenchyma enhance alike.
+- Late epochs: ~1 600–2 000 changed voxels per case, better ≈ worse; val returns to ≈ M0.
+
+### Conclusions
+1. **Honest (out-of-fold) training masks are what make the refiner learn** (train-check +0.016 vs +0.002 with in-sample masks). The SegResNet probability channel adds nothing (v2 − v1-new p = 0.48).
+2. On unseen patients the refiner only smooths the border slightly (median +0.001); a few large wrong removals cancel it → mean gain not significant.
+3. **Little headroom at the border**: on val, the 14 cases with M0 Dice < 0.5 carry **37 %** of all remaining Dice error (the 56 cases ≥ 0.85 only 19 %). These are region errors (wrong candidate, missed tumour, large FP) that a border refiner cannot fix; fixing them to 0.85 would give val 0.841.
+4. Not yet tested: whether the Haar split itself helps (all runs used `freq`). The matched `spatial` / `freq_lll` / minus-HHH comparison is the open frequency ablation.
+
+### Out-of-fold SegResNet maps (`scripts/make_folds.py`, notebook 20, server)
+- `configs/splits.csv`: `fold3_0/1/2` (3 folds of train, stratified by collection, seed 42; values train / heldout / val / test).
+- `s1_train_segresnet.py`: `--split_col`, `--eval_split` (list), `--save_prob` (uint8 probability maps).
+| Fold | Held-out cases | Held-out Dice |
+|---|---|---|
+| fold 0 | 361 | 0.705 |
+| fold 1 | 360 | 0.703 |
+| fold 2 | 359 | ≈ 0.70 |
+| full (existing SegResNet-100, val / test raw) | 120 / 306 | 0.709 / **0.671** (= Kaggle; 0.684 after rel20) |
+- Kaggle lessons: 500-output-file limit (fold 0 first lost 47 maps → notebook 20 zips and verifies outputs, recovery mode from best.pt); notebook cells don't update from GitHub (re-import the .ipynb); all notebooks print one line per epoch (`sh()`).
+
+### s3g — honest jury masks for training (`scripts/s3g_oof_train_masks.py`)
+- Training M0 rebuilt from OOF SegResNet candidates → SAM-S2b → S3f cross-fit memory jury (never the patient's own fold). Val/test masks copied unchanged (426).
+- Train M0 Dice **0.8077 (in-sample) → 0.7417 (OOF)** — now matches val (0.774) / test (0.750) difficulty. SegResNet rel20 OOF 0.711, oracle 0.789, jury AUC 0.923.
+- 989 / 1080 patients keep the same candidates as notebook 12 (scikit-learn 1.9.1 on the server vs Kaggle) → parity check uses `--parity_tol 0.01`.
+
+### Lab server (from 2026-10-28)
+- Linux, `user@iiser` (10.67.0.12), 2× RTX A5000 24 GB, 125 GB RAM; VS Code Remote-SSH from the laptop.
+- Project `~/CIDS`, env `~/venvs/cids`, MRI cache `~/data` (train/, val/), long runs in tmux, logs via plain `| tee` (awk filter buffered output).
+- **All training on GPU 0**; GPU 1 drives the display and is left free for others.
+- Missing packages installed for medim: `requests einops appdirs huggingface_hub` (to add to requirements.txt).
+- 2026-10-30: v1-new crashed at epoch 24 with `CUDA error: unspecified launch failure`; dmesg **Xid 31 (MMU fault) + Xid 32**, no thermal/ECC Xid → one-off driver/AMP fault; persistence mode enabled (`nvidia-smi -pm 1`); rerun completed without error.
+
+### Next
+1. (Optional, ~2 h each on GPU 0) frequency ablation of the refiner: `spatial`, then `freq_lll`, minus-HHH — answers "does the Haar split matter?" for the paper.
+2. (Proposed) calibration study on the v1-new checkpoint: reliability/ECE in the 8 mm band, temperature scaling, confident-edits-only τ ∈ {0.6, 0.7, 0.8, 0.9}, case-level max-change rule; choose on val, test once.
+3. nnU-Net baseline on our split (guide's state-of-the-art question; also as a stronger finder for the 14 region-level failures).
+4. Ablation table, LOCO, 3 seeds, MAMA_MIA_COMPLETE transfer, paper.
 
 ---
 
