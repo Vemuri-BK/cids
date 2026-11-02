@@ -7,8 +7,8 @@ import pandas as pd
 import pytest
 
 from cids.jury import JURY13, MemoryJury
-from cids.radiomics import (RAD_CLEAN, RAD_EXTRACTED, RAD_MEM, REL, UNC, add_position, add_relative, add_uncertainty,
-                            candidate_features, case_features, icc_31, lins_ccc, shape_features)
+from cids.radiomics import (RAD_EXTRACTED, REL, add_position, add_relative, candidate_features, case_features,
+                            icc_21, icc_31, lins_ccc, shape_features)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -138,25 +138,14 @@ def test_jury_post_hook_and_default_unchanged():
     assert np.array_equal(old.proba(df, D), base)
 
 
-def test_radiomic_memory_and_uncertainty():
-    from tests.test_jury import _table
-    df, D = _table()
-    rng = np.random.default_rng(7)
-    for c in RAD_CLEAN + ["sam_soft_ml", "log_sam_soft_ml", "log_seg_ml", "seg_prob_mean", "agree"]:
-        df[c] = rng.normal(1.0, 0.3, len(df))
-    df = add_uncertainty(df)
-    assert set(UNC) <= set(df) and (df[UNC] >= 0).all().all()
-    j = MemoryJury(k=5, features=JURY13 + RAD_CLEAN + RAD_MEM + UNC, post=add_relative, rad_cols=RAD_CLEAN).fit(df, D)
-    mc = j.memory_clues(df, D)
-    assert set(RAD_MEM) <= set(mc) and np.isfinite(j.proba(df, D)).all()
-
-
 def test_icc_ccc():
     a = np.array([1.0, 2, 3, 4, 5])
+    assert icc_21(a, a) == pytest.approx(1.0)
     assert icc_31(a, a) == pytest.approx(1.0) and lins_ccc(a, a) == pytest.approx(1.0)
     assert icc_31(a, a + 1) == pytest.approx(1.0)       # consistency ignores a constant shift
+    assert icc_21(a, a + 1) == pytest.approx(5 / 6)     # absolute agreement penalizes constant shift
     assert lins_ccc(a, a + 1) == pytest.approx(0.8)     # agreement does not: 2*2 / (2 + 2 + 1)
-    assert icc_31(a, a[::-1]) < 0
+    assert icc_31(a, a[::-1]) < 0 and icc_21(a, a[::-1]) < 0
 
 
 # ---------------------------------------------------------------------------- end to end (synthetic S3f)
@@ -224,11 +213,11 @@ def test_s3h_end_to_end(tmp_path):
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     assert "using cached train_radiomics.csv" in r.stdout
     v = pd.read_csv(out / "variants.csv").set_index("variant")
-    assert {"finder_only", "jury11", "jury13", "finder_rad", "rad_mem_only", "jury13_rad_rel",
-            "jury_rad_mem_unc", "-shape"} <= set(v.index)
-    assert (out / "uncertainty_resolution.csv").exists()
-    assert (out / "loho_hospitals.csv").exists()
-    assert (out / "biomarker_concordance.csv").exists()
+    assert {"finder_only", "jury11", "jury13", "finder_rad", "jury13_rad_rel", "-shape"} <= set(v.index)
+    loho = pd.read_csv(out / "loho_hospitals.csv")
+    assert {"heldout_hospital", "variant", "t_train", "auc", "dice"} <= set(loho) and "dice_best" not in loho
+    bio = pd.read_csv(out / "biomarker_concordance.csv")
+    assert {"icc_21", "icc_21_ci95_lo", "icc_31", "lins_ccc", "mae_ml", "wilcoxon_mae_vs_jury13"} <= set(bio)
     # the false tube is the largest candidate and the finder / SAM clues are random: only radiomics can tell
     assert v.loc["finder_rad", "auc_test"] > 0.95 and v.loc["finder_rad", "test_dice"] == pytest.approx(1.0)
     assert v.loc["jury13", "auc_test"] < 0.9

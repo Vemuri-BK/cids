@@ -46,8 +46,8 @@ from cids.data.cache import find_cache_root, load_case  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.jury import JURY11, JURY13, CrossFitMemoryJury, keep_candidates  # noqa: E402
 from cids.provenance import cases_digest, file_digest, require_cases, save_npz_atomic  # noqa: E402
-from cids.radiomics import (GROUPS, RAD_ALL, RAD_CLEAN, RAD_EXTRACTED, RAD_MEM, RAD_VERSION, REL, UNC,  # noqa: E402
-                            add_position, add_relative, extract_case, icc_31, lins_ccc, load_bundle, versions)
+from cids.radiomics import (GROUPS, RAD_ALL, RAD_EXTRACTED, RAD_VERSION, REL, add_position, add_relative,  # noqa: E402
+                            extract_case, icc_21, icc_31, lins_ccc, load_bundle, versions)
 
 PROPOSED, BASELINE = "jury13_rad_rel", "jury13"
 PLATEAU = 0.002                      # cut-off rule margin (fixed before the dev run)
@@ -61,11 +61,9 @@ def variants() -> dict:
          "jury11": JURY11,
          "jury13": JURY13,
          "finder_rad": FINDER + RAD_ALL + ["rel_seg_prob", "rel_ring_cnr"],
-         "rad_mem_only": FINDER + RAD_CLEAN + RAD_MEM + ["rel_seg_prob", "rel_ring_cnr"],
          "jury13_rel": JURY13 + [c for c in REL if c != "rel_ring_cnr"],   # no radiomics-derived clue
          "jury13_rad": JURY13 + RAD_ALL,
-         "jury13_rad_rel": prop,
-         "jury_rad_mem_unc": JURY13 + RAD_CLEAN + RAD_MEM + UNC + REL}
+         "jury13_rad_rel": prop}
     for g, cols in GROUPS.items():
         v[f"-{g}"] = [c for c in prop if c not in cols]
     return v
@@ -237,41 +235,19 @@ def curve_wins(cv, base, lo=0.2, hi=0.8, splits=("test", "val")):
     return out
 
 
-def uncertainty_resolution(df: pd.DataFrame, p_by_var: dict, split: str, thresh: float = 0.25) -> list[dict]:
-    """Stratify real candidates into Low Disagreement (|seg_prob - agree| < thresh) vs High CNN-SAM Uncertainty."""
-    from sklearn.metrics import roc_auc_score
-    r = (df.k >= 0).to_numpy()
-    if not r.any() or "unc_disagree" not in df:
-        return []
-    sub = df.loc[r].reset_index(drop=True)
-    y = sub.on_tumour.to_numpy().astype(int)
-    unc = sub.unc_disagree.to_numpy() >= thresh
-    rows = []
-    for regime, mask in (("low_uncertainty", ~unc), ("high_uncertainty", unc), ("all_candidates", np.ones_like(unc))):
-        if not mask.any():
-            continue
-        ym = y[mask]
-        for vname, p in p_by_var.items():
-            pm = p[r][mask]
-            a = float(roc_auc_score(ym, pm)) if 0 < ym.sum() < len(ym) else None
-            acc = float(((pm >= 0.5).astype(int) == ym).mean())
-            rows.append(dict(split=split, regime=regime, n_cand=int(mask.sum()), pos_rate=float(ym.mean()),
-                             variant=vname, auc=a, acc_at_05=acc))
-    return rows
-
-
 def loho_eval(tr: pd.DataFrame, Dtr: np.ndarray, coll: dict, k: int, allow_tiny: bool = False) -> pd.DataFrame:
-    """Leave-One-Hospital-Out (LOHO) on training set across clinical collections (DUKE, ISPY1, ISPY2, NACT)."""
-    from cids.jury import MemoryJury
+    """Leave-One-Hospital-Out (LOHO) on training set across clinical collections (DUKE, ISPY1, ISPY2, NACT).
+    Cut-off t_train is chosen strictly on the 3 training hospitals' out-of-fold Dice curve (plateau_cut)."""
     c_arr = np.array([coll.get(cid, cid.split("_")[0].upper()) for cid in tr.cache_id])
     hospitals = sorted(set(c_arr[tr.k >= 0]))
     if len(hospitals) < 2:
         return pd.DataFrame()
     loho_vars = {
-        "jury13": (JURY13, None),
-        "finder_rad": (FINDER + RAD_ALL + ["rel_seg_prob", "rel_ring_cnr"], None),
-        "jury13_rad_rel": (JURY13 + RAD_ALL + REL, None),
-        "jury_rad_mem_unc": (JURY13 + RAD_CLEAN + RAD_MEM + UNC + REL, RAD_CLEAN),
+        "finder_only": FINDER,
+        "jury11": JURY11,
+        "jury13": JURY13,
+        "finder_rad": FINDER + RAD_ALL + ["rel_seg_prob", "rel_ring_cnr"],
+        "jury13_rad_rel": JURY13 + RAD_ALL + REL,
     }
     rows = []
     for h in hospitals:
@@ -282,42 +258,76 @@ def loho_eval(tr: pd.DataFrame, Dtr: np.ndarray, coll: dict, k: int, allow_tiny:
             continue
         if len(set(tr_in.loc[tr_in.k >= 0, "on_tumour"])) < 2:
             continue
-        for vname, (feats, rcols) in loho_vars.items():
+        for vname, feats in loho_vars.items():
             try:
-                j = MemoryJury(k=k, features=feats, post=add_relative, rad_cols=rcols).fit(tr_in, D_in)
-                ph = j.proba(te_h, D_h)
+                cross_in = CrossFitMemoryJury(tr_in, D_in, k=k, features=feats, post=add_relative,
+                                              allow_tiny=allow_tiny)
+                ptr_in = cross_in.proba(tr_in, D_in)
+                t_tr = plateau_cut(curve(tr_in, ptr_in))
+                ph = cross_in.full.proba(te_h, D_h)
                 c_h = curve(te_h, ph)
+                dice_h = float(c_h[np.isclose(c_h.index, t_tr)].iloc[0])
                 rows.append(dict(heldout_hospital=h, n_cases=int(te_h.cache_id.nunique()), variant=vname,
-                                 auc=auc(te_h, ph), dice_t035=float(c_h.get(0.35, c_h.median())),
-                                 dice_best=float(c_h.max())))
+                                 t_train=t_tr, auc=auc(te_h, ph), dice=dice_h))
             except ValueError:
                 if not allow_tiny:
                     raise
     return pd.DataFrame(rows)
 
 
-def biomarker_concordance(df: pd.DataFrame, p_by_var: dict, t_by_var: dict) -> pd.DataFrame:
-    """Downstream IBSI volumetric biomarker concordance (ICC(3,1) and Lin's CCC) vs expert ground-truth volume."""
+def biomarker_concordance(df: pd.DataFrame, p_by_var: dict, t_by_var: dict, n_boot: int = 5000, seed: int = 0) -> pd.DataFrame:
+    """Downstream volumetric biomarker agreement (ICC(2,1) absolute, ICC(3,1) consistency, Lin's CCC, MAE mL)
+    with 5,000-sample bootstrap 95% confidence intervals and paired Wilcoxon p-value vs jury13 and seg_rel20."""
+    from scipy.stats import wilcoxon
     r = df[df.k >= 0]
     if not len(r):
         return pd.DataFrame()
     gt_ml = r.groupby("cache_id")["gt_vox"].first().astype(float) / 1000.0
     rel20_ml = r.groupby("cache_id")["rel20_size"].first().astype(float) / 1000.0
-    rows = [dict(method="seg_rel20", biomarker="volume_ml", icc_31=icc_31(gt_ml, rel20_ml),
-                 lins_ccc=lins_ccc(gt_ml, rel20_ml),
-                 mae_ml=float(np.abs(rel20_ml - gt_ml).mean()))]
+    preds = {"seg_rel20": rel20_ml}
     for vname, p in p_by_var.items():
-        t = t_by_var.get(vname, 0.35)
+        t = t_by_var.get(vname, 0.40)
         keep = keep_candidates(df, p, t)
-        pred_ml = []
-        for cid in gt_ml.index:
-            ks = keep.get(cid, [])
-            g = r[(r.cache_id == cid) & (r.k.isin(ks))]
-            pred_ml.append(float(g.size_vox.sum()) / 1000.0)
-        pred_s = pd.Series(pred_ml, index=gt_ml.index)
-        rows.append(dict(method=vname, biomarker="volume_ml", icc_31=icc_31(gt_ml, pred_s),
-                         lins_ccc=lins_ccc(gt_ml, pred_s),
-                         mae_ml=float(np.abs(pred_s - gt_ml).mean())))
+        pred_ml = [float(r[(r.cache_id == cid) & (r.k.isin(keep.get(cid, [])))].size_vox.sum()) / 1000.0
+                   for cid in gt_ml.index]
+        preds[vname] = pd.Series(pred_ml, index=gt_ml.index)
+
+    g = gt_ml.to_numpy(float)
+    n = len(g)
+    rng = np.random.default_rng(seed)
+    boot_idx = rng.integers(0, n, size=(n_boot, n))
+    err_j13 = np.abs(preds["jury13"].to_numpy(float) - g) if "jury13" in preds else None
+    err_rel20 = np.abs(preds["seg_rel20"].to_numpy(float) - g)
+
+    rows = []
+    for mname, ps in preds.items():
+        pr = ps.to_numpy(float)
+        err = np.abs(pr - g)
+        b_i21, b_i31, b_ccc, b_mae = [], [], [], []
+        for idx in boot_idx:
+            ga, pa = g[idx], pr[idx]
+            if ga.var() > 0 and pa.var() > 0:
+                b_i21.append(icc_21(ga, pa))
+                b_i31.append(icc_31(ga, pa))
+                b_ccc.append(lins_ccc(ga, pa))
+            b_mae.append(float(np.abs(pa - ga).mean()))
+        ci = lambda arr: (float(np.percentile(arr, 2.5)), float(np.percentile(arr, 97.5))) if arr else (None, None)  # noqa: E731
+        i21_lo, i21_hi = ci(b_i21)
+        i31_lo, i31_hi = ci(b_i31)
+        ccc_lo, ccc_hi = ci(b_ccc)
+        mae_lo, mae_hi = ci(b_mae)
+        d_j13 = err - err_j13 if err_j13 is not None else np.zeros(n)
+        d_r20 = err - err_rel20
+        p_vs_j13 = float(wilcoxon(d_j13[d_j13 != 0]).pvalue) if (d_j13 != 0).sum() > 0 else 1.0
+        p_vs_rel20 = float(wilcoxon(d_r20[d_r20 != 0]).pvalue) if (d_r20 != 0).sum() > 0 else 1.0
+        rows.append(dict(
+            method=mname, biomarker="volume_ml",
+            icc_21=icc_21(g, pr), icc_21_ci95_lo=i21_lo, icc_21_ci95_hi=i21_hi,
+            icc_31=icc_31(g, pr), icc_31_ci95_lo=i31_lo, icc_31_ci95_hi=i31_hi,
+            lins_ccc=lins_ccc(g, pr), lins_ccc_ci95_lo=ccc_lo, lins_ccc_ci95_hi=ccc_hi,
+            mae_ml=float(err.mean()), mae_ci95_lo=mae_lo, mae_ci95_hi=mae_hi,
+            wilcoxon_mae_vs_jury13=p_vs_j13, wilcoxon_mae_vs_rel20=p_vs_rel20,
+        ))
     return pd.DataFrame(rows)
 
 
@@ -423,9 +433,7 @@ def main():
     res, per_case, curves, juries, scores = [], {}, [], {}, []
     p_val_by_var, p_test_by_var, t_by_var = {}, {}, {}
     for name, feats in variants().items():
-        rcols = RAD_CLEAN if any(c in feats for c in RAD_MEM) else None
-        cross = CrossFitMemoryJury(tr, Dtr, k=a.k, features=feats, post=add_relative, rad_cols=rcols,
-                                   allow_tiny=bool(a.limit))
+        cross = CrossFitMemoryJury(tr, Dtr, k=a.k, features=feats, post=add_relative, allow_tiny=bool(a.limit))
         jury = cross.full
         ptr, pv = cross.proba(tr, Dtr), jury.proba(va, Dva)
         pt = jury.proba(te, Dte) if te is not None else None
@@ -450,20 +458,13 @@ def main():
     pd.concat(scores).to_csv(out / f"{tag}scores.csv", index=False)       # every candidate's score (any version)
     imp = importance(juries[PROPOSED][0], va, Dva)
     imp.to_csv(out / f"{tag}importance_val.csv", index=False)
-    key_vars = [k for k in ("jury11", "jury13", "finder_rad", "jury13_rad_rel", "jury_rad_mem_unc") if k in p_val_by_var]
-    unc_rows = uncertainty_resolution(va, {k: p_val_by_var[k] for k in key_vars}, "val")
-    if te is not None:
-        unc_rows.extend(uncertainty_resolution(te, {k: p_test_by_var[k] for k in key_vars}, "test"))
-    unc_df = pd.DataFrame(unc_rows)
-    if len(unc_df):
-        unc_df.to_csv(out / f"{tag}uncertainty_resolution.csv", index=False)
+    key_vars = [k for k in ("jury11", "jury13", "finder_rad", "jury13_rad_rel") if k in p_val_by_var]
     loho_df = loho_eval(tr, Dtr, coll, k=a.k, allow_tiny=bool(a.limit))
     if len(loho_df):
         loho_df.to_csv(out / f"{tag}loho_hospitals.csv", index=False)
     wins = {BASELINE: curve_wins(cv, BASELINE, splits=("test", "val") if a.final else ("val", "train_oof"))}
     summary = dict(mode="final" if a.final else "dev", proposed=PROPOSED, plateau_margin=PLATEAU,
                    variants=table.to_dict(orient="records"), curve_wins=wins,
-                   uncertainty_resolution=unc_df.to_dict(orient="records") if len(unc_df) else [],
                    loho_hospitals=loho_df.to_dict(orient="records") if len(loho_df) else [],
                    cases={s: int(d[0].cache_id.nunique()) for s, d in data.items()}, limit=a.limit,
                    rad_version=RAD_VERSION, versions=versions())
@@ -499,11 +500,10 @@ def main():
                     s3f_provenance=(json.loads((s3f / "summary.json").read_text()).get("provenance")
                                     if (s3f / "summary.json").exists() else None))
         fin = {}
-        for name in (PROPOSED, BASELINE, "jury_rad_mem_unc"):
-            if name in juries:
-                jury, t, feats = juries[name]
-                fin[name] = export(name, jury, t, feats, {"val": (va, Dva), "test": (te, Dte)}, cases_dir, cache_paths,
-                                   out, a.workers, prov, coll).round(4).to_dict(orient="index")
+        for name in (PROPOSED, BASELINE):
+            jury, t, feats = juries[name]
+            fin[name] = export(name, jury, t, feats, {"val": (va, Dva), "test": (te, Dte)}, cases_dir, cache_paths,
+                               out, a.workers, prov, coll).round(4).to_dict(orient="index")
         bio_df = biomarker_concordance(te, {k: p_test_by_var[k] for k in key_vars}, t_by_var)
         if len(bio_df):
             bio_df.to_csv(out / "biomarker_concordance.csv", index=False)
