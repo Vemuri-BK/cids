@@ -235,6 +235,39 @@ def curve_wins(cv, base, lo=0.2, hi=0.8, splits=("test", "val")):
     return out
 
 
+def uncertainty_resolution(df: pd.DataFrame, p_by_var: dict, split: str, thresh: float = 0.25) -> list[dict]:
+    """Read-only regime analysis (does not alter any model): stratify real candidates into
+      1. Confidence-agreement gap (|seg_prob_mean - agree| < thresh vs >= thresh)
+      2. Direct Finder-Checker mask agreement (Dice agree >= 0.50 vs agree < 0.50)."""
+    from sklearn.metrics import roc_auc_score
+    r = (df.k >= 0).to_numpy()
+    if not r.any() or not ({"seg_prob_mean", "agree"} <= set(df)):
+        return []
+    sub = df.loc[r].reset_index(drop=True)
+    y = sub.on_tumour.to_numpy().astype(int)
+    gap = (sub.seg_prob_mean - sub.agree).abs().to_numpy() >= thresh
+    disagree_mask = sub.agree.to_numpy() < 0.50
+    regimes = [
+        ("low_uncertainty", ~gap),
+        ("high_uncertainty", gap),
+        ("high_mask_agree_ge05", ~disagree_mask),
+        ("low_mask_agree_lt05", disagree_mask),
+        ("all_candidates", np.ones_like(gap)),
+    ]
+    rows = []
+    for regime, mask in regimes:
+        if not mask.any():
+            continue
+        ym = y[mask]
+        for vname, p in p_by_var.items():
+            pm = p[r][mask]
+            a = float(roc_auc_score(ym, pm)) if 0 < ym.sum() < len(ym) else None
+            acc = float(((pm >= 0.5).astype(int) == ym).mean())
+            rows.append(dict(split=split, regime=regime, n_cand=int(mask.sum()), pos_rate=float(ym.mean()),
+                             variant=vname, auc=a, acc_at_05=acc))
+    return rows
+
+
 def loho_eval(tr: pd.DataFrame, Dtr: np.ndarray, coll: dict, k: int, allow_tiny: bool = False) -> pd.DataFrame:
     """Leave-One-Hospital-Out (LOHO) on training set across clinical collections (DUKE, ISPY1, ISPY2, NACT).
     Cut-off t_train is chosen strictly on the 3 training hospitals' out-of-fold Dice curve (plateau_cut)."""
@@ -459,12 +492,19 @@ def main():
     imp = importance(juries[PROPOSED][0], va, Dva)
     imp.to_csv(out / f"{tag}importance_val.csv", index=False)
     key_vars = [k for k in ("jury11", "jury13", "finder_rad", "jury13_rad_rel") if k in p_val_by_var]
+    unc_rows = uncertainty_resolution(va, {k: p_val_by_var[k] for k in key_vars}, "val")
+    if te is not None:
+        unc_rows.extend(uncertainty_resolution(te, {k: p_test_by_var[k] for k in key_vars}, "test"))
+    unc_df = pd.DataFrame(unc_rows)
+    if len(unc_df):
+        unc_df.to_csv(out / f"{tag}uncertainty_resolution.csv", index=False)
     loho_df = loho_eval(tr, Dtr, coll, k=a.k, allow_tiny=bool(a.limit))
     if len(loho_df):
         loho_df.to_csv(out / f"{tag}loho_hospitals.csv", index=False)
     wins = {BASELINE: curve_wins(cv, BASELINE, splits=("test", "val") if a.final else ("val", "train_oof"))}
     summary = dict(mode="final" if a.final else "dev", proposed=PROPOSED, plateau_margin=PLATEAU,
                    variants=table.to_dict(orient="records"), curve_wins=wins,
+                   uncertainty_resolution=unc_df.to_dict(orient="records") if len(unc_df) else [],
                    loho_hospitals=loho_df.to_dict(orient="records") if len(loho_df) else [],
                    cases={s: int(d[0].cache_id.nunique()) for s, d in data.items()}, limit=a.limit,
                    rad_version=RAD_VERSION, versions=versions())

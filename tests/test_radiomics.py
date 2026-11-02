@@ -214,6 +214,8 @@ def test_s3h_end_to_end(tmp_path):
     assert "using cached train_radiomics.csv" in r.stdout
     v = pd.read_csv(out / "variants.csv").set_index("variant")
     assert {"finder_only", "jury11", "jury13", "finder_rad", "jury13_rad_rel", "-shape"} <= set(v.index)
+    unc = pd.read_csv(out / "uncertainty_resolution.csv")
+    assert {"low_uncertainty", "high_uncertainty", "low_mask_agree_lt05"} <= set(unc.regime)
     loho = pd.read_csv(out / "loho_hospitals.csv")
     assert {"heldout_hospital", "variant", "t_train", "auc", "dice"} <= set(loho) and "dice_best" not in loho
     bio = pd.read_csv(out / "biomarker_concordance.csv")
