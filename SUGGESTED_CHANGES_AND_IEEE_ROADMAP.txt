@@ -1,0 +1,178 @@
+================================================================================
+CIDS: ACTIONABLE CODE CHANGES, S7 REFINER FIXES & IEEE TMI/JBHI ROADMAP
+Date: 2026-11-01
+Target: Lab Server (user@iiser, GPU 0 = RTX A5000 24 GB)
+================================================================================
+
+1. CURRENT BASELINE & WHERE THE REMAINING ERROR LIES
+--------------------------------------------------------------------------------
+Current S3f (SegResNet-100 -> SAM-S2b -> 13-Clue Memory Jury):
+  - Validation (120 cases): Dice = 0.7742 | NSD = 0.8204 | HD95 med = 3.00 mm | Missed = 3
+  - Official Test (306 cases): Dice = 0.7495 | NSD = 0.7987 | HD95 med = 3.32 mm | Missed = 10
+  - Candidate Selection Ceiling (Oracle): Val = 0.8120 (+0.0378 gap) | Test = 0.7901 (+0.0406 gap)
+  - On well-localized cases (Dice >= 0.5): Mean Dice is already 0.8402 (Val) / 0.8200 (Test).
+
+Why S7 Refiner (v1-new / v2) only reached Val 0.7752 / 0.7761 (+0.001 to +0.002):
+  1. Missing Checker Map (`sam_prob`): S7 only sees `M0` (which is `seg_prob > 0.5`) and `seg_prob`
+     (redundant). SAM-S2b's boundary probability map `sam_prob` was discarded before S7.
+  2. Band-Only Soft Dice Denominator: `dice_bce` computes Soft Dice only on `allow > 0.5`, ignoring
+     the frozen tumor core (`M0 & ~allow`). Because the outer 8 mm shell has larger surface area
+     than the inner 8 mm shell, background outnumbers foreground in the band, biasing the refiner
+     to shrink/erode tumors on ambiguous margins (`ispy2_775346`, `ispy2_788149`, `duke_132`).
+  3. Synthetic Mask Perturbation (`p_perturb = 0.8`): 80% of OOF training masks are corrupted by
+     Gaussian SDF wobble (+/- 2 mm), teaching geometric smoothing rather than MRI edge alignment.
+  4. Unfiltered High-Frequency Noise (`HHH` band): `det_proj` mixes all 21 high-frequency channels
+     (including noisy `HHH`) with a 3x3x3 conv, memorizing training texture (`s7_learn_test`:
+     fitted +0.050, unseen -0.035).
+
+
+================================================================================
+2. FILE-BY-FILE CODE CHANGES TO IMPLEMENT
+================================================================================
+
+--------------------------------------------------------------------------------
+CHANGE 1: Upgrade Memory Jury with Within-Case Relative Clues (CPU Only, ~30 sec)
+Files: cids/jury.py, scripts/s3e_memory_jury.py, scripts/s3f_jury_masks.py, scripts/s3g_oof_train_masks.py
+--------------------------------------------------------------------------------
+Why:
+  In `JURY13`, `sam_soft_ml`, `seg_prob_mean`, `agree`, `mem_knn`, and `mem_probe` are absolute.
+  In low-enhancement scans (NACT post-chemo, 1.5T), all candidates have lower scores, causing the
+  jury to miss 7 recoverable test tumors. Adding within-patient relative clues fixes this.
+
+What to add in `cids/jury.py`:
+  1. Define `JURY18`:
+     REL_CLUES = ["rel_seg_prob", "rel_sam_soft", "rel_agree", "rel_mem_knn", "rel_mem_probe"]
+     JURY18 = JURY13 + REL_CLUES
+
+  2. Add helper function `add_relative_clues(df)`:
+     For each patient (`groupby("cache_id")`) over real candidates (`k >= 0`):
+       - `rel_seg_prob` = `seg_prob_mean / max(seg_prob_mean)`
+       - `rel_sam_soft` = `(sam_soft_ml + 0.01) / (max(sam_soft_ml) + 0.01)`
+       - `rel_agree`    = `agree - max(agree)`
+       - `rel_mem_knn`  = `mem_knn - max(mem_knn)`
+       - `rel_mem_probe`= `mem_probe - max(mem_probe)`
+     Call `add_relative_clues(rows)` inside `MemoryJury.fit()` and `MemoryJury.memory_clues()`.
+
+  3. Add `--jury_clues` (`13` or `18`, default `13`) to `s3e_memory_jury.py`, `s3f_jury_masks.py`,
+     and `s3g_oof_train_masks.py`.
+
+
+--------------------------------------------------------------------------------
+CHANGE 2: Post-Hoc Calibration & Safety Gate on Existing S7 Checkpoints (GPU, ~2 min)
+New Script: scripts/s7_calibrate.py (and flags in scripts/s7_refine.py)
+--------------------------------------------------------------------------------
+Why:
+  In `v1-new`, 77 val cases improved vs 40 worsened (Wilcoxon p = 0.002), but 3 outlier cases
+  lost -0.07 to -0.10 Dice due to excessive voxel removals.
+
+What to add:
+  1. Confidence threshold `--tau_edit` (default 0.0; test {0.0, 0.25, 0.5, 0.75, 1.0} in logit space):
+     A voxel in the `allow` band is only flipped from `M0` if `|z| > tau_edit`.
+  2. Case-level volume-erosion safety cap `--max_rem_frac` (e.g., 0.12):
+     If removals `(M0 & ~r).sum() > max_rem_frac * M0.sum()`, only keep the top most-negative
+     `z` removals up to `max_rem_frac * M0.sum()`.
+  3. Choose `(tau_edit, max_rem_frac)` strictly on Validation (120 cases).
+
+
+--------------------------------------------------------------------------------
+CHANGE 3: Full-ROI Soft-Dice Loss + Edit-Preservation Penalty in S7 Refiner
+File: scripts/s7_refine.py (lines 58-94)
+--------------------------------------------------------------------------------
+Why:
+  Computing Soft Dice only inside `allow > 0.5` ignores the frozen tumor core (`M0 & ~allow`) and
+  biases the refiner toward shrinking the mask.
+
+What to add in `scripts/s7_refine.py`:
+  Add `--loss full_dice_bce` and `--lam_stay 0.05`:
+  ```python
+  def full_dice_bce(z, y, x, lam_stay=0.05):
+      """Full-ROI Soft Dice (frozen core = M0, editable band = sigmoid(z)) + active-band BCE + stay penalty."""
+      m0 = x[:, 3:4]
+      allow = x[:, 5:6]
+      band = allow > 0.5
+      if not band.any():
+          return z.sum() * 0.0
+      # Effective full-patch probability: exact 0/1 outside allow band, sigmoid(z) inside allow band
+      p_full = (1.0 - allow) * m0 + allow * torch.sigmoid(z)
+      dims = (1, 2, 3, 4)
+      inter = (p_full * y).sum(dims)
+      den = p_full.sum(dims) + y.sum(dims)
+      dice = (1.0 - (2.0 * inter + 1.0) / (den + 1.0)).mean()
+      # Active-band BCE
+      bce = F.binary_cross_entropy_with_logits(z[band], y[band])
+      # Small L1 penalty on logit residual r = z - z0 inside allow band to prevent speculative edits
+      z0 = (2.0 * m0 - 1.0) * math.log(3.0)
+      stay = (allow * (z - z0)).abs()[band].mean()
+      return dice + bce + lam_stay * stay
+  ```
+
+
+--------------------------------------------------------------------------------
+CHANGE 4: Dual-Teacher Inputs (`seg_prob` + `sam_prob` + Disagreement) for S7
+Files: scripts/s3f_jury_masks.py, scripts/s3g_oof_train_masks.py, cids/refine/data.py
+--------------------------------------------------------------------------------
+Why:
+  Where SegResNet (`seg_prob`) and SAM-S2b (`sam_prob`) agree, the boundary is already reliable.
+  Where they disagree (`|seg_prob - sam_prob|` is high inside the 8 mm band), the refiner can use
+  3D Haar MRI edges to arbitrate between Finder and Checker.
+
+What to change:
+  1. In `s3f_jury_masks.py` and `s3g_oof_train_masks.py`:
+     Save `sam` (uint8, max of `d["prob"] * 255` over the kept candidates) inside `cases/<cid>.npz`
+     alongside `seg` and `lab`.
+  2. In `cids/refine/data.py` (`prepare_case` and `roi_channels`):
+     When `sam_prob` is present in `d.files`, append 3 extra channels (`extra_ch = 3`):
+     `[seg_prob, sam_prob, np.abs(seg_prob - sam_prob)]`.
+
+
+--------------------------------------------------------------------------------
+CHANGE 5: Subband Gating & `freq_no_hhh` Mode in `BoundaryRefiner`
+File: cids/refine/model.py (lines 41-88)
+--------------------------------------------------------------------------------
+Why:
+  The 3-axis high-pass `HHH` wavelet band in breast DCE-MRI is dominated by noise/BPE speckle,
+  causing overfitting in `det_proj`.
+
+What to change in `cids/refine/model.py`:
+  1. Allow `mode in ("freq", "freq_no_hhh", "freq_lll", "spatial")`.
+  2. In `mode == "freq_no_hhh"`, zero out band 7 (`HHH`) while keeping `LLL` (context) and the 6
+     directional 1-axis/2-axis edge bands (`LLH, LHL, LHH, HLL, HLH, HHL`).
+  3. Add a learnable 7-element subband gate `self.band_logit = nn.Parameter(torch.zeros(7))`
+     (scaling each high-frequency subband by `2 * sigmoid(band_logit)` before `det_proj`), providing
+     an interpretable subband importance readout just like `SamFreqAdapter`.
+
+
+================================================================================
+3. RECOMMENDED EXECUTION ORDER ON YOUR LAB SERVER (GPU 0)
+================================================================================
+
+Step 1 (CPU, ~1 min):
+  Test `JURY18` (within-case relative clues) on cached S3e/S3f tables and verify Val Dice improvement.
+
+Step 2 (GPU 0, ~2 min):
+  Run `scripts/s7_calibrate.py` on existing `v1-new` and `v2` checkpoints to measure Val Dice / NSD
+  after confidence gating (`--tau_edit`) and max-removal safety clamping (`--max_rem_frac`).
+
+Step 3 (GPU 0, ~1.5 h per run, `--skip_test` during tuning):
+  Run `scripts/s7_refine.py` with:
+    `--loss full_dice_bce --p_perturb 0.0 --lr 3e-4 --error_sampling --skip_test`
+  across the 4 matched ablation modes:
+    1. `--mode freq`
+    2. `--mode freq_no_hhh`
+    3. `--mode freq_lll`
+    4. `--mode spatial`
+
+Step 4 (GPU 0, ~15 min, once only):
+  Evaluate the single best validation model on the 306-case official Test set (`test_metrics.csv`,
+  `test_summary.json`).
+
+================================================================================
+4. EXPECTED VAL & TEST METRICS AFTER THESE CHANGES
+--------------------------------------------------------------------------------
+- S7 Refiner fixes alone (on frozen S3f masks):
+    Val Dice:  0.7742 -> 0.778 - 0.783  | Val NSD:  0.8204 -> 0.830 - 0.838
+    Test Dice: 0.7495 -> 0.754 - 0.758  | Test NSD: 0.7987 -> 0.808 - 0.815
+- Upgraded Memory Jury (JURY18) + Fixed Dual-Teacher S7 Refiner:
+    Val Dice:  0.7742 -> 0.785 - 0.792
+    Test Dice: 0.7495 -> 0.762 - 0.770  (with missed tumors reduced from 10 -> 5-7)
+==============================================================================

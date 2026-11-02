@@ -1,0 +1,169 @@
+COUNCIL RUN ANALYSIS
+Prepared 2026-10-14; analysis only.
+
+MAIN CONCLUSION
+
+The full council is roughly matching the finder on validation, not matching
+the best S3d pipeline. Best logged council validation Dice = 0.7236 at epoch 40.
+Finder validation = 0.7238. S3d validation is reported as 0.766 in PROJECT_LOG.
+Thus the observed finder gap is -0.0002 and the reported S3d gap is about -0.0424.
+The S3d number is rounded and its protocol must be aligned before an exact claim.
+Do not compare council VALIDATION 0.7236 directly with S3d TEST 0.735.
+
+PROVENANCE AND WHAT ACTUALLY RAN
+
+Source: the user-supplied pasted-text.txt attachment.
+SHA256: 36902ec1776f2a21067d230508433eae2b840a97523ebd066dab598ccd0a3957
+Logged Git commit: c62698785425d095bea76dd514a3a9d065a8151c.
+The local cids/fcouncil code and S5/S6 scripts have no Git diff against that
+commit. This supports tracing the logged behavior to the reviewed code; it
+cannot rule out edits made later inside the remote notebook environment.
+GPU: Tesla T4. Kaggle tests: 39 passed in 63.56 seconds.
+Model: 3,100,936 parameters, around 0.77M per expert.
+Maps: finder SegResNet-100, checker SAM-S2b, NO S4 adapter, cross-fitted jury ON.
+Distillation: ON. Full split: 1080 train / 120 validation / 306 test.
+S5 completed all 1506 map files in 112.4 minutes.
+The log ends after the epoch-42 loss summary, at 37437 seconds (~10.40 hours
+from notebook start). No full-run council test result or crash trace appears.
+The user says the run was stopped; the attachment does not show the stop cause.
+
+CRITICAL SMOKE-TEST DISTINCTION
+
+The TEST section near record 145 says 'TEST (306, once)', but its JSON explicitly
+says cases=4. This was the 8-train / 4-val / 4-test, one-epoch smoke run.
+Its council test Dice 0.3831 and very low expert scores are NOT the trained
+full-run result. The fixed console header is misleading.
+The full run begins near records 193-195, around 7106.5 seconds.
+
+FULL VALIDATION TRAJECTORY
+
+Epoch    Council Dice    Finder Dice    Checker Dice    Gate E1/E2/E3/E4
+  5         0.7157          0.7238          0.6447        .02/.05/.14/.79
+ 10         0.7059          0.7238          0.6447        .02/.26/.24/.48
+ 15         0.7097          0.7238          0.6447        .02/.40/.32/.26
+ 20         0.7191          0.7238          0.6447        .04/.45/.31/.20
+ 25         0.7178          0.7238          0.6447        .04/.37/.43/.16
+ 30         0.7129          0.7238          0.6447        .06/.41/.43/.09
+ 35         0.7192          0.7238          0.6447        .08/.44/.39/.08
+ 40         0.7236          0.7238          0.6447        .12/.39/.41/.08
+
+Gate numbers are rounded averages INSIDE THE PREDICTED TUMOUR, not global
+utilization. Rounding can make them sum to 0.99. They do not prove collapse.
+Routing changes considerably; it is not permanently stuck on HHH. By epoch 40
+the edge/corner groups receive about 80% of the logged tumour-region weight.
+
+Training total loss: 0.7253 at epoch 1; 0.4664 at epoch 5; 0.4436 at epoch 42.
+Most of the initial loss improvement happens early. Validation still improves
+late, so remaining epochs could improve it, but these logs provide no basis
+for expecting an additional ~0.042 gain just from longer training.
+No unaugmented whole-volume training Dice is logged; overfitting versus
+underfitting cannot be diagnosed confidently from training loss alone.
+
+EXPORTED MAP QUALITY
+
+               Finder rel20    Jury-weighted checker rel20
+Validation        0.7238                    0.6447
+Test              0.6835                    0.5987
+
+Validation by collection:
+DUKE              0.6106                    0.5378
+ISPY1             0.7321                    0.6995
+ISPY2             0.7434                    0.6579
+NACT              0.8254                    0.7400
+
+The weighted checker is weaker as a standalone mask for every listed validation
+collection. This does not prove it lacks useful complementary information, or
+that its inclusion causes the poor council result. Its product with jury score
+changes calibration, and it is not the actual S3d output.
+
+WHAT THE CODE MAKES THE COUNCIL LEARN
+
+1. Four randomly initialized small U-Nets learn complete segmentation from
+   separate Haar groups and the same two maps. There is no pretrained finder
+   weight transfer and no S3d output skip connection.
+2. The gate combines only those expert logits. Finder and S3d outputs are not
+   explicit fallback members of the final mixture.
+3. A 96-mm local patch does not directly contain all candidate-level/global
+   evidence that S3d uses for selection.
+4. Augmented map channels double as distillation targets. A dropped teacher
+   means zero rather than unavailable. Both are dropped with probability 2%
+   per patch under the default independent 10%/20% dropout draws.
+5. SAM evidence is also zero outside processed crop coverage. This absence is
+   treated as background confidence by the current teacher loss.
+6. The agreement rule abs(p_f-p_c)<0.5 accepts, for example, 0.55 versus 0.10,
+   producing teacher target 0.325 although binary decisions disagree.
+7. Most agreement voxels can be easy background. At epoch 40 the KD term is
+   only ~0.0172 after its 0.3 weight, versus main loss ~0.2826. It is worth
+   ablating, but scalar magnitude does not establish its gradient importance
+   or that it is the dominant problem.
+
+DIAGNOSTIC TRAPS
+
+- Expert Dice is raw, while council Dice is after rel20. At epoch 40 experts
+  are .642/.650/.692/.660; do not interpret the entire council gap as a gate
+  gain until postprocessing is matched.
+- Gate-balancing loss averages over all voxels; printed gate weights use a
+  predicted foreground region. Their differing behavior is not a bug proof.
+- S6 validation overlap defaults to 0.25, while test uses 0.5. The finder maps
+  for validation use 0.5. Reevaluate shortlisted checkpoints at 0.5 first.
+- The debugger warning is unrelated to segmentation quality. The scalar-loss
+  warning calls for detached logging, not an architectural change.
+- S4 was not used in this run; these logs cannot judge whether its adapter helps.
+- The attachment cannot show whether missing tumour, false-positive volume,
+  boundary erosion, or a specific collection drives the council's losses.
+  Per-case predictions and matched metrics are the next necessary diagnostics.
+
+PRIORITY DIAGNOSIS (HYPOTHESES, NOT PROVEN CAUSES)
+
+Most promising: preserve S3d's global candidate decision and learn corrections.
+Next: separate teacher evidence from map corruption and missing coverage.
+Next: address optimistic in-sample upstream maps and difficult-error sampling.
+Then: add image context to frequency specialists and evaluate gate usefulness.
+Lower priority: larger models, stronger balancing, metadata, or longer training
+before the above comparisons establish what is limiting performance.
+
+EXTRACTED EPOCH SUMMARIES (first is the smoke run)
+
+7038.2s	142	epoch 1: loss 2.6016 (final 1.6022 experts 1.6061 kd 0.6544) | val council 0.4231 finder 0.6775 checker 0.5928 | experts 0.000 0.057 0.006 0.006 | gate 0.25 0.25 0.25 0.25 | best 0.4231
+7779.3s	200	epoch 1: loss 0.7253 (final 0.4456 experts 0.4881 kd 0.0989)
+8473.7s	202	epoch 2: loss 0.5016 (final 0.3188 experts 0.3316 kd 0.0564)
+9136.5s	204	epoch 3: loss 0.4834 (final 0.3057 experts 0.3208 kd 0.0576)
+9797.2s	206	epoch 4: loss 0.4700 (final 0.2967 experts 0.3119 kd 0.0580)
+10767.6s	209	epoch 5: loss 0.4664 (final 0.2946 experts 0.3090 kd 0.0576) | val council 0.7157 finder 0.7238 checker 0.6447 | experts 0.634 0.546 0.641 0.511 | gate 0.02 0.05 0.14 0.79 | best 0.7157
+11425.4s	211	epoch 6: loss 0.4777 (final 0.3024 experts 0.3162 kd 0.0573)
+12078.7s	213	epoch 7: loss 0.4642 (final 0.2930 experts 0.3078 kd 0.0576)
+12728.2s	215	epoch 8: loss 0.4662 (final 0.2950 experts 0.3079 kd 0.0575)
+13369.2s	217	epoch 9: loss 0.4602 (final 0.2910 experts 0.3039 kd 0.0575)
+14290.4s	220	epoch 10: loss 0.4661 (final 0.2954 experts 0.3070 kd 0.0575) | val council 0.7059 finder 0.7238 checker 0.6447 | experts 0.654 0.585 0.631 0.534 | gate 0.02 0.26 0.24 0.48 | best 0.7157
+14942.4s	222	epoch 11: loss 0.4713 (final 0.2991 experts 0.3100 kd 0.0572)
+15596.3s	224	epoch 12: loss 0.4558 (final 0.2887 experts 0.2994 kd 0.0580)
+16244.3s	226	epoch 13: loss 0.4723 (final 0.2995 experts 0.3115 kd 0.0572)
+16888.9s	228	epoch 14: loss 0.4547 (final 0.2883 experts 0.2983 kd 0.0572)
+17857.0s	231	epoch 15: loss 0.4705 (final 0.2987 experts 0.3090 kd 0.0575) | val council 0.7097 finder 0.7238 checker 0.6447 | experts 0.636 0.589 0.614 0.546 | gate 0.02 0.40 0.32 0.26 | best 0.7157
+18521.2s	233	epoch 16: loss 0.4646 (final 0.2948 experts 0.3049 kd 0.0577)
+19212.6s	235	epoch 17: loss 0.4471 (final 0.2831 experts 0.2934 kd 0.0575)
+19887.9s	237	epoch 18: loss 0.4613 (final 0.2927 experts 0.3031 kd 0.0569)
+20559.4s	239	epoch 19: loss 0.4559 (final 0.2887 experts 0.2996 kd 0.0579)
+21508.9s	242	epoch 20: loss 0.4518 (final 0.2864 experts 0.2963 kd 0.0575) | val council 0.7191 finder 0.7238 checker 0.6447 | experts 0.583 0.626 0.711 0.578 | gate 0.04 0.45 0.31 0.20 | best 0.7191
+22167.0s	244	epoch 21: loss 0.4594 (final 0.2914 experts 0.3015 kd 0.0575)
+22863.4s	246	epoch 22: loss 0.4544 (final 0.2881 experts 0.2983 kd 0.0572)
+23661.1s	248	epoch 23: loss 0.4505 (final 0.2856 experts 0.2956 kd 0.0572)
+24366.0s	250	epoch 24: loss 0.4567 (final 0.2898 experts 0.2994 kd 0.0572)
+25295.0s	253	epoch 25: loss 0.4535 (final 0.2877 experts 0.2973 kd 0.0570) | val council 0.7178 finder 0.7238 checker 0.6447 | experts 0.638 0.599 0.682 0.651 | gate 0.04 0.37 0.43 0.16 | best 0.7191
+25973.9s	255	epoch 26: loss 0.4592 (final 0.2916 experts 0.3006 kd 0.0576)
+26633.7s	257	epoch 27: loss 0.4393 (final 0.2782 experts 0.2878 kd 0.0573)
+27285.3s	259	epoch 28: loss 0.4586 (final 0.2912 experts 0.3005 kd 0.0572)
+27929.8s	261	epoch 29: loss 0.4469 (final 0.2833 experts 0.2927 kd 0.0572)
+28865.3s	264	epoch 30: loss 0.4532 (final 0.2878 experts 0.2966 kd 0.0572) | val council 0.7129 finder 0.7238 checker 0.6447 | experts 0.605 0.638 0.672 0.603 | gate 0.06 0.41 0.43 0.09 | best 0.7191
+29512.9s	266	epoch 31: loss 0.4640 (final 0.2946 experts 0.3045 kd 0.0572)
+30181.3s	268	epoch 32: loss 0.4545 (final 0.2885 experts 0.2976 kd 0.0571)
+30836.8s	270	epoch 33: loss 0.4533 (final 0.2876 experts 0.2971 kd 0.0572)
+31499.2s	272	epoch 34: loss 0.4590 (final 0.2917 experts 0.3003 kd 0.0570)
+32511.1s	275	epoch 35: loss 0.4613 (final 0.2935 experts 0.3014 kd 0.0570) | val council 0.7192 finder 0.7238 checker 0.6447 | experts 0.633 0.640 0.675 0.622 | gate 0.08 0.44 0.39 0.08 | best 0.7192
+33175.3s	277	epoch 36: loss 0.4564 (final 0.2896 experts 0.2994 kd 0.0569)
+33830.1s	279	epoch 37: loss 0.4493 (final 0.2850 experts 0.2943 kd 0.0573)
+34488.9s	281	epoch 38: loss 0.4486 (final 0.2845 experts 0.2936 kd 0.0574)
+35148.0s	283	epoch 39: loss 0.4510 (final 0.2864 experts 0.2949 kd 0.0570)
+36086.9s	286	epoch 40: loss 0.4458 (final 0.2826 experts 0.2920 kd 0.0572) | val council 0.7236 finder 0.7238 checker 0.6447 | experts 0.642 0.650 0.692 0.660 | gate 0.12 0.39 0.41 0.08 | best 0.7236
+36770.3s	288	epoch 41: loss 0.4507 (final 0.2860 experts 0.2953 kd 0.0570)
+37437.0s	290	epoch 42: loss 0.4436 (final 0.2812 experts 0.2906 kd 0.0570)

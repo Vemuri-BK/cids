@@ -1,0 +1,282 @@
+================================================================================
+S7 STOPPED RUN: EVIDENCE, REQUIRED FIXES, AND FREQUENCY REFINEMENT PLAN
+================================================================================
+Updated: 2026-10-19
+Reviewed implementation: 10be598 (masked loss introduced in 5ef4ff9)
+Scope: documentation only; no implementation changes made by this update.
+Source log: attached 0dea1983-4cf5-4599-9de5-97aa463bab8e/pasted-text.txt.
+The user has stopped the run. The supplied log ends during epoch 10.
+It contains completed training through epoch 9 and no final test results.
+The log does not print a commit hash; confirm the Kaggle checkout before
+attributing its behavior to a specific code version.
+
+1. WHAT THE RUN ESTABLISHES
+--------------------------------------------------------------------------------
+Epoch    Train loss    Val Dice    Delta vs M0    Better / worse    Changed voxels
+0        --            0.7742      --             --                0
+3        0.4714        0.7717      -0.0025         18 / 25           1256
+6        0.4546        0.7717      -0.0025         20 / 28           1658
+9        0.4398        0.7716      -0.0026         19 / 24           1885
+
+Better/worse counts use a >0.01 Dice change; other cases have smaller changes.
+Training loss falls overall from 0.6505 at epoch 1, but not monotonically.
+The network changes masks, so it is not stuck at zero residual. Those changes
+have not improved average validation Dice at any reported checkpoint.
+Epoch-zero Dice matches the S3f baseline to the printed precision.
+At the last reported validation, best.pt is still the epoch-zero identity
+fallback, not the trained epoch-nine model. Later state is not in this log.
+
+This is an unsuccessful early pilot, not proof that frequency refinement cannot
+work. Falling augmented-patch training loss does not prove generalization.
+The changed-voxel count does not reveal whether the model grows or shrinks.
+
+2. CORRECTIONS TO THE PREVIOUS VERSION OF THIS DOCUMENT
+--------------------------------------------------------------------------------
+- The active-band Dice+BCE fix already exists in the reviewed source, and the
+  training call passes x[:,5:6]. Do not list it as a new fix unless the Kaggle
+  run used older code. Inactive-background dilution is not an established
+  explanation for this log.
+- Boundary shrinkage, excessive perturbation, and excessive learning rate are
+  hypotheses. The log has no additions/removals, gate or gradient diagnostics
+  that establish these as root causes.
+- Earlier numeric promises (300-600 changed voxels, validation 0.777-0.781,
+  test 0.76-0.77) were unsupported and are withdrawn.
+- The desired result is useful, reproducible corrections, not a particular
+  number of edited voxels. No proposed modification guarantees improvement.
+
+3. REQUIRED ENGINEERING FIXES BEFORE THE NEXT RUN
+--------------------------------------------------------------------------------
+A. Prevent stale ROI and mask reuse.
+Files: cids/refine/data.py:prepare_case; scripts/s7_refine.py:find_s3f.
+- ROI reuse currently checks file existence, not source mask/data identity.
+- Existing extracted masks can remain while a new summary replaces the old one.
+- Key extraction and ROI caches by source digest and preprocessing settings;
+  validate case IDs, shapes/grid, ROI margin, and mask lineage.
+- Store a manifest and fail on ambiguous multiple source outputs.
+- Compare per-case epoch-zero validation masks/metrics to S3f, not just the
+  refined model versus its own cached input. A matching mean is insufficient.
+These defects were reproduced in local synthetic checks. There is no evidence
+that they caused the supplied run; fixing them makes subsequent runs trustworthy.
+
+B. Make training resumable and evaluation deliberate.
+File: scripts/s7_refine.py.
+- Save last.pt atomically: model, optimizer, scaler, epoch, step, best score,
+  history, random states, configuration and input hashes.
+- Support resume with configuration/provenance validation.
+- Refuse to overwrite an existing experiment on an accidental fresh start.
+- Save an identifiable trained diagnostic checkpoint even when it loses to M0.
+- Add --skip_test and a separate evaluation mode. Budget stops and pilots
+  should not automatically evaluate the official test set.
+- Preserve the stopped run's log and initial best checkpoint under its own ID.
+  It cannot be resumed exactly from the identity best.pt alone.
+
+C. Preserve image-channel consistency.
+File: cids/refine/data.py:RefinePatchDataset.__getitem__.
+- Augment pre and post, then recompute subtraction = post - pre.
+- Current independent transformations of all three channels break this identity.
+- Keep spatial transforms aligned across images, masks, distance, allow and GT.
+- Separate intensity jitter, spatial augmentation and mask perturbation controls.
+
+D. Enforce genuine jury-fold exclusion.
+File: cids/jury.py:CrossFitMemoryJury.
+- A failed fold currently falls back to the full jury, including held-out cases.
+- Fail closed in real mask export. Any tiny-smoke fallback must be explicit,
+  recorded and prohibited from generating production training inputs.
+- Record fold memberships and model lineage.
+- Jury cross-fitting does not make finder outputs out-of-fold. For strong
+  generalization evidence, regenerate training inputs with held-out upstream
+  finder predictions too. Synthetic perturbations are not an equivalent fix.
+
+E. Keep the identity-preserving design and corrected masked loss.
+- Keep delta zero-initialized and the output gate initially nonzero (currently .5).
+- Zero gate gradient on the first step is expected while delta=0, not a failure.
+- Do not randomly initialize delta to force immediate gate updates.
+- Do not raise the base logit from ln(3) to 4 as a loss fix: it makes binary
+  corrections harder, and outside-band voxels are already excluded from loss.
+- Validate patch size is divisible by four; pad_min has an edge case for sizes
+  such as 65. The default 64 is unaffected.
+
+4. FIRST DIAGNOSTIC: HOW MUCH CAN THIS REFINER POSSIBLY FIX?
+--------------------------------------------------------------------------------
+Before increasing model size, compute an editable-band upper bound on validation.
+Let M0 be the input mask, G the reference annotation and A the editable region.
+Construct, for diagnostic analysis ONLY:
+    M_oracle = (M0 AND NOT A) OR (G AND A)
+Use exactly the ROI and allow region available to inference.
+Measure full-volume Dice, NSD and HD95 for M0 and M_oracle.
+Compare R_ALLOW = 4, 8 and 12 mm, with ROI margin greater than R_ALLOW.
+
+Also report:
+- Correctable false-negative voxels: G AND NOT M0 AND A.
+- Correctable false-positive voxels: M0 AND NOT G AND A.
+- Unreachable reference voxels and fixed false-positive core voxels outside A.
+- Empty input masks, by collection and tumor size.
+
+Interpretation:
+- Small oracle gain: the band/initial candidate selection limits this method.
+- Large oracle gain but no learned gain: focus on data, sampling and objectives.
+- A larger radius improves the oracle but worsens learned validation: added
+  freedom is introducing errors; more radius is not automatically beneficial.
+The existing empty M0 test case cannot be rescued by this boundary-only model.
+Reference masks are allowed for this offline diagnostic, never as inference inputs.
+
+5. PRIORITY LEARNING CHANGES TO TEST
+--------------------------------------------------------------------------------
+A. Test clean masks versus controlled perturbations FIRST.
+Current behavior: about 80% of masks get smooth grow/shrink/wobble perturbations.
+Provide independent options, for example:
+    --mask_perturb_prob, --mask_shift_mm, --mask_noise_scale
+These are proposed options, NOT currently executable CLI flags.
+Start with a clean-mask arm (probability 0), preserving ordinary spatial transforms.
+Then test a 50% clean / 50% mildly perturbed arm as a candidate setting.
+For the mild arm, a shift range of +/-1 mm is a starting experiment, not an optimum.
+Gaussian wobble is not strictly bounded by the shift range; explicitly bound the
+combined displacement if a hard maximum is desired.
+Estimate realistic error patterns using out-of-fold training predictions.
+
+B. Sample correctable errors, not only arbitrary mask surface.
+Current sampling: 75% M0 edge and 25% anywhere in the padded ROI.
+Pilot a mixture such as:
+    25% editable false negatives; 25% editable false positives;
+    50% ordinary boundary locations, including already-correct boundaries.
+Use training annotations only. If an error category is absent, redistribute
+samples to ordinary boundary locations. Keep validation/inference sampling free
+of annotations. These fractions are experimental, not requirements.
+Log editable-voxel count and correctable-error count per sampled patch.
+Do not train exclusively on mistakes: the model must learn when not to edit.
+
+C. Treat a lower learning rate as a controlled experiment.
+Compare 1e-3 against 2e-4 or 3e-4 with the same data, schedule and update budget.
+Do not claim 1e-3 caused this result: the log has no instability or divergence.
+Log effective learning rate, residual magnitude, gate values and gradient norm.
+Select on validation, not test. Do not change learning rate, augmentation,
+loss and architecture together and attribute any gain to frequency.
+
+D. Keep masked Dice+BCE as the reference objective.
+Only after data diagnostics, test ONE additional objective at a time:
+- A small distance/surface auxiliary term for accurate boundaries.
+- A small correction penalty on already-correct editable training voxels.
+- Per-patch normalization if pooled editable voxels over-weight particular patches.
+Normalize terms and log each magnitude. Excessive preservation penalties can
+produce identity; excessive boundary weighting can damage region overlap.
+Ground-truth edges must be training targets, never input channels at inference.
+
+6. HOW TO MAKE THE FREQUENCY BRANCH ADD DEMONSTRABLE VALUE
+--------------------------------------------------------------------------------
+The current design already supplies LLL context and signed high-frequency bands.
+Do not assume more frequency modules will help. Test these explanations in order:
+
+A. Does frequency beat a matched spatial refiner?
+Run the spatial twin with the same input masks, sampling, augmentation, optimizer,
+update count, validation procedure and seeds. Use identical initialization for
+shared layers where practical; the same random seed alone does not ensure this
+because constructing the learned split consumes random numbers.
+Report exact parameter counts; the spatial split adds a small number of parameters.
+Compare frequency minus spatial directly on paired patients.
+
+B. Is high-frequency detail actually being used?
+Controlled ablations: all bands, LLL-only (detail zeroed), high-frequency branch
+zeroed, context-detail fusion gate removed. Distinguish retrained ablations from
+inference-only perturbation probes; the latter can be out-of-distribution.
+Inspect where correct edits coincide with useful MRI boundaries, not only gate maps.
+A gate visualization alone does not establish causal usefulness.
+
+C. Does Haar help beyond fixed downsampling?
+If the primary comparison is promising, add a fixed voxel-unshuffle or another
+fixed orthonormal transform control. This separates the benefit of a fixed
+representation from Haar's particular context/detail organization.
+
+D. Add adaptive detail suppression only if errors implicate noisy bands.
+Candidate modification: bounded context-conditioned gains or soft thresholds for
+individual bands, keeping low-frequency anatomy available and preserving signed
+coefficients. Compare with the existing fusion gate at matched capacity.
+This may suppress noise, but can also remove small-lesion detail; ablate it.
+Do not force every strong high-frequency edge to become a tumor boundary.
+
+E. Check scale and shift sensitivity before more expensive architecture changes.
+Strided Haar is sensitive to one-voxel phase changes. Measure prediction changes
+under small translated inputs, align outputs back, and evaluate only valid regions.
+If phase sensitivity is substantial, test phase augmentation or shift averaging
+and report its inference cost. A second wavelet scale is justified only if error
+analysis indicates missing context/detail scale; compare a spatial multiscale twin.
+
+7. DIAGNOSTICS TO SAVE AT EVERY VALIDATION
+--------------------------------------------------------------------------------
+Save one row per patient with:
+- M0 and refined full-volume Dice; selected boundary metrics at reasonable intervals.
+- Added and removed voxel counts.
+- Helpful additions = added AND G; harmful additions = added AND NOT G.
+- Helpful removals = removed AND NOT G; harmful removals = removed AND G.
+- Editable-band oracle Dice and unreachable-error counts.
+- Input volume, output volume, collection, tumor size and empty-mask status.
+Save representative slices/3D overlays for improvements and large regressions.
+Record unaugmented training diagnostics on a fixed training subset as well as
+validation. This helps distinguish synthetic-denoising success from real refinement.
+Use annotations solely for training/evaluation diagnostics, not test-time decisions.
+
+8. CONTROLLED EXPERIMENT SEQUENCE AND DECISION RULES
+--------------------------------------------------------------------------------
+Stage 0: reliability
+  Fix cache identity, checkpoint/resume, evaluation controls and channel consistency.
+  Freeze the source S3f masks and record the exact code/environment/input hashes.
+  Run identity, outside-band invariance, gradient, resume and cache tests.
+  Test both undersegmentation and oversegmentation synthetic examples with the
+  actual masked training loss; confirm inference reconstruction parity.
+
+Stage 1: inexpensive diagnosis
+  Compute the editable-band upper bound. Inspect representative real errors.
+  Add validation edit-quality logs. No official-test evaluation during tuning.
+
+Stage 2: pilot matched baselines
+  Run spatial and frequency twins using the corrected data pipeline.
+  Establish clean-mask baselines, then vary perturbation or sampling one at a time.
+  Use a fixed pilot horizon (e.g. 18-24 epochs) and the same scheduling convention.
+  A shortened schedule has a different cosine decay from a truncated 60-epoch run;
+  record this rather than presenting those runs as identical optimization.
+  If testing LR, vary it separately. Keep the stopped run as historical evidence.
+
+Stage 3: full confirmation
+  Extend promising configurations to a predeclared full schedule.
+  Repeat the strongest spatial/frequency comparison across multiple seeds.
+  Select the final method using validation, freeze it, then evaluate test once
+  for that final comparison. Disclose earlier test-set use in the project.
+
+Success criteria:
+- Refined model improves over its EXACT source M0 baseline.
+- Frequency improves over the matched spatial model, not merely M0.
+- Paired patient-level confidence intervals, seed variability, boundary metrics,
+  lesion misses and severe regressions support the claimed benefit.
+- Report runtime and memory costs for any additional gain.
+- If both twins improve equally, claim useful refinement, not a proven frequency
+  advantage. If neither improves, revisit input errors and headroom before adding text.
+There is no guaranteed numeric Dice target or acceptable edit-count target.
+
+9. WHAT TO KEEP UNCHANGED FOR NOW
+--------------------------------------------------------------------------------
+- The frozen jury baseline and zero-initialized residual starting point.
+- Prediction-derived ROIs, with sufficient margin for the selected correction band.
+- Matched validation/test inference overlap.
+- Clean train/validation/test separation and validation-only model selection.
+- No text integration until the image-only refiner's behavior is understood.
+- No enlargement of the model merely because the first pilot failed.
+
+10. IMPLEMENTATION CHECKLIST (PROPOSED; NOT APPLIED)
+--------------------------------------------------------------------------------
+[ ] Versioned extraction/ROI manifests and per-case baseline parity.
+[ ] Resume-safe last/best checkpoints and fresh-output overwrite protection.
+[ ] --skip_test / separate evaluate mode; save trained diagnostic state.
+[ ] Independent augmentation controls; recompute subtraction after intensity jitter.
+[ ] Strict cross-fit export with fold lineage; document upstream in-sample limitation.
+[ ] Configurable correction radius and compatible ROI margin.
+[ ] Editable-band oracle report and helpful/harmful edit diagnostics.
+[ ] Clean versus perturbed mask ablation; error-aware sampling experiment.
+[ ] Matched spatial/frequency experiments and separate LR comparison.
+[ ] Optional loss/band modifications only after the preceding evidence.
+[ ] Full model-dependent tests in Kaggle; local review environment lacked PyTorch.
+
+Immediate recommendation:
+Preserve the stopped run, implement Stage 0 plus the band-oracle diagnostic, then
+run a controlled clean-mask spatial/frequency pilot. Add realistic perturbations
+and error-aware sampling based on evidence. Do not restart the unchanged 60-epoch
+configuration and expect the previously suggested numerical gains.
+================================================================================

@@ -1,0 +1,125 @@
+FREQUENCY-GUIDED MASK REFINEMENT: RESEARCH AND A CIDS ADAPTATION
+Research checked 2026-10-14. No implementation changes.
+
+READ THESE FIRST
+
+1. WMREN: Wavelet Multi-scale Region-Enhanced Network for Medical Image
+   Segmentation. Hang Lu, Liang Du, Peng Zhou. IJCAI 2025, pp.1675-1683.
+   Paper: https://www.ijcai.org/proceedings/2025/0187.pdf
+   Landing page: https://www.ijcai.org/proceedings/2025/187
+   Code linked by paper: https://github.com/C101812/WMREN/tree/master
+   Combines Haar and spatial residual branches, then uses decoder boundary
+   guidance. Section 3.2 describes its region/boundary refinement. Table 5
+   reports Synapse decoder baseline Dice 82.72 / HD95 17.23, versus 84.40 /
+   15.65 with SAFM+CREM. These are its 2D-model experiment results, not expected
+   CIDS gains. Useful principle: combine spatial context and frequency detail.
+
+2. Frequency-Aware Feature Fusion for Dense Image Prediction (FreqFusion).
+   Linwei Chen et al. IEEE TPAMI 2024; DOI 10.1109/TPAMI.2024.3449959.
+   Paper: https://arxiv.org/abs/2408.12879
+   Code: https://github.com/Linwei-Chen/FreqFusion
+   Uses adaptive low-pass filtering for interior consistency, high-pass detail
+   enhancement, and learned resampling for alignment. It is feature fusion for
+   dense prediction, not a ready-made 3D medical mask postprocessor. Useful
+   principle: suppress inappropriate high-frequency changes within regions
+   while restoring relevant boundary detail.
+
+3. WaveRNet: Wavelet-Guided Frequency Learning for Multi-Source
+   Domain-Generalized Retinal Vessel Segmentation. Chanchan Wang et al.
+   Verified arXiv submission: January 2026, arXiv:2601.05942.
+   Paper: https://arxiv.org/abs/2601.05942
+   Full text: https://arxiv.org/pdf/2601.05942
+   Repository linked by paper: https://github.com/Chanchan-Wang/WaveRNet
+   Combines wavelet-based SAM adaptation with mask-prompt refinement. Section
+   3.4 feeds a coarse prediction back as the prompt for a higher-resolution
+   decoder. Evaluated on 2D retinal vessels; not evidence for SAM-Med3D breast
+   tumour refinement. The wavelet module and refiner are distinct components.
+   The arXiv version was verified; publisher acceptance status was not verified.
+
+4. UDBRNet: A novel uncertainty driven boundary refined network for organ at
+   risk segmentation. Riad Hassan, M. Rubaiyat Hossain Mondal, Sheikh Iqbal
+   Ahamed. PLOS ONE 19(6), e0304771, June 2024.
+   Paper: https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0304771
+   Code: https://github.com/riadhassan/UDBRNet
+   Section 2.3 explicitly predicts a residual from the main mask and uncertainty,
+   then adds it to the main mask. It is a CT organ segmentation method, not a
+   wavelet method. Useful precedent for preserving an existing prediction and
+   learning a correction. Adding frequency evidence is our proposed extension.
+
+WHAT THESE SOURCES SUPPORT
+
+Frequency-informed features and residual refinement each have research
+precedents. They do not validate the exact proposed CIDS combination, establish
+novelty, or guarantee a Dice improvement. The main distinction is feature
+refinement versus direct mask refinement: a wavelet encoder alone does not
+mean that an existing mask is being corrected.
+
+PROPOSED CIDS ADAPTATION (OUR DESIGN, NOT A FORMULA COPIED FROM THESE PAPERS)
+
+Keep S3d's accepted mask M0 and frozen finder/checker/jury. Around candidate
+regions, supply the MRI, M0, separate finder and raw SAM probabilities, jury
+scores, and SAM-coverage mask to a small refiner.
+
+Step 1: compute 3D Haar coefficients from MRI or learned image features.
+Your HaarDWT3D already produces LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH.
+Keep LLL as context and retain the signed directional coefficients. A summary
+of high-frequency magnitude can additionally guide attention; do not replace
+all directional information with one magnitude map.
+
+Step 2: condition high-frequency processing on low-frequency/image context
+and the current mask. High-frequency responses are candidate evidence, not
+tumour labels. The refiner must learn which local variations correspond to
+the labelled tumour boundary and which should be ignored.
+
+Step 3: predict a correction to baseline logits:
+  z_final = z0 + g * delta
+  P_final = sigmoid(z_final)
+where delta is a signed learned correction and g is a learned spatial gate.
+Choose P0 so threshold(P0,0.5)=M0 and z0=logit(P0). For a binary starting mask,
+P0=0.25+0.5*M0 is a simple finite-score initialization; it is not calibrated
+confidence. Zero-initialize the delta head, but keep g nonzero initially so
+gradients can reach the correction head. Verify exact baseline-mask equality
+after full-volume inference. Do not add postprocessing that changes M0.
+
+Step 4: initially train with supervised Dice+BCE. Optionally add a small
+supervised boundary-head loss, with the GT boundary derived only in training.
+Keep distillation disabled in the first experiment. Do not demand that every
+image high-frequency edge become a predicted tumour edge.
+
+Step 5: optionally constrain corrections to a predicted-mask neighbourhood
+or uncertain candidate region. This limits distant false positives but cannot
+rescue a tumour outside that region. Preserve a separate candidate-rescue path
+if that is a major validation failure mode. Never use GT to position test crops.
+
+An inverse wavelet transform is optional. If a CNN consumes concatenated band
+features and directly predicts delta, IDWT is unnecessary. If the model edits
+subbands and reconstructs a feature volume, use IDWT and validate alignment.
+Simply sharpening a binary mask with a high-pass filter is not this method:
+it cannot supply image evidence about where an incorrect boundary should move.
+
+HOW TO RETAIN THE COUNCIL IDEA
+
+Let each specialist predict a correction delta_k using its assigned bands plus
+context, then z_final=z0+sum_k(w_k*delta_k). Supervise each expert's corrected
+output sigmoid(z0+delta_k), rather than supervising delta_k as a whole mask.
+First test one small refiner; only retain four experts if they add a measurable
+benefit over comparable compute/capacity. This is a proposal to test, not a
+claim that equal band specialization is optimal.
+
+MINIMUM EXPERIMENTS TO SHOW FREQUENCY CONTRIBUTES
+
+A. Unchanged S3d.
+B. S3d plus a spatial-only residual refiner.
+C. Same refiner plus Haar bands and context-guided fusion.
+D. C plus boundary supervision.
+Match data, capacity as closely as practical, optimizer, inference overlap,
+and postprocessing. Use training-only/out-of-fold upstream evidence for fitting
+the refiner. Compare paired validation Dice, NSD, HD95, missed tumours, and
+changed-voxel errors; then confirm a selected configuration on held-out data.
+C must improve on B to support a frequency contribution. D versus C tests
+boundary supervision. An improvement over A alone does not establish that
+wavelets caused the gain.
+
+Reading order: WMREN for wavelet/spatial fusion, UDBRNet for actual mask-residual
+refinement, FreqFusion for selective frequency handling, WaveRNet for the SAM
+mask-prompt route. Author repositories are linked, not installed or executed.

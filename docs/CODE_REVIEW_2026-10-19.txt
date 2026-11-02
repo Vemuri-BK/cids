@@ -1,0 +1,166 @@
+IMPLEMENTATION REVIEW - 2026-10-19
+================================
+Scope: current HEAD 88d7c6f, changes since c626987, new S3e notebook,
+S3d/S3e candidate flow, S4/S5/S6 fixes, council data/loss/model, and the
+untracked S3d pipeline/export code. Read-only implementation review.
+
+Verdict
+-------
+S3e is a sensible candidate-selection extension: frozen SAM descriptors,
+patient-excluded kNN/probe scores for training, then a 13-feature jury.
+Validation chooses each variant's threshold. No test labels enter the
+memory or fitted classifiers in the inspected implementation.
+
+The new frequency boundary refiner has NOT been implemented. The existing
+frequency council still predicts four full masks and mixes their logits.
+S3e also remains an evaluation experiment rather than an integrated model
+used by S5 and CIDSPipeline.
+
+The project log reports S3e val 0.774 / test 0.7495 versus S3d 0.7352.
+These are recorded results, not newly reproduced results in this review.
+The local active output directories do not contain the S3e run artifacts
+needed to independently verify those values or its bootstrap analysis.
+
+FINDINGS, PRIORITIZED
+--------------------
+1. HIGH: checkpoint identity is insufficient to invalidate cached results.
+   scripts/s3d_learned_jury.py:56-65 (used by both S3d and S3e).
+   file_sig records only basename and byte count. Different weights saved
+   under best.pt commonly have the same size. Replacing the weights can
+   therefore silently reuse features/descriptors from a different model.
+   Case signatures also omit input cache contents/preprocessing identity.
+   Reproduced: replacing four bytes with four different bytes returns the
+   same signature. Use a content digest computed once per checkpoint and
+   include input-data/preprocessing provenance in the manifest.
+
+2. HIGH: S3e is not persisted or integrated into the prediction path.
+   scripts/s3e_memory_jury.py:95-118,190-216;
+   scripts/s5_export_maps.py:73-76; cids/pipeline.py:49,81-83.
+   The fitted full probe is local to memory_scores; fitted jury models are
+   discarded after evaluation. No complete selected inference bundle is
+   written. S5 instantiates the original 11-feature CrossFitJury, and the
+   pipeline explicitly constructs/consumes only the original features.
+   Passing an S3e feature CSV to existing S5 still trains an 11-feature
+   model: extra memory columns are ignored. This is an integration gap,
+   not evidence the reported S3e evaluation is wrong.
+   Save the selected jury, probe, training descriptors/labels, feature
+   order, k, temperature, threshold and provenance; implement the same
+   descriptor/scoring path in inference and verify mask parity.
+   Training refiner maps need appropriately cross-fitted stacked models;
+   simply using the full S3e memory on its training patients is unsafe.
+
+3. HIGH: exported S5 maps still have no provenance validation.
+   scripts/s5_export_maps.py:90,107-108.
+   Files are reused solely because <case>.npz exists. Changing finder,
+   checker, adapter or jury can leave old maps, or mix old and new maps
+   when continuing a partial export. The new S3d/S3e table manifests do
+   not protect these files. Validate a map-export manifest and completeness
+   before reuse; write maps atomically and record the generating models.
+
+4. MEDIUM: repeated cache invalidation fails on Windows.
+   scripts/s3d_learned_jury.py:79-80.
+   Every invalidation renames to the same .stale destination. On Windows
+   the second invalidation raises FileExistsError. On POSIX it can replace
+   the prior archive, contrary to the stated retention behavior.
+   Reproduced locally in a temporary directory: first invalidation passes,
+   second fails with WinError 183. The new existing cache test itself
+   exercises two invalidations, but is skipped here due to its torch gate.
+   Use unique archive names or a deliberate documented replacement policy.
+
+5. MEDIUM: S6 best-checkpoint repair covers only some resume paths.
+   scripts/s6_freq_council.py:180-186,241-242.
+   Same-folder resume does not check that best.pt exists even when last.pt
+   records a historical best. If no later validation improves, the fallback
+   writes current weights as best while retaining the historical score.
+   External resume into a folder already containing best.pt also retains
+   that destination file without establishing that it belongs to the
+   resumed experiment. Validate historical-best identity on every resume;
+   reject missing/mismatched artifacts rather than silently substituting.
+   This finding is from control-flow inspection, not a torch execution.
+
+6. MEDIUM: missing source cases are silently excluded.
+   scripts/s3e_memory_jury.py:158-161; also S3d/S5/S6 case construction.
+   A partial mounted cache produces a smaller evaluation without an error.
+   S6's missing-map check only examines cases surviving source filtering.
+   Check all requested split IDs first, fail with a missing-case report,
+   and make deliberate --limit subsets explicit in saved results.
+
+7. LOW: small/degenerate memory runs fail without a useful preflight.
+   scripts/s3e_memory_jury.py:83-86,103-109.
+   One patient creates GroupKFold(1); a single-class memory makes the full
+   logistic probe fail even though individual folds have a fallback.
+   Both cases reproduced using the exact extracted scoring functions.
+   Validate number of patients, class coverage and k >= 1 before expensive
+   extraction. Define a consistent fallback only if such runs are supported.
+
+8. MEDIUM: evaluation/inference settings remain inconsistent in S6.
+   scripts/s6_freq_council.py:86,137; scripts/s5_export_maps.py:93.
+   Council best selection defaults to overlap .25; test uses .5.
+   Exported finder maps use .25 on training and .5 on validation/test.
+   Use matched settings for comparisons, or separately document and measure
+   the speed/accuracy tradeoff. This is carried forward, not newly introduced.
+
+9. LOW: notebook shell commands do not enforce successful preceding steps.
+   notebooks/08_s5_s6_freq_council.ipynb and 11_s3e_memory_jury.ipynb.
+   The new nonzero S5 exit is useful, but !python does not itself raise a
+   Python exception that reliably stops Run All. Likewise !pytest and the
+   S3e smoke run are not checked. S6 normally catches missing map files,
+   but stale files can satisfy that check. Use checked subprocess calls
+   and validate output manifests before starting the next stage.
+
+FIXES THAT LOOK CORRECT IN THE INSPECTED FLOW
+-------------------------------------------
+- S2c rejects ineligible real_keep scores and saves epoch 0 as fallback.
+- S4 saves its zero-adapter starting point before training.
+- Council teacher maps are copied after aligned spatial transforms but
+  before map dropout/gamma/noise; training now uses that clean copy.
+- LOCO full-resolution paths follow the official source split.
+- Shared rel20 metrics are separated from candidate-only rel20.
+- The oracle enumerates non-empty candidate subsets, matching the current
+  keep-at-least-one, tumour-positive evaluation setting. An empty-subset
+  oracle would also be needed for general tumour-negative cases.
+- S5 exits its outer split loop when its time budget expires.
+- S6 copies historical best artifacts when resuming into a fresh folder.
+- Memory kNN/probe folds are grouped by cache_id; the synthetic exclusion
+  check produces [0,0,1,1] as expected for the two-patient example.
+
+WHAT THE FIXES DO NOT YET SOLVE
+-----------------------------
+- Clean KD targets still lack SAM crop/coverage validity. Zero outside a
+  checked crop can be interpreted as a confident negative teacher.
+- Finder training maps are still in-sample; memory-only cross-fitting does
+  not make the complete upstream finder pipeline out-of-fold.
+- The frequency council still lacks an identity-preserving jury-mask path,
+  contextual high-frequency residual refinement, and a saved S3e base mask.
+- The S3e script writes Dice summaries, not full predicted masks/HD95/NSD.
+  A higher mean Dice alone does not establish improved boundaries.
+- The log's claim that the council 'learned to copy SegResNet' is a possible
+  explanation, not proven merely by similar mean validation Dice.
+
+VALIDATION PERFORMED
+--------------------
+- python -m pytest -q -rs: 11 passed, 7 skipped.
+  PyTorch is absent; skips include the entire new test_s2c module and the
+  council/Haar/model modules. One skipped module is outputs/_incoming.
+  The project log's 45-pass report was not reproduced in this environment.
+- Parsed active cids/, scripts/, tests/ Python sources: no syntax errors.
+- Executed exact AST-extracted pure cache/memory functions with installed
+  NumPy/pandas/scikit-learn, avoiding unavailable torch imports.
+- Confirmed signature collision, repeat-invalidation failure, grouped
+  memory exclusion, and single-patient/single-class error behavior.
+- No training, GPU inference or full-volume metric rerun was performed.
+- No implementation, notebook, configuration, checkpoint or existing
+  project-log changes made. Only this review document was added.
+
+RECOMMENDED ORDER
+-----------------
+1. Fix cache identity and map provenance so reruns are trustworthy.
+2. Persist/integrate S3e; confirm its inference masks reproduce the table
+   Dice at the validation-selected threshold, then compute full metrics.
+3. Fix resume consistency and required-case preflight checks.
+4. Run the full model-dependent test suite in the Kaggle environment.
+5. Build a small zero-initialized residual refiner around the frozen S3e
+   mask, with shared anatomical context and Haar features. Compare a
+   matched spatial-only refiner before claiming a frequency contribution.
+6. Select changes on validation. Treat the repeatedly inspected official
+   test set cautiously when making final generalization claims.

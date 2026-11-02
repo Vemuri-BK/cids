@@ -1,0 +1,142 @@
+S7 REFINEMENT REVIEW - HEAD 10be598
+================================
+Scope: cids/refine/{model,data}.py, scripts/s7_refine.py, S3f mask
+generation, cids/jury.py, tests/test_refine.py, S7 notebooks.
+Implementation unchanged. Findings distinguish reproduced defects from
+proposed experiments; no accuracy gain is claimed without data.
+
+WHAT IS NOW CORRECT
+- Zero-initialized residual output reproduces M0 at initialization.
+- The sigmoid output gate starts at 0.5, allowing the delta head to learn.
+- Corrections are restricted to an 8 mm band on the 1 mm grid.
+- Haar detail receives anatomical context through gated feature fusion.
+- Spatial comparison uses a similar architecture/parameter budget.
+- Training uses the corrected masked Dice+BCE on editable voxels.
+- Validation includes reference voxels outside the ROI in full Dice.
+- The unrefined baseline is saved as the initial best checkpoint.
+- S3f now exports masks and the memory-jury bundle and checks mask/table
+  Dice parity. Nested jury cross-fitting excludes held-out patients in
+  the normal path; it does not cross-fit the upstream finder.
+
+FIX BEFORE RELYING ON RERUNS
+1. ROI cache has no input identity (data.py:42-46).
+   prepare_case reuses <cid>.npz/json if present, ignoring changed masks,
+   source images/labels and margin. Reproduced with exact extracted
+   function: source mask changed from 512 to 125 voxels, cache still 512.
+   Hash inputs and preprocessing settings; invalidate incompatible ROIs.
+   Verify shapes/grid identity. Compare epoch-zero val Dice against the
+   S3f source metrics, not merely refined-versus-cached-M0 identity.
+
+2. Extracted-mask cache can mix source identity (s7_refine.py:57-90).
+   find_s3f skips ZIP extraction when destination masks/ already exists,
+   but overwrites summary.json with the new source summary. The symlink
+   branch likewise leaves an old destination link in place.
+   Reproduced using two synthetic archives: summary B with mask payload A.
+   Use content-addressed extraction directories, validate source digest
+   and required file set, and reject ambiguous multiple summary matches.
+
+3. Training cannot resume and overwrites earlier best on rerun
+   (s7_refine.py:198-208,239-246).
+   No last.pt, optimizer/scaler/step/RNG restoration, or resume argument.
+   Running in an existing output folder replaces best.pt with identity.
+   Save resumable state atomically and refuse accidental fresh-start
+   overwrite. Add --skip_test and a separate evaluation action: time-budget
+   stops currently proceed directly to official-test evaluation.
+
+4. Augmentation breaks subtraction consistency (data.py:126-127).
+   Independent scaling/shifting of all three channels makes channel 2
+   differ from augmented post minus augmented pre. Reproduced numerically
+   in the exact dataset code, using a lightweight tensor-return stub.
+   Augment pre/post, then recompute their difference. Decide explicitly
+   whether pre/post share intensity transforms. Compare against no jitter.
+
+5. Out-of-fold jury fallback can leak held-out patients (jury.py:114-119).
+   On ValueError, a fold silently uses self.full, which includes its held
+   patients. 'Tests only' is a comment, not a runtime restriction.
+   Fail closed for production mask export; permit a clearly marked smoke
+   fallback only under an explicit option. Save fold lineage with masks.
+   This does not establish that a full-data fold actually failed.
+
+6. Non-multiple-of-four patches are accepted but unsupported.
+   pad_min(size=65) returns 65 for smaller axes, violating its documented
+   shape invariant; the down/up sampling paths require compatible sizes.
+   Validate patch divisibility and round max(size,dimension) up to four.
+   Default patch=64 is unaffected.
+
+IMPROVEMENT EXPERIMENTS, IN ORDER
+A. Measure editable-band headroom before enlarging the network.
+   For each validation case let A = editable band and G = reference mask.
+   Diagnostic best-possible mask under this constraint:
+       M_oracle = (M0 outside A) union (G inside A).
+   Compute full-volume Dice/NSD for M0 and M_oracle. This uses reference
+   labels for an offline upper-bound analysis only, never inference.
+   Compare R = 4, 8, 12 mm, with ROI margin exceeding R. Report remaining
+   reference voxels outside A, fixed false-positive cores, empty M0 cases.
+   Empty M0 cannot be rescued; large false-positive cores cannot be removed
+   under the current constraint. A larger model cannot overcome that limit.
+
+B. Sample actual correctable errors as well as generic boundaries.
+   Current sampling: 75% M0 edge, 25% anywhere in padded ROI.
+   Many sampled voxels are already right or not editable. Pilot a mixture
+   of editable false negatives, editable false positives and ordinary
+   boundary patches; use training labels only for sampling. Preserve
+   ordinary/correct examples so the model also learns to leave masks alone.
+   Log each patch's editable count and correctable error count.
+
+C. Separate mask perturbation from other augmentation.
+   Current perturbation applies to about 80% of nonempty masks. Since
+   upstream finder masks remain in-sample, perturbation is useful but not
+   a guarantee of realistic held-out errors. Provide independent switches,
+   compare clean versus mixed-mask training, and estimate displacement,
+   undersegmentation and oversegmentation patterns from out-of-fold data.
+   Avoid choosing severity using official-test failures.
+
+D. Improve loss/diagnostics only after the above checks.
+   Masked Dice+BCE is a valid baseline; the old dilution bug is fixed.
+   Current loss pools editable voxels across all patches in a patient.
+   Compare per-patch normalization only if large editable regions dominate.
+   Optionally add a small surface/distance auxiliary loss for boundary
+   accuracy, and a penalty for unnecessary changes on already-correct
+   editable training voxels. Ablate each: both can also discourage needed
+   corrections if over-weighted.
+   Log additions/removals classified as helpful or harmful on validation,
+   unchanged cases, residual magnitude, gate values and band-wise errors.
+
+E. Isolate the frequency contribution.
+   Keep existing spatial twin. Add inexpensive ablations: detail disabled,
+   LLL only, and context-detail gate removed. A fixed voxel-unshuffle or
+   fixed alternative orthonormal transform controls for fixed downsampling
+   separately from Haar's frequency structure. These are experimental
+   suggestions, not evidence that any alternative is better.
+   Haar with stride 2 is sensitive to one-voxel phase shifts. Test a small
+   shift-consistency diagnostic before adding costly shift averaging or
+   undecimated transforms. Add multiscale bands only if errors show a
+   missing scale of context/detail.
+
+DO NOT APPLY THESE OLDER SUGGESTIONS BLINDLY
+- The root REFINEMENT_BUGS_AND_FIXES.txt describes loss/call-site issues
+  already fixed at this HEAD. Its numerical gradient attenuation estimates
+  are not general constants; they depend on numerator and denominator.
+- Do not initialize delta nonzero just to give the output gate first-step
+  gradients: that loses exact starting-mask identity. Zero gate gradient
+  at step zero is expected when delta=0. Changing gate bias cannot change
+  that product. Keep the identity design and check learning after updates.
+- Raising base logit from ln(3) to 4 is unnecessary to fix the now-masked
+  loss. It increases the correction needed to flip a voxel: at gate=.5,
+  delta must exceed ~8 rather than ~2.20 in magnitude.
+- Frozen outside-band probabilities are anchor scores, not calibrated
+  tumor probabilities. Evaluate binary masks accordingly.
+
+VERIFICATION
+- 19 tests passed, 8 modules skipped: PyTorch absent, including refinement
+  tests. Initial pytest invocation hit a pre-existing temporary-directory
+  permission issue; rerun with a fresh workspace basetemp passed.
+- Active refinement/S3f source parsed successfully.
+- Exact AST-extracted NumPy/SciPy functions reproduced stale ROI reuse,
+  stale ZIP extraction, subtraction inconsistency and padding edge case.
+  These checks do not execute neural-network forward/backward or MONAI.
+- No full GPU training or clinical performance evaluation was run.
+
+Recommended immediate sequence: fix provenance and resume/evaluation
+controls; measure band oracle; run matched spatial/frequency baselines;
+then test consistent intensity augmentation and error-aware sampling.

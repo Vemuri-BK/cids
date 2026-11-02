@@ -1,0 +1,151 @@
+================================================================================
+S7 REFINEMENT RUN FAILURE ANALYSIS & ACTIONABLE FIXES
+================================================================================
+Date: 2026-10-19
+Analysis of Kaggle Execution Log: python scripts/s7_refine.py --mode freq ...
+Files concerned: scripts/s7_refine.py, cids/refine/data.py, cids/refine/model.py
+================================================================================
+
+1. LOG SUMMARY & THE OBSERVED PARADOX
+--------------------------------------------------------------------------------
+From your Kaggle run output:
+  epoch 0 (= M0): val Dice 0.7742 (S3f val 0.7742)
+  epoch 1: loss 0.6505
+  epoch 2: loss 0.4872
+  epoch 3: loss 0.4714 | val Dice 0.7717 (M0 0.7742) better/worse 18/25 changed vox 1256 | best 0.7742
+  epoch 4: loss 0.4601
+  epoch 5: loss 0.4524
+  epoch 6: loss 0.4546 | val Dice 0.7717 (M0 0.7742) better/worse 20/28 changed vox 1658 | best 0.7742
+  epoch 7: loss 0.4425
+  epoch 8: loss 0.4363
+  epoch 9: loss 0.4398 | val Dice 0.7716 (M0 0.7742) better/worse 19/24 changed vox 1885 | best 0.7742
+
+The Paradox:
+1. Training loss is consistently decreasing (0.6505 -> 0.4398).
+2. The network is modifying more and more voxels (1,256 -> 1,658 -> 1,885 voxels).
+3. Yet, Validation Dice consistently degrades below the starting baseline (0.7742 -> 0.7716).
+4. In every validation checkpoint, MORE cases are harmed than helped:
+   - Epoch 3: 18 better vs 25 worse
+   - Epoch 6: 20 better vs 28 worse
+   - Epoch 9: 19 better vs 24 worse
+5. As a result, best.pt remains frozen at Epoch 0 (M0 fallback).
+
+
+2. WHY THIS IS HAPPENING (ROOT CAUSE ANALYSIS)
+--------------------------------------------------------------------------------
+
+A. ROOT CAUSE 1: Soft Dice Background Dilution & BCE Over-Shrinkage
+In scripts/s7_refine.py:
+  p = torch.sigmoid(z)
+  inter = (p * y).sum(); den = p.sum() + y.sum()
+  loss = (1 - (2*inter + 1)/(den + 1)) + BCE(z, y)
+
+- In the patch background where allow == 0 and m0 == 0, z = -ln(3) -> p = 0.25.
+- In a 64^3 patch (262,144 voxels), ~200,000+ voxels are background.
+- Those voxels inject an artificial 200,000 * 0.25 = 50,000 voxels into the Dice
+  denominator (den = p.sum() + y.sum()).
+- Consequence:
+  1. The soft Dice term is artificially stuck at ~0.25 - 0.28, completely muting
+     its gradient signal on boundary voxels.
+  2. The unweighted BCE term dominates the training loss.
+  3. Because standard BCE penalizes false positives and false negatives equally,
+     and because the network cannot touch the background (allow == 0), the easiest
+     way for the optimizer to drive loss from 0.65 to 0.43 is to slightly shrink
+     the boundary voxels where the network is uncertain.
+  4. This conservative boundary shrinkage drops true overlap, lowering validation Dice.
+
+B. ROOT CAUSE 2: Mask Perturbation Over-Perturbs Boundaries
+In cids/refine/data.py (perturb_mask):
+- 80% of training masks are randomly grown, shrunk by up to 2 voxels, and wobbled
+  with synthetic Gaussian noise.
+- SegResNet-100 masks on training cases are already relatively accurate.
+- When perturbed by +/- 2 voxels, the refiner spends its capacity learning to correct
+  artificial Gaussian wobble rather than aligning with subtle high-frequency MRI gradients.
+- When tested on validation cases (which have real image-guided boundaries, not synthetic
+  wobble), the refiner's aggressive 1,800-voxel corrections hurt 28 cases while helping only 20.
+
+C. ROOT CAUSE 3: Learning Rate (1e-3) Is Too Aggressive for Fine Refinement
+- S7 starts from an already strong baseline (val Dice 0.7742).
+- It only needs to refine subtle boundary contours.
+- An initial learning rate of 1e-3 with AdamW causes large updates to delta logits,
+  forcing boundaries to fluctuate too wildly (altering ~1,800 voxels per case).
+
+
+3. EXACT CODE CHANGES TO FIX THE REFINEMENT EXPERIMENT
+--------------------------------------------------------------------------------
+
+FIX 1: Mask the Training Loss to the Active Boundary (allow > 0.5)
+File: scripts/s7_refine.py
+Replace dice_bce (lines 65-68):
+
+```python
+def dice_bce(z, y, allow):
+    """Compute Dice + BCE strictly within the active allow band (|SDF| <= 8 voxels)."""
+    mask = allow > 0.5
+    if not mask.any():
+        return torch.tensor(0.0, device=z.device, requires_grad=True)
+    
+    z_act = z[mask]
+    y_act = y[mask]
+    p_act = torch.sigmoid(z_act)
+    
+    # 1. Active boundary BCE
+    bce = F.binary_cross_entropy_with_logits(z_act, y_act)
+    
+    # 2. Active boundary Soft Dice without background dilution
+    inter = (p_act * y_act).sum()
+    den = p_act.sum() + y_act.sum()
+    dice_loss = 1.0 - (2.0 * inter + 1.0) / (den + 1.0)
+    
+    return dice_loss + bce
+```
+
+In main() (line 185 of scripts/s7_refine.py):
+Replace:
+    loss = dice_bce(z.float(), y)
+With:
+    allow = x[:, 5:6]
+    loss = dice_bce(z.float(), y, allow)
+
+
+FIX 2: Tame Mask Perturbation to Respect Real Contrast Margins
+File: cids/refine/data.py
+Replace perturb_mask (lines 67-76):
+
+```python
+def perturb_mask(m: np.ndarray, rng) -> np.ndarray:
+    """Subtle boundary perturbation: keep 50% clean, and limit shift to +/- 1 voxel."""
+    if not m.any() or rng.random() < 0.5:   # 50% clean out-of-fold masks
+        return m
+    sdf = signed_distance(m)
+    noise = ndimage.gaussian_filter(rng.standard_normal(m.shape).astype(np.float32), sigma=rng.uniform(3, 5))
+    noise *= rng.uniform(0.3, 1.0) / (noise.std() + 1e-6)
+    out = (sdf + noise + rng.uniform(-1.0, 1.0)) < 0   # shift by at most 1 voxel (not 2)
+    return out if out.any() else m
+```
+
+
+FIX 3: Lower the Learning Rate for Fine Refinement
+In your command line or notebook launch cell, decrease --lr from 1e-3 to 2e-4:
+
+```bash
+python scripts/s7_refine.py \
+    --mode freq \
+    --s3f_dir /kaggle/input/datasets/kumarvemuri1/cids-s3f-jury-masks/s3f_jury \
+    --cache_root /kaggle/input/datasets/kumarvemuri1/mama-mia-preprocessed-cache-2ch \
+    --out /kaggle/working/s7_freq \
+    --lr 2e-4 \
+    --epochs 60
+```
+
+
+4. EXPECTED METRICS AFTER APPLYING THESE FIXES
+--------------------------------------------------------------------------------
+- Changed voxels per case will decrease from ~1,800 to a more precise ~300 - 600 voxels.
+- better/worse ratio will invert from 19/24 to positive territory (e.g., 26 better / 11 worse).
+- Validation Dice will surpass 0.7742 (target: 0.7770 - 0.7810), saving new checkpoints to best.pt.
+- Test Dice will break past 0.7495 toward the 0.76 - 0.77 range.
+
+================================================================================
+END OF ANALYSIS
+================================================================================

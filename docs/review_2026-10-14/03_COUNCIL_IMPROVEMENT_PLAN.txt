@@ -1,0 +1,250 @@
+PROPOSED COUNCIL CHANGES AND EXPERIMENT ORDER
+2026-10-14. PROPOSALS ONLY. No code, notebooks, weights, or configuration changed.
+
+OBJECTIVE
+
+Beat the current best automatic S3d system, reported as validation Dice 0.766
+and test Dice 0.735. Select changes on validation. A credible improvement also
+needs acceptable missed-tumour counts, surface metrics, and collection results.
+There is no evidence yet to promise a particular gain or guarantee >0.735.
+
+MY MAIN RECOMMENDATION
+
+Keep S3d as the global candidate selector. Let the frequency council learn
+local corrections to its accepted mask, rather than relearn segmentation and
+candidate selection from scratch. First disable KD to establish whether the
+architecture can add value without possibly conflicting soft supervision.
+
+Current:
+ image bands + finder map + weighted checker map
+ -> four fresh segmenters -> gate -> replace the original segmentation
+
+Proposed:
+ frozen finder + checker + jury -> exact S3d mask and candidate evidence
+ image + frequency groups + separate evidence maps
+ -> four correction experts -> residual gate -> refine the S3d mask
+
+The existing S4 adapter already demonstrates zero-initialized residual design,
+but the current S6 council does not use a residual baseline.
+
+A. CHEAP DIAGNOSTICS BEFORE TRAINING A REPLACEMENT
+
+1. Preserve the stopped run's best.pt, last.pt, config.json, train_log.csv,
+   val_best_per_case.csv, and map directory. The source has a new-directory
+   resume bug: it does not carry the historical best weights across. The log
+   ends after the epoch-42 print; it does not prove that its checkpoint write
+   finished. Inspect the stored checkpoint epoch if resuming later.
+2. Evaluate the best checkpoint on all 120 validation cases with overlap 0.5
+   and the same postprocessing protocol intended for final evaluation.
+3. Include actual S3d predictions on those patients. Measure paired Dice deltas,
+   false-positive and false-negative voxels, predicted/GT volume ratio, missed
+   tumours, HD95 with valid-case counts, and NSD. Stratify by collection and
+   tumour size. Review worst losses and best gains using the same slices.
+4. Match raw/rel20 processing for all four experts and the council. Compare
+   learned gate with uniform averaging and the best individual expert.
+5. On training data, measure how many GT-positive voxels get KD toward <0.5,
+   how many agreeing voxels are background, and the rate of absent/dropped
+   teacher evidence. Do not infer these counts from average KD loss.
+6. Run a small validation-only baseline/council blend grid, including the exact
+   S3d endpoint. This tests complementary errors without retraining. Select one
+   global setting on validation; do not choose per-case weights using GT.
+   Tune no thresholds using the test-map table in the attachment.
+
+B. LOW-COST CAUSAL ABLATIONS USING THE EXISTING MAPS
+
+B1. Train the SAME council from scratch with --no_teachers, keeping all other
+    settings fixed. Existing code supports this. It isolates KD; maps remain
+    inputs. Simply turning off KD during evaluation changes nothing.
+B2. Compare B1 with map augmentation on versus off. This isolates whether map
+    dropout/noise/gamma harms learning. Turning off both KD and augmentation in
+    only one comparison would not tell which mattered.
+B3. If KD helps, restore it using uncorrupted, geometrically aligned teacher
+    maps plus validity masks. Retain augmented versions only as model inputs.
+    Keep clean copies through flips/crops; intensity corruption should not
+    change target teacher probabilities.
+
+Do not run a huge hyperparameter grid. Use fixed seeds and staged comparisons.
+Existing quantized maps are enough for B1/B2, but lack checker coverage and the
+raw-versus-jury decomposition needed for a complete B3 implementation.
+
+C. EXPORT THE INFORMATION THAT THE STRONGEST PIPELINE ACTUALLY USES
+
+Extend S5 conceptually to save:
+ - original finder probability;
+ - exact S3d final mask, including threshold=0.60 and its fallback behavior;
+ - candidate IDs and per-candidate jury scores/rank/relative size;
+ - raw SAM probability and crop-coverage mask;
+ - jury-weighted SAM probability as an optional ADDITIONAL feature;
+ - optional signed distance to the S3d boundary;
+ - manifest with checkpoint hashes, split, overlap, jury model/fold, and schema.
+
+Do not replace raw SAM evidence with its product with jury score. A candidate
+score of 0.4 multiplied by even SAM probability 1.0 can never pass 0.5. The
+product can be a useful feature, but it is not S3d's keep/drop-and-fallback rule.
+If overlapping candidate maps are combined by maximum, candidate identity is
+also lost. Store candidate-level evidence or candidate-specific crops when
+global selection/ranking is needed later.
+
+Training S3d masks should use held-out jury predictions, not jury probabilities
+from a model fitted to the same candidate labels. Additionally, cross-fitting
+the jury alone leaves the finder (and checker) in-sample. The strongest protocol
+uses fold-specific upstream models to generate held-out maps. This is expensive.
+At minimum, explicitly evaluate out-of-fold finder maps and record remaining
+checker exposure; do not call jury-only cross-fitting an out-of-fold pipeline.
+
+D. RESIDUAL FREQUENCY COUNCIL (PRIORITY ARCHITECTURE EXPERIMENT)
+
+Let M0 be the exact S3d binary mask. Construct baseline probabilities P0 with
+threshold(P0,0.5)=M0; for example 0.75 inside and 0.25 outside, or a continuous
+finder-derived map constrained to the corresponding side of 0.5. These are
+baseline scores, not calibrated probabilities. Avoid extremely saturated
+0/1 logits that make correction difficult.
+
+Define:
+ z0 = logit(P0)
+ delta_k = independently learned correction from expert k
+ w_k = voxel-wise softmax gate
+ z_final = z0 + sum_k(w_k * delta_k)
+
+Zero-initialize each correction head. At initialization delta_k=0, so the
+thresholded output equals the actual S3d mask, including its fallback. Verify
+this after full-volume sliding-window inference, padding, and output handling.
+Do NOT append rel20 automatically: it can alter S3d's mask and destroy exact
+baseline equivalence. Evaluate any new postprocessing separately on validation.
+
+Supervise sigmoid(z_final) against GT. If retaining per-expert supervision,
+apply it to sigmoid(z0+delta_k), not to delta_k alone as a standalone mask.
+Start with a modest auxiliary weight (e.g. 0.1 as an initial hypothesis), not
+an assumption that the current 0.5 is optimal. Use no KD in the first trial.
+Regularize unnecessarily large corrections only lightly; making preservation
+too strong prevents repairing genuine S3d errors. Track changed voxels and
+whether each change fixes or introduces an error on validation.
+
+Initial spatial scope: candidate-centred crops and a modest correction region
+around the predicted boundary/candidates. A margin such as 8-16 mm is only a
+starting experimental range, not an established optimum. This limits new
+distant false positives, but also prevents recovery of remote missed tumours.
+Use GT only to supervise/sample TRAINING errors, never to position validation
+or test crops. Retain GT-positive training samples even if S3d misses them.
+
+Two routes address different errors:
+ - boundary correction around accepted candidates;
+ - candidate rescue/reranking among all proposed candidates, including rejected
+   ones, when global context indicates the original jury chose incorrectly.
+
+Boundary-only refinement cannot recover a tumour with no nearby proposal.
+The project log's statement that 15/17 S3d misses had a true candidate available
+motivates studying candidate rescue, but it came from test analysis: confirm
+the mechanism on validation before designing or selecting the rescue rule.
+
+E. GIVE FREQUENCY EXPERTS USEFUL CONTEXT WITHOUT ERASING THEIR ROLES
+
+Current strict split leaves E2/E3/E4 without the image's low-frequency appearance.
+Each can rely on maps at both half and full resolution. Independent parameters
+do not guarantee independent errors or specialized behavior.
+
+Try a common low-resolution image/LLL CONTEXT INPUT, processed by separate stems
+inside each expert, alongside its assigned bands. Weights can remain fully
+independent. This changes the strict band-exclusive design into band-specialized
+experts; retain the original strict split as an explicit ablation.
+
+Alternative with clearer roles: LLL predicts broad shape correction, one-axis
+bands emphasize edges, two-axis bands refine local structure, and HHH has a
+small or optional texture-correction role. Do not hardcode physiological claims
+about these groups without ablations. Give all experts enough context to know
+whether an edge is tumour, vessel, or chest wall.
+
+Use band ablations and pairwise error correlations. Do not increase HHH weight
+or force all weights to 0.25 because one logged region has unbalanced usage.
+The gate moved from HHH dominance at epoch 5 to E2/E3 at epoch 40; that is not
+evidence of a permanently collapsed gate.
+
+F. SUPERVISION AND SAMPLING THAT TARGET THE REMAINING ERRORS
+
+If reintroducing KD:
+ - use clean teacher probabilities, coverage, and availability masks;
+ - require compatible binary decisions and reasonable confidence, not just
+   absolute difference <0.5;
+ - separate foreground/background aggregation to prevent easy background from
+   dominating the useful teacher signal;
+ - during training, optionally exclude confidently wrong teacher targets using
+   GT; this is a training reliability filter, not inference-time GT access;
+ - ramp a small KD coefficient only after the supervised refiner is stable.
+
+A prospective starting hypothesis is lambda_kd 0.05-0.1 with a short ramp.
+These values are suggestions for a small validation experiment, not evidence
+that they beat 0.3. KD could be unnecessary because dense GT already exists.
+
+Example error-aware patch mixture, to be validated rather than assumed best:
+ 40% tumour/boundary patches;
+ 25% false-positive candidate patches;
+ 20% missed-tumour or teacher-disagreement patches;
+ 15% random body/background patches.
+Use training-only predictions, fallback when strata are empty, and log the
+actual sampled distribution. Do not discard all easy negatives. Include small
+tumours and collection-aware sampling without using test-derived thresholds.
+
+Augment pre/post channels consistently and recompute post-pre. If teacher maps
+are corrupted, keep clean targets and validity masks. Geometric transforms
+must apply identically to images, labels, all maps, and candidate masks.
+
+G. EVALUATION AND EXPERIMENT MATRIX
+
+Baseline R0: unchanged S3d, same 120 validation cases and final inference setup.
+R1: current council best checkpoint, reevaluated at overlap 0.5.
+R2: current architecture, KD off, otherwise matched to its training protocol.
+R3: R2 with map augmentation off (small diagnostic, not automatic final choice).
+R4: single residual image/map refiner on S3d, KD off.
+R5: four-band residual council on S3d, KD off, same input/evaluation contract.
+R6: best residual design with corrected KD, one controlled comparison.
+R7: context-enriched frequency specialists, only if R5 adds useful signal.
+
+For architectural claims, compare both practical compute and roughly matched
+parameter budgets; four experts versus a tiny single model is not a clean test
+of the frequency council itself. Do not combine all proposed changes into one
+run before determining which helps.
+
+Go/no-go: beat the SAME-protocol S3d validation result with paired per-case
+improvements, examine sensitivity/misses and collection regressions, then
+repeat the promising setting across seeds. Use patient-level paired bootstrap
+intervals, not candidate-level resampling that treats patient blobs as independent.
+Prespecify test evaluation and report the exploratory use of previous test
+results. Do not infer a test Dice from validation Dice or promise a target gain.
+
+H. WHAT I WOULD NOT PRIORITIZE YET
+
+- Blindly extending the existing run to 100+ epochs.
+- Increasing gate balance simply to make weights equal.
+- Adding acquisition metadata before showing that a residual image-only
+  council beats the strongest baseline. Original acquisition geometry is needed;
+  the resampled 1-mm cache spacing alone contains no acquisition variation.
+- Adding a transformer or substantially enlarging all experts before a simple
+  residual refiner comparison.
+- Treating the weighted checker's poor standalone Dice as proof SAM is useless.
+- Using the four-case smoke test as an estimate of final performance.
+
+PRACTICAL NEXT CHOICE
+
+For the fastest informative run: unchanged council with KD off, plus matched
+validation of the stopped checkpoint and S3d.
+For the most promising architectural direction: S3d-preserving residual
+frequency council, separate raw checker/jury/coverage features, and training
+patches concentrated on the errors the baseline actually makes.
+For a trustworthy final claim: out-of-fold upstream evidence, matched evaluation,
+multiple seeds, and a held-out confirmation. None guarantees a performance gain.
+
+EXTERNAL CONTEXT (PRIMARY SOURCES; NOT PROOF OF A CIDS GAIN)
+
+1. Isensee et al., nnU-Net Revisited: A Call for Rigorous Validation in 3D
+   Medical Image Segmentation (2024):
+   https://arxiv.org/abs/2404.09556
+   Supports comparing well-configured baselines and controlling compute before
+   attributing gains to architectural novelty. It does not evaluate this council.
+2. scikit-learn StackingClassifier documentation:
+   https://scikit-learn.org/1.2/modules/generated/sklearn.ensemble.StackingClassifier.html
+   Explicitly notes the overfitting risk of fitting a stack on base predictions
+   from the same training data. Applying this concern to dense CIDS maps is an
+   inference from the analogous stacking setup, not an observed causal diagnosis.
+
+All specific CIDS redesigns above are proposals derived from its source and
+provided run, and must be validated experimentally before claiming improvement.

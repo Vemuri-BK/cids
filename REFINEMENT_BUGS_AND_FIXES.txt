@@ -1,0 +1,180 @@
+================================================================================
+CIDS S7 REFINEMENT EXPERIMENT: BUGS, ROOT CAUSE ANALYSIS & REQUIRED FIXES
+Date: 2026-10-19
+Scope: cids/refine/model.py, cids/refine/data.py, scripts/s7_refine.py,
+       tests/test_refine.py, notebooks/13_s7_refine_freq.ipynb, 14_s7_refine_spatial.ipynb
+================================================================================
+
+1. CRITICAL BUG: SOFT DICE BACKGROUND DILUTION IN TRAINING LOSS
+--------------------------------------------------------------------------------
+File: scripts/s7_refine.py (lines 65-68, 185) & cids/refine/model.py (lines 29, 81)
+
+Problem & Mathematical Mechanism:
+- In BoundaryRefiner (cids/refine/model.py):
+    z0 = (2 * m0 - 1) * LOG3, where LOG3 = ln(3.0) ~ 1.0986
+    z_final = z0 + allow * sigmoid(gate) * delta
+- For any voxel outside the allow band (allow == 0):
+    If m0 == 0 (exterior background): z = -ln(3) -> p = sigmoid(-ln 3) = 0.25
+    If m0 == 1 (tumor interior):      z = +ln(3) -> p = sigmoid(+ln 3) = 0.75
+- In a training patch of size 64^3 (262,144 voxels), typically 200,000+ voxels
+  are background voxels with allow == 0 and m0 == 0.
+- In dice_bce(z, y):
+    p = torch.sigmoid(z)
+    den = p.sum((1, 2, 3, 4)) + y.sum((1, 2, 3, 4))
+- Every inactive background voxel contributes 0.25 to p.sum(), adding an artificial
+  200,000 * 0.25 = 50,000 VOXELS to the denominator!
+- Meanwhile, the true tumor foreground (y == 1) is typically only ~5,000 to 12,000 voxels.
+
+Consequences:
+1. Even if the network boundary prediction is 100% mathematically perfect,
+   Soft Dice = 2 * inter / den will evaluate to only ~0.25 - 0.28.
+   The Dice loss term (1 - Soft Dice) is permanently pegged near ~0.72 - 0.75.
+2. The gradient of the Soft Dice loss with respect to p:
+   d(Dice_Loss)/dp scales with 1 / (den + 1)^2 ~ 1 / (65,000)^2.
+   The true gradient signal guiding boundary refinement is attenuated by 15x to 50x.
+3. The model has zero gradient on those 200,000 background voxels because allow == 0,
+   meaning the network is forced to minimize a loss it has no mathematical capacity to satisfy.
+
+Why Existing Tests Did Not Catch This:
+In tests/test_refine.py (line 66), the unit test trained using:
+  loss = torch.nn.functional.binary_cross_entropy_with_logits(z, b["y"])
+The unit test omitted dice_bce entirely and only used raw BCE, masking this critical bug.
+
+
+2. SECONDARY BUG: BCE GRADIENT ATTENUATION ACROSS INACTIVE VOXELS
+--------------------------------------------------------------------------------
+File: scripts/s7_refine.py (line 68)
+
+Problem:
+In F.binary_cross_entropy_with_logits(z, y):
+- Every inactive background voxel (allow == 0, m0 == 0, y == 0) incurs a constant penalty:
+    -ln(1 - 0.25) = -ln(0.75) ~ 0.2877
+- Every inactive tumor core voxel (allow == 0, m0 == 1, y == 1) incurs the same penalty:
+    -ln(0.75) ~ 0.2877
+- Because BCE averages over all 262,144 voxels in the patch, but ~80% of voxels are
+  inactive (gradient zero with respect to weights), the active boundary learning rate
+  is diluted by a factor of ~5x.
+
+
+3. MISSING ALLOW TENSOR IN TRAINING LOSS CALL
+--------------------------------------------------------------------------------
+File: scripts/s7_refine.py (line 185)
+
+Problem:
+- The input tensor x contains 6 channels: [img (3 ch), m0 (1 ch), sdf (1 ch), allow (1 ch)].
+- In line 185:
+    loss = dice_bce(z.float(), y)
+- The loss function is never passed the allow tensor (x[:, 5:6]).
+- Consequently, dice_bce cannot mask the computation to active boundary voxels.
+
+
+4. INITIAL GRADIENT ON SPATIAL GATE
+--------------------------------------------------------------------------------
+File: cids/refine/model.py (lines 61-62, 82)
+
+Observation:
+- Both delta and gate convs are zero-initialized:
+    z = z0 + allow * sigmoid(gate(u1)) * delta(u1)
+- At step 0:
+    delta = 0, gate = 0 -> sigmoid(gate) = 0.5
+    d(z)/d(delta) = allow * 0.5 != 0   (delta starts learning immediately)
+    d(z)/d(gate)  = allow * 0.25 * delta = 0  (gate has zero gradient at step 0)
+- Delta begins moving immediately on step 1, which in turn unlocks gradients for gate.
+  While not a fatal bug, initializing delta with a small non-zero scale or calibrating
+  gate bias allows joint learning from step 1.
+
+
+5. BOUNDARY CONFINEMENT PROPERTY ON LARGE FALSE POSITIVES
+--------------------------------------------------------------------------------
+File: cids/refine/model.py (line 82) & cids/refine/data.py (line 23)
+
+Observation:
+- R_ALLOW is set to 8.0 voxels (8 mm).
+- If the upstream memory jury made a mistake and retained a large false-positive
+  connected component (e.g. an enhancing lymph node with radius > 8 mm):
+  The core voxels have allow == 0 and z0 = +ln(3) > 0.
+- The boundary refiner CANNOT delete the core of a large false-positive blob; it can
+  only trim up to 8 mm from its perimeter.
+- Conclusion: The refiner is strictly a boundary tuner; it does not replace candidate verification.
+
+
+6. NOTEBOOK SHELL COMMAND IMPORT SAFETY
+--------------------------------------------------------------------------------
+File: notebooks/13_s7_refine_freq.ipynb & 14_s7_refine_spatial.ipynb (cell 4)
+
+Problem:
+- Cell 4 executes:
+    sh('pytest -q tests')
+- In Python subprocess environments, pytest invoked directly may fail with:
+    ModuleNotFoundError: No module named 'cids'
+  because the working directory is not automatically prepended to sys.path.
+- Because sh() enforces strict exit codes, any pytest import failure aborts the notebook.
+- Fix: Replace with `python -m pytest -q tests`.
+
+
+================================================================================
+REQUIRED CODE CHANGES
+================================================================================
+
+A. FIX IN scripts/s7_refine.py
+--------------------------------------------------------------------------------
+Replace the dice_bce definition (lines 65-68) with a masked boundary loss:
+
+def dice_bce(z, y, allow):
+    """Compute Dice + BCE only within the active allow band (|SDF| <= 8 voxels)."""
+    mask = allow > 0.5
+    if not mask.any():
+        return torch.tensor(0.0, device=z.device, requires_grad=True)
+    z_act = z[mask]
+    y_act = y[mask]
+    p_act = torch.sigmoid(z_act)
+    bce = F.binary_cross_entropy_with_logits(z_act, y_act)
+    inter = (p_act * y_act).sum()
+    den = p_act.sum() + y_act.sum()
+    dice = 1.0 - (2.0 * inter + 1.0) / (den + 1.0)
+    return dice + bce
+
+In main() training loop (line 185):
+Replace:
+    loss = dice_bce(z.float(), y)
+With:
+    allow = x[:, 5:6]
+    loss = dice_bce(z.float(), y, allow)
+
+
+B. (ALTERNATIVE/COMPLEMENTARY) FIX IN cids/refine/model.py
+--------------------------------------------------------------------------------
+Adjust base logit z0 so that inactive background voxels have p ~ 0 instead of 0.25:
+
+Line 29:
+    BASE_LOGIT = 4.0  # sigmoid(4.0) = 0.982, sigmoid(-4.0) = 0.018
+
+Line 81:
+    z0 = (2 * m0 - 1) * BASE_LOGIT
+
+* Identity check (z > 0) == m0 remains 100% exact.
+* Inactive background voxels contribute only ~3,600 voxels instead of ~50,000 voxels.
+
+
+C. FIX IN tests/test_refine.py
+--------------------------------------------------------------------------------
+In test_roi_counts_and_training_learns_to_grow() (line 66):
+Replace:
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(z, b["y"])
+With:
+    from scripts.s7_refine import dice_bce
+    allow = b["x"][:, 5:6]
+    loss = dice_bce(z, b["y"], allow)
+
+
+D. FIX IN notebooks/13_s7_refine_freq.ipynb & 14_s7_refine_spatial.ipynb
+--------------------------------------------------------------------------------
+In Cell 4:
+Replace:
+    sh('pytest -q tests')
+With:
+    sh('python -m pytest -q tests')
+
+================================================================================
+END OF AUDIT
+================================================================================
