@@ -235,10 +235,12 @@ def curve_wins(cv, base, lo=0.2, hi=0.8, splits=("test", "val")):
     return out
 
 
-def uncertainty_resolution(df: pd.DataFrame, p_by_var: dict, split: str, thresh: float = 0.25) -> list[dict]:
+def uncertainty_resolution(df: pd.DataFrame, p_by_var: dict, split: str, thresh: float = 0.25,
+                           n_boot: int = 2000, seed: int = 0) -> list[dict]:
     """Read-only regime analysis (does not alter any model): stratify real candidates into
-      1. Confidence-agreement gap (|seg_prob_mean - agree| < thresh vs >= thresh)
-      2. Direct Finder-Checker mask agreement (Dice agree >= 0.50 vs agree < 0.50)."""
+      1. Confidence-agreement gap (|seg_prob_mean - agree| < thresh vs >= thresh: low_gap / high_gap)
+      2. Direct Finder-Checker mask agreement (Dice agree >= 0.50 vs agree < 0.50)
+    with patient-clustered 2,000-sample bootstrap 95% CIs on ROC-AUC."""
     from sklearn.metrics import roc_auc_score
     r = (df.k >= 0).to_numpy()
     if not r.any() or not ({"seg_prob_mean", "agree"} <= set(df)):
@@ -248,8 +250,8 @@ def uncertainty_resolution(df: pd.DataFrame, p_by_var: dict, split: str, thresh:
     gap = (sub.seg_prob_mean - sub.agree).abs().to_numpy() >= thresh
     disagree_mask = sub.agree.to_numpy() < 0.50
     regimes = [
-        ("low_uncertainty", ~gap),
-        ("high_uncertainty", gap),
+        ("low_gap", ~gap),
+        ("high_gap", gap),
         ("high_mask_agree_ge05", ~disagree_mask),
         ("low_mask_agree_lt05", disagree_mask),
         ("all_candidates", np.ones_like(gap)),
@@ -259,12 +261,26 @@ def uncertainty_resolution(df: pd.DataFrame, p_by_var: dict, split: str, thresh:
         if not mask.any():
             continue
         ym = y[mask]
+        pid = sub.cache_id.to_numpy()[mask]
+        pats, inv = np.unique(pid, return_inverse=True)
+        by_pat = [np.where(inv == i)[0] for i in range(len(pats))]
+        rng = np.random.default_rng(seed)
+        boot_picks = [ np.concatenate([by_pat[i] for i in rng.integers(0, len(pats), len(pats))])
+                       for _ in range(n_boot) ]
         for vname, p in p_by_var.items():
             pm = p[r][mask]
             a = float(roc_auc_score(ym, pm)) if 0 < ym.sum() < len(ym) else None
-            acc = float(((pm >= 0.5).astype(int) == ym).mean())
-            rows.append(dict(split=split, regime=regime, n_cand=int(mask.sum()), pos_rate=float(ym.mean()),
-                             variant=vname, auc=a, acc_at_05=acc))
+            boots = []
+            if a is not None:
+                for idx in boot_picks:
+                    yb, pb = ym[idx], pm[idx]
+                    if 0 < yb.sum() < len(yb):
+                        boots.append(roc_auc_score(yb, pb))
+            lo, hi = (np.percentile(boots, [2.5, 97.5]) if boots else (np.nan, np.nan))
+            rows.append(dict(split=split, regime=regime, n_cand=int(mask.sum()), n_patients=int(len(pats)),
+                             pos_rate=float(ym.mean()), variant=vname, auc=a,
+                             auc_ci95_lo=float(lo) if np.isfinite(lo) else None,
+                             auc_ci95_hi=float(hi) if np.isfinite(hi) else None))
     return rows
 
 
