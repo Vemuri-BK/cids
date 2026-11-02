@@ -43,6 +43,14 @@ RAD_EXTRACTED = RAD_SHAPE + RAD_CONTRAST + RAD_TEXTURE + CENTRE     # columns wr
 REL = ["rel_seg_prob", "rel_sam_soft", "rel_agree", "rel_mem_knn", "rel_ring_cnr"]
 GROUPS = dict(shape=RAD_SHAPE, contrast=RAD_CONTRAST, texture=RAD_TEXTURE, position=RAD_POS, relative=REL)
 
+# Pruned IBSI feature subset (drops duplicate roundness rad_sphericity/rad_flatness, noisy rad_ring_ratio/rad_sub_entropy)
+RAD_SHAPE_CLEAN = ["rad_elongation", "rad_solidity", "rad_surf_to_vol"]
+RAD_CONTRAST_CLEAN = ["rad_ring_cnr", "rad_rim_minus_core", "rad_local_z_sub", "rad_rel_enh"]
+RAD_TEXTURE_CLEAN = ["rad_sub_iqr", "rad_sub_skew", "rad_edge_sharpness"]
+RAD_CLEAN = RAD_SHAPE_CLEAN + RAD_CONTRAST_CLEAN + RAD_TEXTURE_CLEAN + RAD_POS
+RAD_MEM = ["rad_mem_knn", "rad_mem_probe"]
+UNC = ["unc_disagree", "unc_vol_gap"]
+
 RING_MM, RIM_MM, BOX_MM = 4.0, 2.0, 15.0
 MARGIN = int(BOX_MM) + 2             # crop margin around the candidate's bounding box
 EPS = 0.01
@@ -123,7 +131,7 @@ def texture_features(post: np.ndarray, sub: np.ndarray, comp: np.ndarray, ring: 
     return dict(
         rad_sub_entropy=float(-(p * np.log2(p)).sum()),
         rad_sub_iqr=float(np.subtract(*np.percentile(v, [75, 25]))),
-        rad_sub_skew=float(skew(v)) if len(v) > 2 and v.std() > 0 else 0.0,
+        rad_sub_skew=float(np.clip(skew(v), -5.0, 5.0)) if len(v) > 2 and v.std() > 0.02 else 0.0,
         rad_edge_sharpness=(_mean(g, edge) + EPS) / (_mean(g, ring) + EPS),
     )
 
@@ -173,6 +181,23 @@ def add_position(df: pd.DataFrame) -> pd.DataFrame:
     anchor = order.groupby("cache_id")[CENTRE].first()
     a = anchor.reindex(real.cache_id).to_numpy()
     df.loc[r, "rad_dist_to_dom_mm"] = np.linalg.norm(real[CENTRE].to_numpy() - a, axis=1)
+    if "rad_sub_skew" in df:
+        df.loc[r, "rad_sub_skew"] = df.loc[r, "rad_sub_skew"].clip(-5.0, 5.0)
+    return add_uncertainty(df)
+
+
+def add_uncertainty(df: pd.DataFrame) -> pd.DataFrame:
+    """Predictive uncertainty / disagreement between Convolutional Finder (SegResNet) and Foundation Checker (SAM)."""
+    df = df.copy()
+    for c in UNC:
+        df[c] = 0.0
+    r = (df.k >= 0).to_numpy()
+    if not r.any():
+        return df
+    if {"seg_prob_mean", "agree"} <= set(df):
+        df.loc[r, "unc_disagree"] = (df.loc[r, "seg_prob_mean"] - df.loc[r, "agree"]).abs().to_numpy()
+    if {"log_sam_soft_ml", "log_seg_ml"} <= set(df):
+        df.loc[r, "unc_vol_gap"] = (df.loc[r, "log_sam_soft_ml"] - df.loc[r, "log_seg_ml"]).abs().to_numpy()
     return df
 
 

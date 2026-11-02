@@ -46,8 +46,8 @@ from cids.data.cache import find_cache_root, load_case  # noqa: E402
 from cids.eval.metrics import all_metrics  # noqa: E402
 from cids.jury import JURY11, JURY13, CrossFitMemoryJury, keep_candidates  # noqa: E402
 from cids.provenance import cases_digest, file_digest, require_cases, save_npz_atomic  # noqa: E402
-from cids.radiomics import (GROUPS, RAD_ALL, RAD_EXTRACTED, RAD_VERSION, REL, add_position, add_relative,  # noqa: E402
-                            extract_case, load_bundle, versions)
+from cids.radiomics import (GROUPS, RAD_ALL, RAD_CLEAN, RAD_EXTRACTED, RAD_MEM, RAD_VERSION, REL, UNC,  # noqa: E402
+                            add_position, add_relative, extract_case, icc_31, lins_ccc, load_bundle, versions)
 
 PROPOSED, BASELINE = "jury13_rad_rel", "jury13"
 PLATEAU = 0.002                      # cut-off rule margin (fixed before the dev run)
@@ -61,9 +61,11 @@ def variants() -> dict:
          "jury11": JURY11,
          "jury13": JURY13,
          "finder_rad": FINDER + RAD_ALL + ["rel_seg_prob", "rel_ring_cnr"],
+         "rad_mem_only": FINDER + RAD_CLEAN + RAD_MEM + ["rel_seg_prob", "rel_ring_cnr"],
          "jury13_rel": JURY13 + [c for c in REL if c != "rel_ring_cnr"],   # no radiomics-derived clue
          "jury13_rad": JURY13 + RAD_ALL,
-         "jury13_rad_rel": prop}
+         "jury13_rad_rel": prop,
+         "jury_rad_mem_unc": JURY13 + RAD_CLEAN + RAD_MEM + UNC + REL}
     for g, cols in GROUPS.items():
         v[f"-{g}"] = [c for c in prop if c not in cols]
     return v
@@ -235,6 +237,90 @@ def curve_wins(cv, base, lo=0.2, hi=0.8, splits=("test", "val")):
     return out
 
 
+def uncertainty_resolution(df: pd.DataFrame, p_by_var: dict, split: str, thresh: float = 0.25) -> list[dict]:
+    """Stratify real candidates into Low Disagreement (|seg_prob - agree| < thresh) vs High CNN-SAM Uncertainty."""
+    from sklearn.metrics import roc_auc_score
+    r = (df.k >= 0).to_numpy()
+    if not r.any() or "unc_disagree" not in df:
+        return []
+    sub = df.loc[r].reset_index(drop=True)
+    y = sub.on_tumour.to_numpy().astype(int)
+    unc = sub.unc_disagree.to_numpy() >= thresh
+    rows = []
+    for regime, mask in (("low_uncertainty", ~unc), ("high_uncertainty", unc), ("all_candidates", np.ones_like(unc))):
+        if not mask.any():
+            continue
+        ym = y[mask]
+        for vname, p in p_by_var.items():
+            pm = p[r][mask]
+            a = float(roc_auc_score(ym, pm)) if 0 < ym.sum() < len(ym) else None
+            acc = float(((pm >= 0.5).astype(int) == ym).mean())
+            rows.append(dict(split=split, regime=regime, n_cand=int(mask.sum()), pos_rate=float(ym.mean()),
+                             variant=vname, auc=a, acc_at_05=acc))
+    return rows
+
+
+def loho_eval(tr: pd.DataFrame, Dtr: np.ndarray, coll: dict, k: int, allow_tiny: bool = False) -> pd.DataFrame:
+    """Leave-One-Hospital-Out (LOHO) on training set across clinical collections (DUKE, ISPY1, ISPY2, NACT)."""
+    from cids.jury import MemoryJury
+    c_arr = np.array([coll.get(cid, cid.split("_")[0].upper()) for cid in tr.cache_id])
+    hospitals = sorted(set(c_arr[tr.k >= 0]))
+    if len(hospitals) < 2:
+        return pd.DataFrame()
+    loho_vars = {
+        "jury13": (JURY13, None),
+        "finder_rad": (FINDER + RAD_ALL + ["rel_seg_prob", "rel_ring_cnr"], None),
+        "jury13_rad_rel": (JURY13 + RAD_ALL + REL, None),
+        "jury_rad_mem_unc": (JURY13 + RAD_CLEAN + RAD_MEM + UNC + REL, RAD_CLEAN),
+    }
+    rows = []
+    for h in hospitals:
+        is_h = c_arr == h
+        tr_in, D_in = tr[~is_h].reset_index(drop=True), Dtr[~is_h]
+        te_h, D_h = tr[is_h].reset_index(drop=True), Dtr[is_h]
+        if te_h.cache_id.nunique() < 1 or tr_in[tr_in.k >= 0].cache_id.nunique() < 2:
+            continue
+        if len(set(tr_in.loc[tr_in.k >= 0, "on_tumour"])) < 2:
+            continue
+        for vname, (feats, rcols) in loho_vars.items():
+            try:
+                j = MemoryJury(k=k, features=feats, post=add_relative, rad_cols=rcols).fit(tr_in, D_in)
+                ph = j.proba(te_h, D_h)
+                c_h = curve(te_h, ph)
+                rows.append(dict(heldout_hospital=h, n_cases=int(te_h.cache_id.nunique()), variant=vname,
+                                 auc=auc(te_h, ph), dice_t035=float(c_h.get(0.35, c_h.median())),
+                                 dice_best=float(c_h.max())))
+            except ValueError:
+                if not allow_tiny:
+                    raise
+    return pd.DataFrame(rows)
+
+
+def biomarker_concordance(df: pd.DataFrame, p_by_var: dict, t_by_var: dict) -> pd.DataFrame:
+    """Downstream IBSI volumetric biomarker concordance (ICC(3,1) and Lin's CCC) vs expert ground-truth volume."""
+    r = df[df.k >= 0]
+    if not len(r):
+        return pd.DataFrame()
+    gt_ml = r.groupby("cache_id")["gt_vox"].first().astype(float) / 1000.0
+    rel20_ml = r.groupby("cache_id")["rel20_size"].first().astype(float) / 1000.0
+    rows = [dict(method="seg_rel20", biomarker="volume_ml", icc_31=icc_31(gt_ml, rel20_ml),
+                 lins_ccc=lins_ccc(gt_ml, rel20_ml),
+                 mae_ml=float(np.abs(rel20_ml - gt_ml).mean()))]
+    for vname, p in p_by_var.items():
+        t = t_by_var.get(vname, 0.35)
+        keep = keep_candidates(df, p, t)
+        pred_ml = []
+        for cid in gt_ml.index:
+            ks = keep.get(cid, [])
+            g = r[(r.cache_id == cid) & (r.k.isin(ks))]
+            pred_ml.append(float(g.size_vox.sum()) / 1000.0)
+        pred_s = pd.Series(pred_ml, index=gt_ml.index)
+        rows.append(dict(method=vname, biomarker="volume_ml", icc_31=icc_31(gt_ml, pred_s),
+                         lins_ccc=lins_ccc(gt_ml, pred_s),
+                         mae_ml=float(np.abs(pred_s - gt_ml).mean())))
+    return pd.DataFrame(rows)
+
+
 def print_row(r):
     tt = f"{r['t_train']:.2f}" if r["t_train"] is not None else "  - "
     s = (f"{r['variant']:16s} t_train={tt}  val {r['val_dice']:.4f}  AUC val {r['auc_val']:.3f}")
@@ -335,13 +421,19 @@ def main():
     te, Dte = data.get("test", (None, None))
 
     res, per_case, curves, juries, scores = [], {}, [], {}, []
+    p_val_by_var, p_test_by_var, t_by_var = {}, {}, {}
     for name, feats in variants().items():
-        cross = CrossFitMemoryJury(tr, Dtr, k=a.k, features=feats, post=add_relative, allow_tiny=bool(a.limit))
+        rcols = RAD_CLEAN if any(c in feats for c in RAD_MEM) else None
+        cross = CrossFitMemoryJury(tr, Dtr, k=a.k, features=feats, post=add_relative, rad_cols=rcols,
+                                   allow_tiny=bool(a.limit))
         jury = cross.full
         ptr, pv = cross.proba(tr, Dtr), jury.proba(va, Dva)
         pt = jury.proba(te, Dte) if te is not None else None
         r = score_variant(name, len(feats), tr, ptr, va, pv, te, pt)
         res.append(r["row"]); curves.extend(r["curves"]); juries[name] = (jury, r["row"]["t_train"], feats)
+        p_val_by_var[name] = pv; t_by_var[name] = r["row"]["t_train"]
+        if pt is not None:
+            p_test_by_var[name] = pt
         if r["test_cases"] is not None:
             per_case[name] = r["test_cases"]
         for split, df, p in (("train_oof", tr, ptr), ("val", va, pv), ("test", te, pt)):
@@ -358,9 +450,21 @@ def main():
     pd.concat(scores).to_csv(out / f"{tag}scores.csv", index=False)       # every candidate's score (any version)
     imp = importance(juries[PROPOSED][0], va, Dva)
     imp.to_csv(out / f"{tag}importance_val.csv", index=False)
+    key_vars = [k for k in ("jury11", "jury13", "finder_rad", "jury13_rad_rel", "jury_rad_mem_unc") if k in p_val_by_var]
+    unc_rows = uncertainty_resolution(va, {k: p_val_by_var[k] for k in key_vars}, "val")
+    if te is not None:
+        unc_rows.extend(uncertainty_resolution(te, {k: p_test_by_var[k] for k in key_vars}, "test"))
+    unc_df = pd.DataFrame(unc_rows)
+    if len(unc_df):
+        unc_df.to_csv(out / f"{tag}uncertainty_resolution.csv", index=False)
+    loho_df = loho_eval(tr, Dtr, coll, k=a.k, allow_tiny=bool(a.limit))
+    if len(loho_df):
+        loho_df.to_csv(out / f"{tag}loho_hospitals.csv", index=False)
     wins = {BASELINE: curve_wins(cv, BASELINE, splits=("test", "val") if a.final else ("val", "train_oof"))}
     summary = dict(mode="final" if a.final else "dev", proposed=PROPOSED, plateau_margin=PLATEAU,
                    variants=table.to_dict(orient="records"), curve_wins=wins,
+                   uncertainty_resolution=unc_df.to_dict(orient="records") if len(unc_df) else [],
+                   loho_hospitals=loho_df.to_dict(orient="records") if len(loho_df) else [],
                    cases={s: int(d[0].cache_id.nunique()) for s, d in data.items()}, limit=a.limit,
                    rad_version=RAD_VERSION, versions=versions())
 
@@ -395,10 +499,16 @@ def main():
                     s3f_provenance=(json.loads((s3f / "summary.json").read_text()).get("provenance")
                                     if (s3f / "summary.json").exists() else None))
         fin = {}
-        for name in (PROPOSED, BASELINE):
-            jury, t, feats = juries[name]
-            fin[name] = export(name, jury, t, feats, {"val": (va, Dva), "test": (te, Dte)}, cases_dir, cache_paths,
-                               out, a.workers, prov, coll).round(4).to_dict(orient="index")
+        for name in (PROPOSED, BASELINE, "jury_rad_mem_unc"):
+            if name in juries:
+                jury, t, feats = juries[name]
+                fin[name] = export(name, jury, t, feats, {"val": (va, Dva), "test": (te, Dte)}, cases_dir, cache_paths,
+                                   out, a.workers, prov, coll).round(4).to_dict(orient="index")
+        bio_df = biomarker_concordance(te, {k: p_test_by_var[k] for k in key_vars}, t_by_var)
+        if len(bio_df):
+            bio_df.to_csv(out / "biomarker_concordance.csv", index=False)
+            summary["biomarker_concordance_test"] = bio_df.to_dict(orient="records")
+            print("\ndownstream volumetric biomarker concordance (test):\n" + bio_df.round(4).to_string(index=False))
         summary["final_full_metrics"] = fin
     summary["minutes"] = (time.time() - t0) / 60
     json.dump(summary, open(out / f"{tag}summary.json", "w"), indent=2, default=float)

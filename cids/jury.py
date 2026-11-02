@@ -47,12 +47,32 @@ def _real(df):
     return (df.k >= 0).to_numpy()
 
 
+def _fit_rad_scaler(df: pd.DataFrame, cols: list[str]):
+    X = df[cols].to_numpy(np.float32)
+    med = np.nanmedian(X, axis=0)
+    med = np.where(np.isfinite(med), med, 0.0).astype(np.float32)
+    X_imp = np.where(np.isfinite(X), X, med)
+    q25, q75 = np.percentile(X_imp, [25, 75], axis=0)
+    iqr = np.maximum(q75 - q25, 1e-3).astype(np.float32)
+    return med, iqr
+
+
+def _transform_rad(df: pd.DataFrame, cols: list[str], med: np.ndarray, iqr: np.ndarray) -> np.ndarray:
+    X = df[cols].to_numpy(np.float32)
+    X = np.where(np.isfinite(X), X, med)
+    Z = np.clip((X - med) / iqr, -5.0, 5.0)
+    norm = np.maximum(np.linalg.norm(Z, axis=1, keepdims=True), 1e-6)
+    return (Z / norm).astype(np.float32)
+
+
 class MemoryJury:
-    def __init__(self, k: int = 10, temp: float = 0.05, n_folds: int = 5, features=JURY13, post=None):
+    def __init__(self, k: int = 10, temp: float = 0.05, n_folds: int = 5, features=JURY13, post=None, rad_cols=None):
         """post: optional function rows -> rows applied after the memory clues (S3h: within-patient relative
-        clues, cids.radiomics.add_relative). None (default) = the S3e/S3f jury unchanged."""
+        clues, cids.radiomics.add_relative). rad_cols: optional list of standardized IBSI radiomic columns to form
+        an active in-loop Radiomic Memory Bank (rad_mem_knn, rad_mem_probe). None (default) = S3e/S3f unchanged."""
         self.k, self.temp, self.n_folds, self.features = k, temp, n_folds, list(features)
         self.post = post
+        self.rad_cols = list(rad_cols) if rad_cols is not None else None
         self.threshold = None
 
     def _post(self, rows):
@@ -71,11 +91,27 @@ class MemoryJury:
             raise ValueError("memory needs >= 2 patients and both real and false candidates")
         # memory clues of the training candidates themselves: cross-fitted (never their own patient)
         mk, mp = np.zeros(len(tr)), np.zeros(len(tr))
+        rk, rp = np.zeros(len(tr)), np.zeros(len(tr))
+        rcols = getattr(self, "rad_cols", None)
         for fit, held in GroupKFold(min(self.n_folds, len(set(groups)))).split(D, groups=groups):
             mk[held] = knn_score(D[held], D[fit], y[fit], self.k, self.temp)
             pr = _probe().fit(D[fit], y[fit]) if len(set(y[fit])) > 1 else None
             mp[held] = pr.predict_proba(D[held])[:, 1] if pr is not None else 0.5
-        tr = self._post(tr.assign(mem_knn=mk, mem_probe=mp))
+            if rcols:
+                med_f, iqr_f = _fit_rad_scaler(tr.iloc[fit], rcols)
+                R_fit = _transform_rad(tr.iloc[fit], rcols, med_f, iqr_f)
+                R_held = _transform_rad(tr.iloc[held], rcols, med_f, iqr_f)
+                rk[held] = knn_score(R_held, R_fit, y[fit], self.k, self.temp)
+                rpr = _probe().fit(R_fit, y[fit]) if len(set(y[fit])) > 1 else None
+                rp[held] = rpr.predict_proba(R_held)[:, 1] if rpr is not None else 0.5
+        tr = tr.assign(mem_knn=mk, mem_probe=mp)
+        if rcols:
+            tr = tr.assign(rad_mem_knn=rk, rad_mem_probe=rp)
+            self.rad_med, self.rad_iqr = _fit_rad_scaler(tr, rcols)
+            R_all = _transform_rad(tr, rcols, self.rad_med, self.rad_iqr)
+            self.rad_mem = R_all.astype(np.float16)
+            self.rad_probe = _probe().fit(R_all, y)
+        tr = self._post(tr)
         self.mem, self.mem_y = D.astype(np.float16), y
         self.probe = _probe().fit(D, y)
         self.trees = _trees().fit(tr[self.features].to_numpy(float), y.astype(int))
@@ -86,10 +122,17 @@ class MemoryJury:
     def memory_clues(self, rows: pd.DataFrame, desc: np.ndarray) -> pd.DataFrame:
         rows = rows.copy(); r = _real(rows)
         rows["mem_knn"] = 0.0; rows["mem_probe"] = 0.0
+        rcols = getattr(self, "rad_cols", None)
+        if rcols:
+            rows["rad_mem_knn"] = 0.0; rows["rad_mem_probe"] = 0.0
         if r.any():
             D = np.asarray(desc)[r].astype(np.float32)
             rows.loc[r, "mem_knn"] = knn_score(D, self.mem, self.mem_y, self.k, self.temp)
             rows.loc[r, "mem_probe"] = self.probe.predict_proba(D)[:, 1]
+            if rcols:
+                R = _transform_rad(rows.loc[r], rcols, self.rad_med, self.rad_iqr)
+                rows.loc[r, "rad_mem_knn"] = knn_score(R, self.rad_mem, self.mem_y, self.k, self.temp)
+                rows.loc[r, "rad_mem_probe"] = self.rad_probe.predict_proba(R)[:, 1]
         return self._post(rows)
 
     def proba(self, rows: pd.DataFrame, desc: np.ndarray) -> np.ndarray:
