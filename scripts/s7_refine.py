@@ -139,8 +139,8 @@ def lr_factor(step, total, warm):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["freq", "freq_lll", "spatial"], required=True)
-    ap.add_argument("--s3f_dir", required=True, help="notebook 12 output (contains summary.json, masks/)")
+    ap.add_argument("--mode", choices=["freq", "freq_lll", "spatial"], default=None, help="required unless --test_only")
+    ap.add_argument("--s3f_dir", default=None, help="notebook 12 output (contains summary.json, masks/); required unless --test_only")
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
     ap.add_argument("--work", default="/kaggle/working/refine_rois", help="ROI crops (shared by both modes)")
@@ -175,7 +175,24 @@ def main():
     ap.add_argument("--time_budget_h", type=float, default=10.0)
     ap.add_argument("--limit", type=int, default=0, help="cases per split (tests)")
     ap.add_argument("--no_amp", action="store_true")
+    ap.add_argument("--test_only", action="store_true",
+                    help="no training: evaluate the saved <out>/best.pt on test once, with the run's own settings "
+                         "(mode, masks, ROIs, probability maps, width, gate, patch) read from <out>/config.json")
     a = ap.parse_args()
+    if a.test_only:
+        cfg_f = Path(a.out) / "config.json"
+        if not (Path(a.out) / "best.pt").exists() or not cfg_f.exists():
+            raise SystemExit(f"--test_only needs {a.out}/best.pt and {a.out}/config.json from the training run")
+        if a.skip_test:
+            raise SystemExit("--test_only and --skip_test exclude each other")
+        cfg = json.loads(cfg_f.read_text())
+        for k in ("mode", "s3f_dir", "cache_root", "splits", "work", "width", "patch", "no_gate", "prob_dirs", "limit"):
+            if k in cfg:
+                setattr(a, k, cfg[k])
+        print(f"TEST ONLY: settings of the training run ({cfg_f}): mode {a.mode}, masks {a.s3f_dir}, ROIs {a.work}, "
+              f"probability maps {'yes' if a.prob_dirs else 'no'}")
+    elif a.mode is None or a.s3f_dir is None:
+        ap.error("--mode and --s3f_dir are required (unless --test_only)")
     amp = DEV == "cuda" and not a.no_amp
     t0 = time.time()
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
@@ -213,7 +230,7 @@ def main():
     if not mf.exists() and any(work.glob("*.npz")):
         raise SystemExit(f"{work} holds ROIs without a manifest; use a new --work")
     mf.write_text(json.dumps(roi_manifest, indent=2))
-    (out / "config.json").write_text(json.dumps(dict(vars(a), s3f=str(s3f), s3f_summary=file_digest(s3f / "summary.json"),
+    (out / ("config_test_only.json" if a.test_only else "config.json")).write_text(json.dumps(dict(vars(a), s3f=str(s3f), s3f_summary=file_digest(s3f / "summary.json"),
                                                      s3f_threshold=s3f_summary.get("threshold")), indent=2))
     print(f"S3f masks {s3f} (memory jury t = {s3f_summary.get('threshold')}) | cache {root} | {DEV} | mode {a.mode}")
 
@@ -262,9 +279,14 @@ def main():
           f"test: {'SKIPPED (pilot)' if a.skip_test else 'once, at the end'}")
     total, warm = a.epochs * len(ds), 2 * len(ds)
     best, log, step, ep_t = float(v0.dice_m0.mean()), [dict(epoch=0, val_dice=float(v0.dice_m0.mean()))], 0, []
-    torch.save(model.state_dict(), out / "best.pt")                    # M0 itself is the fallback
+    if a.test_only:                                     # keep the trained best.pt; report its logged val Dice
+        lg = out / "train_log.csv"
+        if lg.exists() and "val_dice" in pd.read_csv(lg):
+            best = float(pd.read_csv(lg).val_dice.max())
+    else:
+        torch.save(model.state_dict(), out / "best.pt")                    # M0 itself is the fallback
 
-    for epoch in range(1, a.epochs + 1):
+    for epoch in range(1, (0 if a.test_only else a.epochs) + 1):
         te = time.time()
         ds.set_epoch(epoch)
         g = torch.Generator().manual_seed(a.seed + epoch)
