@@ -6,8 +6,9 @@ Development set only (val, by default 30 cases); the test set is not touched.
 
 Threat model (non-adaptive, white-box on the finder only):
   the attacker adds delta to the pre- and post-contrast phases, |delta| <= eps per voxel (intensity scale [0, 1]),
-  only inside one patch and never on padding voxels (exact zeros stay zero); the third finder channel
-  (post - pre) is recomputed from the perturbed phases. PGD with sign steps on SegResNet's logits.
+  only inside the sliding windows that touch the target and never on padding voxels (exact zeros stay zero); the third finder channel
+  (post - pre) is recomputed from the perturbed phases. PGD with sign steps on the EXACT sliding-window output of
+  SegResNet (same windows, Gaussian blending, padding as the pipeline; checked per case: sw_check).
   decoy  push SegResNet's probability UP in a ball (radius --radius mm) in tumour-free tissue >= --min_dist mm
          from the expert tumour -> does a false candidate appear, and is it kept in the final mask?
   hide   push the probability DOWN inside the expert tumour -> is the tumour lost?
@@ -80,48 +81,114 @@ def choose_decoy(img, sprob, gt, rng, min_dist=30.0, max_prob=0.1, r=5):
     return tuple(int(v) for v in idx[rng.integers(len(idx))])
 
 
-def patch_slices(shape, centre, size):
-    """size^3 patch (per axis: size rounded down to the volume, multiple of 8 for SegResNet) around centre,
-    shifted to stay inside the volume."""
-    sl = []
-    for s, c in zip(shape, centre):
-        p = min(size, (s // 8) * 8)
-        lo = int(np.clip(c - p // 2, 0, s - p))
-        sl.append(slice(lo, lo + p))
-    return tuple(sl)
+ROI, OVERLAP, SIGMA = 96, 0.5, 0.125         # = s3a.seg_prob: sliding window 96^3, overlap 0.5, Gaussian blending
+
+
+def sw_windows(shape, roi=ROI, overlap=OVERLAP):
+    """The exact window slices MONAI's sliding_window_inference uses on a volume of this (padded) shape."""
+    from monai.data.utils import dense_patch_slices
+    try:
+        from monai.inferers.utils import _get_scan_interval
+        interval = _get_scan_interval(tuple(shape), (roi,) * 3, 3, (overlap,) * 3)
+    except ImportError:                                                  # same rule as MONAI 1.x
+        interval = tuple(roi if roi == s else max(int(roi * (1 - overlap)), 1) for s in shape)
+    return [tuple(w) for w in dense_patch_slices(tuple(shape), (roi,) * 3, interval)]
+
+
+def restrict_target(target, centre, max_windows, shape):
+    """Hide mode, large tumours: if more than max_windows sliding windows touch the target, keep only the target
+    voxels whose output comes entirely from the windows containing the tumour centre (<= 8, up to 27 at
+    clipped borders), so the attack stays affordable and its gradient stays exact. Returns (target, kept fraction)."""
+    wins = sw_windows(shape)
+    if len([w for w in wins if target[w].any()]) <= max_windows:
+        return target, 1.0
+    sel = [w for w in wins if all(w[d].start <= centre[d] < w[d].stop for d in range(3))]
+    n_all, n_sel = np.zeros(shape, np.int16), np.zeros(shape, np.int16)
+    for w in wins:
+        n_all[w] += 1
+    for w in sel:
+        n_sel[w] += 1
+    t = target & (n_sel == n_all)
+    return t, float(t.sum() / max(int(target.sum()), 1))
 
 
 # ---------------------------------------------------------------------------- attack
-def pgd(seg, img, target, mode, eps, steps, alpha, sl, amp):
-    """PGD on the finder inside patch sl. img (2,X,Y,Z) float32, target bool (X,Y,Z).
-    mode 'decoy' raises, 'hide' lowers the logits on target voxels. Returns (adv image, info)."""
+def pgd_sw(seg, img, target, mode, eps, steps, alpha, amp, batch=4):
+    """PGD on EXACTLY what the pipeline computes: the Gaussian-blended sliding-window logits of SegResNet
+    (same windows, weights and padding as s3a.seg_prob), restricted to the windows touching the target.
+    Exact gradient in two passes per step: (1) blended logits without graph -> dL/dZ, (2) per window batch,
+    backward of sum(z * w / W * dL/dZ) (the blend is linear in the window logits). Memory = one batch.
+    img (2,X,Y,Z) float32, target bool (X,Y,Z). mode 'decoy' raises, 'hide' lowers the target logits.
+    Returns (adv image, info) with info['p_clean_check'] = max |sigmoid(Z_clean) - ...| computed by the caller."""
+    from monai.data.utils import compute_importance_map
     dev = next(seg.parameters()).device
-    x0 = torch.from_numpy(np.ascontiguousarray(img[(slice(None),) + sl])).to(dev)
+    xp, pads = pad_to(img, (ROI,) * 3)
+    tp, _ = pad_to(target, (ROI,) * 3)
+    wins = [w for w in sw_windows(xp.shape[1:]) if tp[w].any()]
+    if not wins:
+        return img.copy(), dict(loss0=np.nan, loss=np.nan, linf=0.0, n_windows=0, z_clean=None)
+    lo = [min(w[d].start for w in wins) for d in range(3)]
+    hi = [max(w[d].stop for w in wins) for d in range(3)]
+    R = tuple(slice(a, b) for a, b in zip(lo, hi))
+    loc = [tuple(slice(w[d].start - lo[d], w[d].stop - lo[d]) for d in range(3)) for w in wins]
+    x0 = torch.from_numpy(np.ascontiguousarray(xp[(slice(None),) + R])).to(dev)
     valid = ((x0[0] != 0) | (x0[1] != 0)).float()[None]                 # padding stays exactly zero
-    tm = torch.from_numpy(np.ascontiguousarray(target[sl])).to(dev)
-    if not tm.any():
-        return img.copy(), dict(loss0=np.nan, loss=np.nan, linf=0.0)
+    tm = torch.from_numpy(np.ascontiguousarray(tp[R])).to(dev)
+    imp = compute_importance_map((ROI,) * 3, mode="gaussian", sigma_scale=SIGMA, device=dev,
+                                 dtype=torch.float32).reshape((ROI,) * 3)
+    den = torch.zeros(tm.shape, device=dev)
+    for w in loc:
+        den[w] += imp
     for prm in seg.parameters():
         prm.requires_grad_(False)
-    delta = torch.zeros_like(x0, requires_grad=True)
-    loss0 = None
-    for _ in range(steps):
-        xa = x0 + delta * valid
-        x3 = torch.stack([xa[0], xa[1], xa[1] - xa[0]])[None]
+
+    def three(xa):
+        return torch.stack([xa[0], xa[1], xa[1] - xa[0]])
+
+    def logits(x3, ws):
         with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
-            logits = seg(x3)[0, 0]
-        z = logits.float()[tm]
-        loss = F.softplus(-z).mean() if mode == "decoy" else F.softplus(z).mean()   # minimised
-        if loss0 is None:
-            loss0 = float(loss.detach())
-        g, = torch.autograd.grad(loss, delta)
+            return seg(torch.stack([x3[(slice(None),) + w] for w in ws]))[:, 0].float()
+
+    def lossf(z):
+        return F.softplus(-z).mean() if mode == "decoy" else F.softplus(z).mean()   # minimised
+
+    delta = torch.zeros_like(x0)
+    loss0 = z_clean = None
+    for step in range(steps + 1):
+        with torch.no_grad():                                             # pass 1: blended logits
+            x3 = three(x0 + delta * valid)
+            num = torch.zeros(tm.shape, device=dev)
+            for i in range(0, len(loc), batch):
+                z = logits(x3, loc[i:i + batch])
+                for j, w in enumerate(loc[i:i + batch]):
+                    num[w] += imp * z[j]
+            Z = num / den.clamp_min(1e-12)
+        Zt = Z[tm].clone().requires_grad_(True)
+        loss = lossf(Zt)
+        if step == 0:
+            loss0, z_clean = float(loss.detach()), Z.detach()
+        if step == steps:
+            break
+        gZ = torch.zeros(tm.shape, device=dev)
+        gZ[tm] = torch.autograd.grad(loss, Zt)[0]
+        coef = gZ / den.clamp_min(1e-12)
+        dvar = delta.clone().requires_grad_(True)                         # pass 2: exact gradient
+        x3g = three(x0 + dvar * valid)
+        for i in range(0, len(loc), batch):
+            ws = loc[i:i + batch]
+            z = logits(x3g, ws)
+            sur = sum((z[j] * imp * coef[w]).sum() for j, w in enumerate(ws))
+            sur.backward(retain_graph=i + batch < len(loc))
         with torch.no_grad():
-            delta -= alpha * g.sign()
+            delta -= alpha * dvar.grad.sign()
             delta.clamp_(-eps, eps)
-    adv = img.copy()
-    with torch.no_grad():
-        adv[(slice(None),) + sl] = (x0 + delta * valid).cpu().numpy()
-    return adv, dict(loss0=loss0, loss=float(loss.detach()), linf=float(np.abs(adv - img).max()))
+    advp = xp.copy()
+    advp[(slice(None),) + R] = (x0 + delta * valid).cpu().numpy()
+    adv = unpad(advp, pads)
+    zc = np.full(tp.shape, np.nan, np.float32)
+    zc[R] = z_clean.cpu().numpy()
+    return adv, dict(loss0=loss0, loss=float(loss.detach()), linf=float(np.abs(adv - img).max()), n_windows=len(wins),
+                     z_clean=unpad(zc, pads))
 
 
 # ---------------------------------------------------------------------------- pipeline (as S3f + S3h)
@@ -192,9 +259,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--n_cases", type=int, default=30)
     ap.add_argument("--eps", default="2,4,8", help="L-inf budgets in units of 1/255")
-    ap.add_argument("--modes", default="decoy,hide")
+    ap.add_argument("--modes", default="decoy", help="decoy and/or hide (comma separated)")
     ap.add_argument("--steps", type=int, default=40)
-    ap.add_argument("--patch", type=int, default=128)
+    ap.add_argument("--alpha", type=float, default=0.1, help="PGD step = alpha * eps")
+    ap.add_argument("--max_windows", type=int, default=27, help="hide mode: shrink large tumours to <= this many windows")
     ap.add_argument("--radius", type=float, default=5.0, help="decoy ball radius (mm = voxels)")
     ap.add_argument("--min_dist", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -238,18 +306,23 @@ def main():
             idx = np.argwhere(gt)
             targets["hide"] = (gt, tuple(int(v) for v in (idx.min(0) + idx.max(0)) // 2))
         for mode, (target, centre) in targets.items():
-            sl = patch_slices(gt.shape, centre, a.patch)
+            target, frac = (restrict_target(target, centre, a.max_windows, gt.shape) if mode == "hide"
+                            else (target, 1.0))
+            check = np.nan
             for e in [0.0] + eps_list:
                 if e == 0:
                     adv, info, (df, D, sprob, lab) = img, dict(loss0=np.nan, loss=np.nan, linf=0.0), (df0, D0, sprob0, lab0)
                 else:
                     eps = e / 255.0
-                    adv, info = pgd(seg, img, target, mode, eps, a.steps, eps / 10.0, sl, amp)
+                    adv, info = pgd_sw(seg, img, target, mode, eps, a.steps, a.alpha * eps, amp)
+                    zc = info.pop("z_clean")
+                    if zc is not None and np.isnan(check):                # attack model == pipeline finder?
+                        check = float(np.nanmax(np.abs(1 / (1 + np.exp(-zc[target])) - sprob0[target])))
                     df, D, sprob, lab = run_pipeline(seg, sam, box, adv, gt, cid, amp)
-                res, hits, sc = judge(bundles, df, D, lab, gt, target, cid)
+                res, hits, sc = judge(bundles, df, D, lab, gt, gt if mode == "hide" else target, cid)   # hide: whole tumour
                 row = dict(cache_id=cid, mode=mode, eps255=e, finder_hit=bool(hits), n_cand=int((df.k >= 0).sum()),
                            target_prob=float(sprob[target].mean()), target_ml=float(target.sum()) / 1000,
-                           patch_covers_target=float(target[sl].sum() / max(target.sum(), 1)), **info)
+                           target_frac=frac, sw_check=check, **info)
                 for name, r in res.items():
                     row.update({f"{name}_{key}": v for key, v in r.items()})
                 runs.append(row)
@@ -259,7 +332,8 @@ def main():
         last = {r["mode"]: r for r in runs if r["eps255"] == max(eps_list)}
         msg = " | ".join(f"{m} eps{int(max(eps_list))}: finder {'hit' if r['finder_hit'] else 'miss'}, "
                          f"rel20 {int(r['rel20_target_kept'])} j13 {int(r['jury13_target_kept'])} "
-                         f"prop {int(r['jury13_rad_rel_target_kept'])}" for m, r in last.items())
+                         f"prop {int(r['jury13_rad_rel_target_kept'])}, p_target {r['target_prob']:.2f}, check {r['sw_check']:.1e}"
+                         for m, r in last.items())
         print(f"[{i + 1}/{len(cases)}] {cid} {time.time() - t0:.0f}s | {msg}", flush=True)
 
     allc = [json.loads(p.read_text()) for p in sorted((out / "cases").glob("*.json"))]

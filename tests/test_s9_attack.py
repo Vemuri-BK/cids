@@ -18,13 +18,9 @@ def _scene(shape=(48, 48, 48)):
     return img, gt
 
 
-def test_ball_and_patch():
+def test_ball():
     b = s9.ball((20, 20, 20), (10, 10, 10), 3)
-    assert b[10, 10, 10] and b.sum() == sum(1 for x in np.argwhere(b))
-    assert not b[10, 10, 14]
-    sl = s9.patch_slices((50, 70, 30), (2, 69, 15), 32)
-    assert [s.stop - s.start for s in sl] == [32, 32, 24]     # clipped to the volume, multiple of 8
-    assert sl[0].start == 0 and sl[1].stop == 70
+    assert b[10, 10, 10] and not b[10, 10, 14]
 
 
 def test_choose_decoy_constraints():
@@ -40,27 +36,49 @@ def test_choose_decoy_constraints():
     assert s9.choose_decoy(img, np.ones(gt.shape), gt, np.random.default_rng(1)) is None
 
 
-def test_pgd_is_bounded_keeps_padding_and_works():
+def _net():
     torch.manual_seed(0)
-    net = torch.nn.Sequential(torch.nn.Conv3d(3, 4, 3, padding=1), torch.nn.ReLU(), torch.nn.Conv3d(4, 1, 3, padding=1))
-    img, _ = _scene()
-    target = s9.ball(img.shape[1:], (24, 24, 30), 4)
-    sl = s9.patch_slices(img.shape[1:], (24, 24, 30), 32)
+    return torch.nn.Sequential(torch.nn.Conv3d(3, 2, 3, padding=1), torch.nn.Tanh(),
+                               torch.nn.Conv3d(2, 1, 3, padding=1)).eval()
+
+
+def _sw_prob(net, img):
+    """The pipeline's finder output (s3a.seg_prob without GPU): MONAI sliding window on 3 channels."""
+    from monai.inferers import sliding_window_inference
+    from cids.data.volumes import pad_to, three_channel, unpad
+    x, pads = pad_to(three_channel(img), (96, 96, 96))
+    with torch.no_grad():
+        z = sliding_window_inference(torch.from_numpy(x)[None], (96,) * 3, sw_batch_size=4, predictor=net,
+                                     overlap=0.5, mode="gaussian")
+    return unpad(torch.sigmoid(z.float())[0, 0].numpy(), pads)
+
+
+def test_attack_model_equals_pipeline_and_attack_works():
+    img = (0.3 + 0.05 * np.random.default_rng(0).standard_normal((2, 100, 90, 104))).astype(np.float32)
+    img[:, :, :, :4] = 0.0                                               # padding slab
+    net = _net()
+    target = s9.ball(img.shape[1:], (50, 45, 60), 4)
     eps = 8 / 255
-    with torch.no_grad():
-        x = torch.from_numpy(img); z0 = net(torch.stack([x[0], x[1], x[1] - x[0]])[None])[0, 0][torch.from_numpy(target)]
-    adv, info = s9.pgd(net, img, target, "decoy", eps, 20, eps / 10, sl, amp=False)
+    p0 = _sw_prob(net, img)
+    adv, info = s9.pgd_sw(net, img, target, "decoy", eps, 3, eps / 3, amp=False)
+    zc = info["z_clean"]
+    assert np.nanmax(np.abs(1 / (1 + np.exp(-zc[target])) - p0[target])) < 1e-5     # exact same function
+    assert info["n_windows"] >= 1 and adv.shape == img.shape
     d = adv - img
-    assert np.abs(d).max() <= eps + 1e-6 and info["linf"] <= eps + 1e-6
-    assert np.all(adv[img == 0] == 0) or np.all(d[:, :, :, :6] == 0)   # padding untouched
-    assert np.all(d[:, :sl[0].start] == 0) and np.all(d[:, sl[0].stop:] == 0)   # only inside the patch
-    with torch.no_grad():
-        xa = torch.from_numpy(adv); z1 = net(torch.stack([xa[0], xa[1], xa[1] - xa[0]])[None])[0, 0][torch.from_numpy(target)]
-    assert z1.mean() > z0.mean() and info["loss"] < info["loss0"]
-    adv_h, info_h = s9.pgd(net, img, target, "hide", eps, 20, eps / 10, sl, amp=False)
-    with torch.no_grad():
-        xh = torch.from_numpy(adv_h); z2 = net(torch.stack([xh[0], xh[1], xh[1] - xh[0]])[None])[0, 0][torch.from_numpy(target)]
-    assert z2.mean() < z0.mean()
+    assert np.abs(d).max() <= eps + 1e-6 and np.all(d[:, :, :, :4] == 0)           # bounded, padding untouched
+    p1 = _sw_prob(net, adv)
+    assert p1[target].mean() > p0[target].mean() and info["loss"] < info["loss0"]  # transfers to the pipeline
+    adv_h, info_h = s9.pgd_sw(net, img, target, "hide", eps, 3, eps / 3, amp=False)
+    assert _sw_prob(net, adv_h)[target].mean() < p0[target].mean()
+
+
+def test_restrict_target_caps_windows():
+    shape = (200, 200, 200)
+    big = s9.ball(shape, (100, 100, 100), 60)
+    t, frac = s9.restrict_target(big, (100, 100, 100), 8, shape)
+    assert len([w for w in s9.sw_windows(shape) if t[w].any()]) <= 8 and 0 < frac < 1
+    small = s9.ball(shape, (100, 100, 100), 3)
+    assert s9.restrict_target(small, (100, 100, 100), 64, shape)[1] == 1.0
 
 
 class _FixedJury:
