@@ -9,7 +9,8 @@ Threat model (non-adaptive, white-box on the finder only):
   only inside the sliding windows that touch the target and never on padding voxels (exact zeros stay zero); the third finder channel
   (post - pre) is recomputed from the perturbed phases. PGD with sign steps on the EXACT sliding-window output of
   SegResNet (same windows, Gaussian blending, padding as the pipeline; checked per case: sw_check).
-  decoy  push SegResNet's probability UP in a ball (radius --radius mm) in tumour-free tissue >= --min_dist mm
+  decoy  push SegResNet's probability UP in a ball (radius --radii mm, one mode per radius) and keep it LOW in
+         the shell around it (--contain), perturbing only within --local_margin mm of the ball, in tumour-free tissue >= --min_dist mm
          from the expert tumour -> does a false candidate appear, and is it kept in the final mask?
   hide   push the probability DOWN inside the expert tumour -> is the tumour lost?
 
@@ -113,27 +114,33 @@ def restrict_target(target, centre, max_windows, shape):
 
 
 # ---------------------------------------------------------------------------- attack
-def pgd_sw(seg, img, target, mode, eps, steps, alpha, amp, batch=4):
+def pgd_sw(seg, img, target, mode, eps, steps, alpha, amp, region=None, outside=None, contain=1.0, batch=4):
     """PGD on EXACTLY what the pipeline computes: the Gaussian-blended sliding-window logits of SegResNet
-    (same windows, weights and padding as s3a.seg_prob), restricted to the windows touching the target.
+    (same windows, weights and padding as s3a.seg_prob), restricted to the windows touching the loss voxels.
     Exact gradient in two passes per step: (1) blended logits without graph -> dL/dZ, (2) per window batch,
     backward of sum(z * w / W * dL/dZ) (the blend is linear in the window logits). Memory = one batch.
-    img (2,X,Y,Z) float32, target bool (X,Y,Z). mode 'decoy' raises, 'hide' lowers the target logits.
-    Returns (adv image, info) with info['p_clean_check'] = max |sigmoid(Z_clean) - ...| computed by the caller."""
+    img (2,X,Y,Z) float32; target bool (X,Y,Z): 'decoy' raises, 'hide' lowers its logits.
+    region  bool mask where the perturbation is allowed (None = every voxel of the windows); padding never.
+    outside bool mask whose logits are kept LOW (decoy containment: a tumour-sized lesion, not a 100 ml blob),
+            weight `contain`. Returns (adv image, info); info['z_clean'] = clean blended logits (pipeline check)."""
     from monai.data.utils import compute_importance_map
     dev = next(seg.parameters()).device
     xp, pads = pad_to(img, (ROI,) * 3)
     tp, _ = pad_to(target, (ROI,) * 3)
-    wins = [w for w in sw_windows(xp.shape[1:]) if tp[w].any()]
-    if not wins:
+    op = pad_to(outside, (ROI,) * 3)[0] if outside is not None else np.zeros_like(tp)
+    rp = pad_to(region, (ROI,) * 3)[0] if region is not None else np.ones_like(tp)
+    wins = [w for w in sw_windows(xp.shape[1:]) if tp[w].any() or op[w].any()]
+    if not wins or not tp.any():
         return img.copy(), dict(loss0=np.nan, loss=np.nan, linf=0.0, n_windows=0, z_clean=None)
     lo = [min(w[d].start for w in wins) for d in range(3)]
     hi = [max(w[d].stop for w in wins) for d in range(3)]
     R = tuple(slice(a, b) for a, b in zip(lo, hi))
     loc = [tuple(slice(w[d].start - lo[d], w[d].stop - lo[d]) for d in range(3)) for w in wins]
     x0 = torch.from_numpy(np.ascontiguousarray(xp[(slice(None),) + R])).to(dev)
-    valid = ((x0[0] != 0) | (x0[1] != 0)).float()[None]                 # padding stays exactly zero
+    allowed = torch.from_numpy(np.ascontiguousarray(rp[R])).to(dev)
+    valid = (((x0[0] != 0) | (x0[1] != 0)) & allowed).float()[None]      # padding stays exactly zero
     tm = torch.from_numpy(np.ascontiguousarray(tp[R])).to(dev)
+    om = torch.from_numpy(np.ascontiguousarray(op[R])).to(dev) & ~tm
     imp = compute_importance_map((ROI,) * 3, mode="gaussian", sigma_scale=SIGMA, device=dev,
                                  dtype=torch.float32).reshape((ROI,) * 3)
     den = torch.zeros(tm.shape, device=dev)
@@ -149,8 +156,13 @@ def pgd_sw(seg, img, target, mode, eps, steps, alpha, amp, batch=4):
         with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
             return seg(torch.stack([x3[(slice(None),) + w] for w in ws]))[:, 0].float()
 
-    def lossf(z):
-        return F.softplus(-z).mean() if mode == "decoy" else F.softplus(z).mean()   # minimised
+    def lossf(Zl):                                                        # minimised
+        if mode == "hide":
+            return F.softplus(Zl[tm]).mean()
+        l = F.softplus(-Zl[tm]).mean()
+        if om.any() and contain > 0:
+            l = l + contain * F.softplus(Zl[om]).mean()
+        return l
 
     delta = torch.zeros_like(x0)
     loss0 = z_clean = None
@@ -163,15 +175,13 @@ def pgd_sw(seg, img, target, mode, eps, steps, alpha, amp, batch=4):
                 for j, w in enumerate(loc[i:i + batch]):
                     num[w] += imp * z[j]
             Z = num / den.clamp_min(1e-12)
-        Zt = Z[tm].clone().requires_grad_(True)
-        loss = lossf(Zt)
+        Zl = Z.clone().requires_grad_(True)
+        loss = lossf(Zl)
         if step == 0:
             loss0, z_clean = float(loss.detach()), Z.detach()
         if step == steps:
             break
-        gZ = torch.zeros(tm.shape, device=dev)
-        gZ[tm] = torch.autograd.grad(loss, Zt)[0]
-        coef = gZ / den.clamp_min(1e-12)
+        coef = torch.autograd.grad(loss, Zl)[0] / den.clamp_min(1e-12)
         dvar = delta.clone().requires_grad_(True)                         # pass 2: exact gradient
         x3g = three(x0 + dvar * valid)
         for i in range(0, len(loc), batch):
@@ -223,6 +233,8 @@ def judge(bundles, df, D, lab, gt, target, cid):
     out, scores = {}, pd.DataFrame(dict(cache_id=real.cache_id, k=real.k.astype(int), size_vox=real.size_vox,
                                         on_target=real.k.isin(hits).to_numpy()))
     m = rel20(lab > 0)
+    hit_mask = np.isin(lab, hits) if hits else np.zeros(lab.shape, bool)
+    out["target_cand"] = dict(ml=float(hit_mask.sum()) / 1000, touches_gt=bool((hit_mask & gt).any()))
     out["rel20"] = dict(dice=dice(m, gt), target_kept=bool(m[target].any()))
     for name, b in bundles.items():
         p = b["jury"].proba(df, D)
@@ -242,7 +254,8 @@ def summarise(runs: pd.DataFrame) -> pd.DataFrame:
                 rel20_kept=("rel20_target_kept", "mean"), jury13_kept=("jury13_target_kept", "mean"),
                 proposed_kept=("jury13_rad_rel_target_kept", "mean"),
                 dice_rel20=("rel20_dice", "mean"), dice_jury13=("jury13_dice", "mean"),
-                dice_proposed=("jury13_rad_rel_dice", "mean"))
+                dice_proposed=("jury13_rad_rel_dice", "mean"),
+                decoy_ml_median=("target_cand_ml", "median"), touches_tumour=("target_cand_touches_gt", "mean"))
     return agg.round(3)
 
 
@@ -263,7 +276,11 @@ def main():
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--alpha", type=float, default=0.1, help="PGD step = alpha * eps")
     ap.add_argument("--max_windows", type=int, default=27, help="hide mode: shrink large tumours to <= this many windows")
-    ap.add_argument("--radius", type=float, default=5.0, help="decoy ball radius (mm = voxels)")
+    ap.add_argument("--radii", default="5,10", help="decoy ball radii in mm (= voxels); one decoy mode per radius")
+    ap.add_argument("--local_margin", type=float, default=10.0,
+                    help="perturbation only within this many mm of the target (decoy ball / tumour); 0 = whole windows")
+    ap.add_argument("--contain", type=float, default=1.0,
+                    help="decoy: weight of keeping the finder LOW in the shell between the ball (+2 mm) and the margin")
     ap.add_argument("--min_dist", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -281,6 +298,7 @@ def main():
     seg, sam, box = s3.load_models(str(Path(a.seg_ckpt).expanduser()), str(Path(a.sam_ckpt).expanduser()),
                                    str(Path(a.turbo_ckpt).expanduser()))
     eps_list = [float(e) for e in a.eps.split(",")]
+    radii = [float(r) for r in a.radii.split(",")]
     modes = a.modes.split(",")
     cfg = dict(vars(a), cases=[c for c, _ in cases], thresholds={n: b["threshold"] for n, b in bundles.items()},
                versions=bundles["jury13_rad_rel"]["versions"])
@@ -298,28 +316,37 @@ def main():
         df0, D0, sprob0, lab0 = run_pipeline(seg, sam, box, img, gt, cid, amp)
         runs, cand_frames = [], []
         clean_scores = {n: b["jury"].proba(df0, D0)[(df0.k >= 0).to_numpy()].tolist() for n, b in bundles.items()}
-        decoy_c = choose_decoy(img, sprob0, gt, crng, a.min_dist, 0.1, int(round(a.radius)))
+        decoy_c = choose_decoy(img, sprob0, gt, crng, a.min_dist, 0.1, int(round(max(radii) + a.local_margin)))
         targets = {}
         if "decoy" in modes and decoy_c is not None:
-            targets["decoy"] = (ball(gt.shape, decoy_c, a.radius), decoy_c)
+            for rr in radii:
+                targets[f"decoy_r{int(rr)}"] = (ball(gt.shape, decoy_c, rr), decoy_c, rr)
         if "hide" in modes and gt.any():
             idx = np.argwhere(gt)
-            targets["hide"] = (gt, tuple(int(v) for v in (idx.min(0) + idx.max(0)) // 2))
-        for mode, (target, centre) in targets.items():
-            target, frac = (restrict_target(target, centre, a.max_windows, gt.shape) if mode == "hide"
+            targets["hide"] = (gt, tuple(int(v) for v in (idx.min(0) + idx.max(0)) // 2), None)
+        for mode, (target, centre, rr) in targets.items():
+            kind = "hide" if mode == "hide" else "decoy"
+            target, frac = (restrict_target(target, centre, a.max_windows, gt.shape) if kind == "hide"
                             else (target, 1.0))
+            if a.local_margin > 0:
+                region = (ball(gt.shape, centre, rr + a.local_margin) if kind == "decoy"
+                          else ndimage.distance_transform_edt(~target) <= a.local_margin)
+            else:
+                region = None
+            outside = (ball(gt.shape, centre, rr + a.local_margin) & ~ball(gt.shape, centre, rr + 2)
+                       if kind == "decoy" and a.local_margin > 0 else None)
             check = np.nan
             for e in [0.0] + eps_list:
                 if e == 0:
                     adv, info, (df, D, sprob, lab) = img, dict(loss0=np.nan, loss=np.nan, linf=0.0), (df0, D0, sprob0, lab0)
                 else:
                     eps = e / 255.0
-                    adv, info = pgd_sw(seg, img, target, mode, eps, a.steps, a.alpha * eps, amp)
+                    adv, info = pgd_sw(seg, img, target, kind, eps, a.steps, a.alpha * eps, amp, region, outside, a.contain)
                     zc = info.pop("z_clean")
                     if zc is not None and np.isnan(check):                # attack model == pipeline finder?
                         check = float(np.nanmax(np.abs(1 / (1 + np.exp(-zc[target])) - sprob0[target])))
                     df, D, sprob, lab = run_pipeline(seg, sam, box, adv, gt, cid, amp)
-                res, hits, sc = judge(bundles, df, D, lab, gt, gt if mode == "hide" else target, cid)   # hide: whole tumour
+                res, hits, sc = judge(bundles, df, D, lab, gt, gt if kind == "hide" else target, cid)   # hide: whole tumour
                 row = dict(cache_id=cid, mode=mode, eps255=e, finder_hit=bool(hits), n_cand=int((df.k >= 0).sum()),
                            target_prob=float(sprob[target].mean()), target_ml=float(target.sum()) / 1000,
                            target_frac=frac, sw_check=check, **info)
@@ -332,7 +359,8 @@ def main():
         last = {r["mode"]: r for r in runs if r["eps255"] == max(eps_list)}
         msg = " | ".join(f"{m} eps{int(max(eps_list))}: finder {'hit' if r['finder_hit'] else 'miss'}, "
                          f"rel20 {int(r['rel20_target_kept'])} j13 {int(r['jury13_target_kept'])} "
-                         f"prop {int(r['jury13_rad_rel_target_kept'])}, p_target {r['target_prob']:.2f}, check {r['sw_check']:.1e}"
+                         f"prop {int(r['jury13_rad_rel_target_kept'])}, p_target {r['target_prob']:.2f}, "
+                         f"blob {r['target_cand_ml']:.1f} ml, check {r['sw_check']:.1e}"
                          for m, r in last.items())
         print(f"[{i + 1}/{len(cases)}] {cid} {time.time() - t0:.0f}s | {msg}", flush=True)
 

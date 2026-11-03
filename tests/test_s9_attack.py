@@ -99,6 +99,7 @@ def test_judge_flags():
                "jury13_rad_rel": dict(jury=_FixedJury([0.9, 0.1]), threshold=0.4)}  # rejects it
     out, hits, sc = s9.judge(bundles, df, None, lab, gt, decoy, "c")
     assert hits == [2]
+    assert out["target_cand"]["ml"] == decoy.sum() / 1000 and not out["target_cand"]["touches_gt"]
     assert out["jury13"]["target_kept"] and not out["jury13_rad_rel"]["target_kept"]
     assert out["rel20"]["target_kept"]                                         # same size -> rel20 keeps both
     assert out["jury13_rad_rel"]["dice"] == 1.0 and out["jury13"]["dice"] < 1.0
@@ -111,6 +112,24 @@ def test_summarise_columns():
     for e in (0, 4):
         rows.append(dict(cache_id="a", mode="decoy", eps255=e, finder_hit=e > 0, rel20_target_kept=e > 0,
                          jury13_target_kept=e > 0, jury13_rad_rel_target_kept=False, rel20_dice=0.7,
-                         jury13_dice=0.8, jury13_rad_rel_dice=0.8))
+                         jury13_dice=0.8, jury13_rad_rel_dice=0.8, target_cand_ml=0.5 if e else 0.0,
+                         target_cand_touches_gt=False))
     agg = s9.summarise(pd.DataFrame(rows))
     assert agg.loc[("decoy", 4), "jury13_kept"] == 1.0 and agg.loc[("decoy", 4), "proposed_kept"] == 0.0
+
+
+def test_local_region_and_containment():
+    img = (0.3 + 0.05 * np.random.default_rng(1).standard_normal((2, 100, 96, 100))).astype(np.float32)
+    net = _net()
+    c, r, margin = (50, 48, 50), 4, 8
+    target = s9.ball(img.shape[1:], c, r)
+    region = s9.ball(img.shape[1:], c, r + margin)
+    shell = region & ~s9.ball(img.shape[1:], c, r + 2)
+    eps = 8 / 255
+    adv, _ = s9.pgd_sw(net, img, target, "decoy", eps, 3, eps / 3, False, region, shell, 1.0)
+    d = np.abs(adv - img).max(0)
+    assert d[~region].max() == 0 and d[region].max() > 0                 # perturbation stays local
+    adv0, _ = s9.pgd_sw(net, img, target, "decoy", eps, 3, eps / 3, False, region, None, 0.0)
+    p_c, p_0, p_clean = _sw_prob(net, adv), _sw_prob(net, adv0), _sw_prob(net, img)
+    assert p_c[target].mean() > p_clean[target].mean()                     # still raises the decoy
+    assert p_c[shell].mean() < p_0[shell].mean()                           # containment keeps the shell lower
