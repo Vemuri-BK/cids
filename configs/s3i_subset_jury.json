@@ -1,0 +1,29 @@
+{
+  "description": "S3i conditional CPU pilot: patient-level subset selection vs independent candidate decisions, on frozen S3f candidate tables (upstream SegResNet / SAM-S2b NOT out-of-fold).",
+  "seed": 42,
+  "outer_folds": 5,
+  "inner_folds": 3,
+  "finder_features": ["rank", "n_cand", "log_seg_ml", "rel_size", "is_largest", "seg_prob_mean", "seg_prob_max"],
+  "sam_features": ["agree", "log_sam_ml", "log_sam_soft_ml", "log_sam_over_seg"],
+  "forbidden_features": ["inter_vox", "gt_vox", "on_tumour", "rel20_inter", "rel20_size", "cache_id", "k", "size_vox"],
+  "hgb_grid": [
+    {"max_depth": 2, "learning_rate": 0.1, "max_iter": 200},
+    {"max_depth": 3, "learning_rate": 0.05, "max_iter": 300},
+    {"max_depth": 3, "learning_rate": 0.1, "max_iter": 150},
+    {"max_depth": 4, "learning_rate": 0.05, "max_iter": 200}
+  ],
+  "hgb_fixed": {"min_samples_leaf": 20, "l2_regularization": 1.0, "early_stopping": false},
+  "prob_threshold_grid": {"start": 0.05, "stop": 0.95, "step": 0.05},
+  "quality_threshold_grid": {"start": 0.0, "stop": 0.90, "step": 0.025},
+  "historical_references": {
+    "finder_only": 0.60,
+    "jury11": 0.55,
+    "jury13": 0.70,
+    "jury13_rad_rel": 0.40
+  },
+  "bootstrap": {"n": 5000, "seed": 0},
+  "change_eps": 0.01,
+  "fail_thresholds": [0.1, 0.5],
+  "routing_budgets": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+  "random_routing_draws": 500
+}
