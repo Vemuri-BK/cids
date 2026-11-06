@@ -41,12 +41,14 @@ STRUCT = np.ones((3, 3, 3))                         # 26-connectivity, as s3a_se
 
 
 def label(mask):
-    """26-connected labels. The number of components is taken from the label map itself: on the server
-    ndimage.label sometimes returned an impossible count (~1e12) for a valid map, which crashed the counting."""
-    lab = ndimage.label(mask, structure=STRUCT)[0]
+    """26-connected labels, written into an explicit int32 array. On the server ndimage.label's default
+    output produced impossible values (~1e12 = 240 * 2^32: 32-bit labels in a 64-bit buffer); the count is
+    therefore also taken from the map itself and checked."""
+    lab = np.zeros(mask.shape, np.int32)
+    ndimage.label(mask, structure=STRUCT, output=lab)
     n = int(lab.max()) if lab.size else 0
     if lab.min() < 0 or n > lab.size:
-        raise ValueError(f"invalid label map: min {lab.min()}, max {n}, dtype {lab.dtype}")
+        raise ValueError(f"invalid label map: min {lab.min()}, max {n}")
     return lab, n
 
 
@@ -57,10 +59,15 @@ def components(mask, min_vox=100, top_k=5, labelled=None):
     if n == 0:
         return lab, []
     size = np.bincount(lab.ravel(), minlength=n + 1)[1:].astype(float)   # = ndimage.sum(mask, lab, 1..n)
+    return lab, [(k, float(size[k - 1])) for k in pick(size, min_vox, top_k)]
+
+
+def pick(size, min_vox, top_k):
+    """Labels (1-based) of the top_k components >= min_vox, largest first; else the largest one."""
     order = [int(i) + 1 for i in np.argsort(-size) if size[i] >= min_vox][:top_k]
-    if not order:
+    if not order and len(size):
         order = [int(np.argmax(size)) + 1]
-    return lab, [(k, float(size[k - 1])) for k in order]
+    return order
 
 
 def oracle_dice(inter, size, g):
@@ -75,13 +82,12 @@ def oracle_dice(inter, size, g):
     return float(max(0.0, (2 * ci / (cs + g)).max()))
 
 
-def candidate_stats(blobs, gt):
-    """blobs: list of boolean masks (disjoint). -> dict of found / coverage / oracle / counts."""
-    g = int(gt.sum())
-    inter = [int((b & gt).sum()) for b in blobs]
-    size = [int(b.sum()) for b in blobs]
+def candidate_stats(inter, size, g):
+    """Per-candidate overlap with the tumour and size (voxels), tumour size g -> found / coverage / oracle /
+    counts. Computed from counts, no candidate masks are built (memory)."""
+    inter, size = [int(x) for x in inter], [int(x) for x in size]
     return dict(found=bool(any(i > 0 for i in inter)), coverage=float(sum(inter) / g) if g else np.nan,
-                oracle=oracle_dice(inter, size, g), n_cand=len(blobs), n_false=int(sum(i == 0 for i in inter)),
+                oracle=oracle_dice(inter, size, g), n_cand=len(size), n_false=int(sum(i == 0 for i in inter)),
                 cand_ml=float(sum(size)) / 1000)
 
 
@@ -111,35 +117,32 @@ def _case_rows(job):
     gt = (lbl[0] if lbl.ndim == 4 else lbl) > 0
     if prob.shape != gt.shape:
         return [dict(cache_id=cid, split=split, error=f"shape {prob.shape} vs {gt.shape}")]
-    rows, cache, labs = [], {}, {}
-
-    def labelled(t):
-        if t not in labs:
-            labs[t] = label(prob > t)
-        return labs[t]
-
-    def comps(t, k):
-        if (t, k) not in cache:
-            cache[(t, k)] = components(prob > t, min_vox, k, labelled(t))
-        return cache[(t, k)]
-
+    g = int(gt.sum())
+    gtf, coref = gt.ravel().astype(np.float64), (prob > 0.5).ravel().astype(np.float64)
+    stats = {}                                       # per threshold: size, overlap, contains-a-p>0.5-voxel
+    for t in sorted({t for _, t, _ in settings} | {0.5}):
+        lab, n = label(prob > t)
+        flat = lab.ravel()
+        stats[t] = (np.bincount(flat, minlength=n + 1)[1:].astype(float),
+                    np.bincount(flat, weights=gtf, minlength=n + 1)[1:],
+                    np.bincount(flat, weights=coref, minlength=n + 1)[1:] > 0)
+        del lab, flat
+    rows = []
     for mode, t, k in settings:
+        size, inter, _ = stats[t]
         if mode == "plain":
-            lab, c = comps(t, k)
-            blobs = [lab == kk for kk, _ in c]
+            ks = pick(size, min_vox, k)
+            cs, ci = [size[i - 1] for i in ks], [inter[i - 1] for i in ks]
         else:                                        # addon: keep the 0.5 / top-5 blobs, add new low-t blobs
-            lab5, c5 = comps(0.5, 5)
-            blobs = [lab5 == kk for kk, _ in c5]
-            core = prob > 0.5
-            labt, n = labelled(t)
-            if n and len(blobs) < k:
-                flat = labt.ravel()
-                size = np.bincount(flat, minlength=n + 1)[1:]
-                has_core = np.bincount(flat, weights=core.ravel().astype(np.float64), minlength=n + 1)[1:] > 0
-                extra = [int(i) + 1 for i in np.argsort(-size) if size[i] >= min_vox and not has_core[i]]
-                blobs += [labt == kk for kk in extra[:k - len(blobs)]]
-        rows.append(dict(cache_id=cid, split=split, mode=mode, t=t, k=k, gt_ml=float(gt.sum()) / 1000,
-                         **candidate_stats(blobs, gt)))
+            s5, i5, _ = stats[0.5]
+            k5 = pick(s5, min_vox, 5)
+            cs, ci = [s5[i - 1] for i in k5], [i5[i - 1] for i in k5]
+            _, _, has_core = stats[t]
+            extra = [int(i) for i in np.argsort(-size) if size[i] >= min_vox and not has_core[i]]
+            extra = extra[:max(k - len(cs), 0)]
+            cs += [size[i] for i in extra]; ci += [inter[i] for i in extra]
+        rows.append(dict(cache_id=cid, split=split, mode=mode, t=t, k=k, gt_ml=g / 1000,
+                         **candidate_stats(ci, cs, g)))
     return rows
 
 
@@ -175,7 +178,7 @@ def main():
     ap.add_argument("--thresholds", default="0.5,0.4,0.3,0.2")
     ap.add_argument("--ks", default="5,10")
     ap.add_argument("--min_vox", type=int, default=100)
-    ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0, help="first N cases per split (smoke test)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()

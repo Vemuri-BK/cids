@@ -55,3 +55,27 @@ def test_case_rows_recall_first(tmp_path):
     s = e0.summarise(pd.DataFrame(rows))
     row = s[(s["mode"] == "addon") & (s.t == 0.3)].iloc[0]
     assert row.missed_at_ref == 1 and row.recovered == 1 and row.delta_vs_ref == 1.0
+
+
+def test_counts_match_mask_based_reference(tmp_path):
+    """The count-based case_rows equals a direct mask-based computation on a random scene."""
+    rng = np.random.default_rng(3)
+    shape = (40, 40, 40)
+    prob = np.zeros(shape, np.float32)
+    for _ in range(8):
+        c = rng.integers(5, 35, 3)
+        prob[_ball(shape, c, rng.integers(2, 5))] = rng.choice([0.25, 0.35, 0.45, 0.7, 0.9])
+    gt = _ball(shape, (20, 20, 20), 4)
+    prob[gt & (prob == 0)] = 0.35
+    np.savez(tmp_path / "m.npz", prob=np.round(prob * 255).astype(np.uint8))
+    np.savez(tmp_path / "c.npz", label=gt[None].astype(np.uint8))
+    settings = e0.settings_for([0.5, 0.3, 0.2], [5, 10])
+    rows = e0.case_rows(("c", "val", tmp_path / "m.npz", tmp_path / "c.npz", settings, 10))
+    p = np.round(prob * 255).astype(np.uint8) / 255.0
+    for r in rows:
+        if r["mode"] != "plain":
+            continue
+        lab, cands = e0.components(p > r["t"], 10, r["k"])
+        blobs = [lab == k for k, _ in cands]
+        inter = [int((b & gt).sum()) for b in blobs]; size = [int(b.sum()) for b in blobs]
+        assert r["n_cand"] == len(blobs) and abs(r["oracle"] - e0.oracle_dice(inter, size, int(gt.sum()))) < 1e-12
