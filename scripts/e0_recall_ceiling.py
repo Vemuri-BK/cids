@@ -40,13 +40,23 @@ sys.path.insert(0, str(ROOT))
 STRUCT = np.ones((3, 3, 3))                         # 26-connectivity, as s3a_seg2sam.components
 
 
-def components(mask, min_vox=100, top_k=5):
+def label(mask):
+    """26-connected labels. The number of components is taken from the label map itself: on the server
+    ndimage.label sometimes returned an impossible count (~1e12) for a valid map, which crashed the counting."""
+    lab = ndimage.label(mask, structure=STRUCT)[0]
+    n = int(lab.max()) if lab.size else 0
+    if lab.min() < 0 or n > lab.size:
+        raise ValueError(f"invalid label map: min {lab.min()}, max {n}, dtype {lab.dtype}")
+    return lab, n
+
+
+def components(mask, min_vox=100, top_k=5, labelled=None):
     """= s3a_seg2sam.components: labels + [(k, size)] of the top_k components >= min_vox (largest first);
     if none is large enough, the largest one is kept."""
-    lab, n = ndimage.label(mask, structure=STRUCT)
+    lab, n = labelled if labelled is not None else label(mask)
     if n == 0:
         return lab, []
-    size = np.bincount(lab.ravel().astype(np.int64), minlength=n + 1)[1:].astype(float)   # = ndimage.sum
+    size = np.bincount(lab.ravel(), minlength=n + 1)[1:].astype(float)   # = ndimage.sum(mask, lab, 1..n)
     order = [int(i) + 1 for i in np.argsort(-size) if size[i] >= min_vox][:top_k]
     if not order:
         order = [int(np.argmax(size)) + 1]
@@ -87,6 +97,13 @@ def settings_for(thresholds, ks):
 
 
 def case_rows(job):
+    try:
+        return _case_rows(job)
+    except Exception as e:                            # one bad case must not stop the whole run
+        return [dict(cache_id=job[0], split=job[1], error=f"{type(e).__name__}: {e}")]
+
+
+def _case_rows(job):
     cid, split, map_path, case_path, settings, min_vox = job
     d = np.load(map_path)
     prob = (d["prob"] if "prob" in d else d["seg"]).astype(np.float32) / 255.0
@@ -94,12 +111,16 @@ def case_rows(job):
     gt = (lbl[0] if lbl.ndim == 4 else lbl) > 0
     if prob.shape != gt.shape:
         return [dict(cache_id=cid, split=split, error=f"shape {prob.shape} vs {gt.shape}")]
-    rows, cache = [], {}
+    rows, cache, labs = [], {}, {}
+
+    def labelled(t):
+        if t not in labs:
+            labs[t] = label(prob > t)
+        return labs[t]
 
     def comps(t, k):
         if (t, k) not in cache:
-            lab, c = components(prob > t, min_vox, k)
-            cache[(t, k)] = (lab, c)
+            cache[(t, k)] = components(prob > t, min_vox, k, labelled(t))
         return cache[(t, k)]
 
     for mode, t, k in settings:
@@ -110,10 +131,10 @@ def case_rows(job):
             lab5, c5 = comps(0.5, 5)
             blobs = [lab5 == kk for kk, _ in c5]
             core = prob > 0.5
-            labt, n = ndimage.label(prob > t, structure=STRUCT)
+            labt, n = labelled(t)
             if n and len(blobs) < k:
-                flat = labt.ravel().astype(np.int64)            # plain counts (scipy's ndimage.sum on a bool
-                size = np.bincount(flat, minlength=n + 1)[1:]   # input failed on the server: huge bincount)
+                flat = labt.ravel()
+                size = np.bincount(flat, minlength=n + 1)[1:]
                 has_core = np.bincount(flat, weights=core.ravel().astype(np.float64), minlength=n + 1)[1:] > 0
                 extra = [int(i) + 1 for i in np.argsort(-size) if size[i] >= min_vox and not has_core[i]]
                 blobs += [labt == kk for kk in extra[:k - len(blobs)]]
@@ -185,7 +206,10 @@ def main():
                 print(f"  {i + 1}/{len(jobs)} cases | {(time.time() - t0) / 60:.1f} min", flush=True)
     df = pd.DataFrame(rows)
     if "error" in df and df.error.notna().any():
-        raise SystemExit(f"map/label mismatch: {df[df.error.notna()].head().to_dict('records')}")
+        bad = df[df.error.notna()]
+        bad.to_csv(out / "e0_errors.csv", index=False)
+        print(f"\n!! {len(bad)} case(s) skipped, see e0_errors.csv: {bad.head(3).to_dict('records')}")
+        df = df[df.error.isna()].drop(columns="error")
     df.to_csv(out / "e0_per_case.csv", index=False)
     s = summarise(df)
     s.to_csv(out / "e0_summary.csv", index=False)
