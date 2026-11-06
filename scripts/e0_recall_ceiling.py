@@ -46,7 +46,7 @@ def components(mask, min_vox=100, top_k=5):
     lab, n = ndimage.label(mask, structure=STRUCT)
     if n == 0:
         return lab, []
-    size = ndimage.sum(mask, lab, range(1, n + 1))
+    size = np.bincount(lab.ravel().astype(np.int64), minlength=n + 1)[1:].astype(float)   # = ndimage.sum
     order = [int(i) + 1 for i in np.argsort(-size) if size[i] >= min_vox][:top_k]
     if not order:
         order = [int(np.argmax(size)) + 1]
@@ -112,8 +112,9 @@ def case_rows(job):
             core = prob > 0.5
             labt, n = ndimage.label(prob > t, structure=STRUCT)
             if n and len(blobs) < k:
-                size = ndimage.sum(np.ones_like(core), labt, range(1, n + 1))
-                has_core = ndimage.maximum(core.astype(np.uint8), labt, range(1, n + 1)) > 0
+                flat = labt.ravel().astype(np.int64)            # plain counts (scipy's ndimage.sum on a bool
+                size = np.bincount(flat, minlength=n + 1)[1:]   # input failed on the server: huge bincount)
+                has_core = np.bincount(flat, weights=core.ravel().astype(np.float64), minlength=n + 1)[1:] > 0
                 extra = [int(i) + 1 for i in np.argsort(-size) if size[i] >= min_vox and not has_core[i]]
                 blobs += [labt == kk for kk in extra[:k - len(blobs)]]
         rows.append(dict(cache_id=cid, split=split, mode=mode, t=t, k=k, gt_ml=float(gt.sum()) / 1000,
