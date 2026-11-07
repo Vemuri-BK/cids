@@ -90,9 +90,12 @@ def test_run_arm_toggle_fixes_wrong_target():
     A = lab == 4
     log = []
     touches = {3: True, 4: False}
-    r = P.run_arm("T", "always", A, gt, lab, [4], {3, 4}, touches, None, 3, log, "x")
+    r = P.run_arm("T", "always", A, gt, lab, [4], {3, 4}, touches, None, 3, log, "x", ver="v1")
     assert r["dice_0"] == 0 and r["dice_3"] > 0.5
-    assert [x["action"] for x in log][:2] == ["toggle_on", "toggle_off"] or "toggle_on" in [x["action"] for x in log]
+    assert "toggle_on" in [x["action"] for x in log]
+    log2 = []
+    r2 = P.run_arm("T", "always", A, gt, lab, [4], {3, 4}, touches, None, 3, log2, "x")          # v2 labels
+    assert r2["dice_3"] == r["dice_3"] and "add_blob" in {x["action"] for x in log2}
 
 
 def test_oracle_undoes_harmful_edit():
@@ -133,16 +136,19 @@ def test_end_to_end(tmp_path):
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-3000:]
     assert "VERDICT" in r.stdout
-    df = pd.read_csv(out / "full" / "per_patient.csv")
+    out = out / "_"                                                                       # results live in full_v2/
+    out = out.parent
+    df = pd.read_csv(out / "full_v2" / "per_patient.csv")
     assert set(df.arm) == set(P.ARMS) and set(df.variant) == set(P.VARIANTS)
     assert df.groupby(["arm", "variant"]).size().nunique() == 1
     a = df[df.arm == "TS"].set_index(["cache_id", "variant"]).dice_0
     assert (a == df[df.arm == "TB"].set_index(["cache_id", "variant"]).dice_0).all()   # same starting mask
-    lg = pd.read_csv(out / "full" / "clicks.csv")
+    lg = pd.read_csv(out / "full_v2" / "clicks.csv")
     assert (lg.groupby(["cache_id", "arm", "variant"]).size() == 3).all()             # every click counted
-    v = json.loads((out / "full" / "decision_rule_check.json").read_text())
+    v = json.loads((out / "full_v2" / "decision_rule_check.json").read_text())
     assert set(v) >= {"mean_dnsd", "ci95", "harmed_TS", "harmed_TB", "advance_to_reader_study"}
-    assert json.loads((out / "decision_rule.json").read_text())["min_mean_dnsd"] == 0.05
+    rule = json.loads((out / "decision_rule_v2.json").read_text())
+    assert rule["min_mean_dnsd"] == 0.05 and rule["version"] == "v2"
 
 
 def test_low_tau_keeps_small_blob():
@@ -168,5 +174,66 @@ def test_calibrate_then_smoke(tmp_path):
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-3000:]
     assert "using calibration.json" in r.stdout
-    rule = json.loads((out / "decision_rule.json").read_text())
+    rule = json.loads((out / "decision_rule_v2.json").read_text())
     assert rule["calibration"]["tau"] == c["chosen_tau"] and rule["config"]["mask_logit"] == c["chosen_L"]
+
+
+def _zero_editor(img):
+    return _editor(img, lambda x, c, l, low: np.zeros((128,) * 3, np.float32))
+
+
+def test_v2_no_repeat_of_noop_click_and_every_attempt_counted():
+    img, gt, lab = _case()
+    A = lab == 3                                          # tumour partly missed -> positive clicks
+    for ver, expect_repeat in (("v1", True), ("v2", False)):
+        log = []
+        P.run_arm("TS", "always", A, gt, lab, [3], {3, 4}, {3: True, 4: False}, _zero_editor(img), 3, log, "x", ver=ver)
+        pts = [(tuple(r["p"]), r["sign"]) for r in log]
+        assert len(log) == 3                               # every attempt counts
+        assert (len(set(pts)) < len(pts)) == expect_repeat
+    assert not any(r.get("duplicate_prompt") for r in log)
+
+
+def test_v2_bounds_a_connected_leak():
+    img, gt, lab = _case()
+    e = _editor(img, lambda x, c, l, low: np.ones((128,) * 3, np.float32))       # SAM says 'tumour everywhere'
+    m = lab == 3
+    new_raw, info_raw = e.propose(m, [((45, 30, 20), 1)])
+    new_b, info_b = e.propose(m, [((45, 30, 20), 1)], radius_mm=20)
+    assert info_raw["raw_change_vox"] == info_raw["change_vox"] > info_b["change_vox"] == (new_b & ~m).sum()
+    assert info_b["raw_change_vox"] == info_raw["raw_change_vox"]
+    assert (new_b & ~m).sum() <= 4 / 3 * np.pi * 20 ** 3 + 1
+
+
+def test_negative_click_on_partly_correct_blob_goes_to_editor():
+    img, gt, lab = _case()
+    lab2 = lab.copy()
+    extra = P.M3.ball(SHAPE, (40, 30, 20), 5) & ~gt
+    lab2[extra] = 3                                       # kept blob 3 = tumour part + an extra protrusion
+    A = lab2 == 3
+    p, sign, _ = P.next_click(A, gt)
+    assert sign == 0 and extra[p]
+    assert P.toggle_action(p, sign, {3}, {3, 4}, lab2, {3: True, 4: False}) is None   # not a whole-blob delete
+    tb = P.brush(A, p, 0, 5)
+    assert not tb[p] and tb[30, 30, 20]
+    keep = A & ~extra
+    e = _editor(img, lambda x, c, l, low: np.zeros((128,) * 3, np.float32))
+    new, info = e.propose(A, [(p, 0)], radius_mm=20)
+    assert not new[p] and info["change_vox"] > 0
+
+
+def test_replay_reproduces_v1_and_probes_negatives(tmp_path):
+    base = [x.replace("s3m_contour_study.py", "s3p_click_repair.py") for x in _with_tables(tmp_path)]
+    out = tmp_path / "out"
+    assert subprocess.run(base + ["--step", "parity", "--out", str(out)], capture_output=True, text=True).returncode == 0
+    r = subprocess.run(base + ["--step", "smoke", "--version", "v1", "--random_weights", "--budget", "2", "--smoke_n", "2",
+                               "--out", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert (out / "smoke" / "clicks.csv").exists() and (out / "decision_rule_v1.json").exists()
+    r = subprocess.run(base + ["--step", "replay", "--random_weights", "--budget", "2", "--smoke_n", "2", "--out", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    import re
+    m = re.search(r"reproduced: (\d+)/(\d+)", r.stdout)
+    assert m and m.group(1) == m.group(2)
+    assert (out / "replay" / "replay.csv").exists()

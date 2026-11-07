@@ -61,9 +61,10 @@ from cids.eval.metrics import nsd  # noqa: E402
 from cids.provenance import require_cases  # noqa: E402
 
 STRUCT = np.ones((3, 3, 3), bool)
-ARMS = ("T", "TB", "TS")
+ARMS_V1 = ("T", "TB", "TS")
+ARMS = ("T", "TB", "TS", "TSH")          # v2; TSH = exploratory hybrid (SAM for positive, brush for negative clicks)
 VARIANTS = ("always", "oracle")
-CFG = dict(budget=5, brush_mm=5, mask_logit=4.0, mask_tau=0.5, sam_spacing=1.5, sam_size=128, report_steps=[0, 1, 3, 5],
+CFG = dict(budget=5, brush_mm=5, edit_radius_mm=20, mask_logit=4.0, mask_tau=0.5, sam_spacing=1.5, sam_size=128, report_steps=[0, 1, 3, 5],
            budget_frac=0.10)
 RULE = dict(population="S3n 108-patient review queue (development cohort)", acceptance="always-accept",
             comparison="TS (toggle + SAM) vs TB (toggle + 5 mm brush) after 3 clicks", min_mean_dnsd=0.05,
@@ -99,23 +100,46 @@ def ball_slice(shape, p, r):
 
 
 # ----------------------------------------------------------------------------------------------- simulated reader
-def next_click(m, gt):
+def ordered_points(comp):
+    """All voxels of a region, deepest first (distance to the region's edge), ties -> nearest to the centroid,
+    then lexicographic. The first point equals deepest_point(comp)."""
+    lo, hi = M3.bbox(comp)
+    sl = tuple(slice(a, b + 1) for a, b in zip(lo, hi))
+    c = comp[sl]
+    dt = M3.inside_distance(c)
+    idx = np.argwhere(c)
+    d = dt[c]
+    d2 = ((idx - np.argwhere(comp).mean(0) + lo) ** 2).sum(1)
+    order = np.lexsort((idx[:, 2], idx[:, 1], idx[:, 0], d2, -d))
+    return idx[order] + lo
+
+
+def next_click(m, gt, exclude=None):
     """Simulated reader (uses the expert mask): (point, sign, region voxels) or None if the mask is perfect.
-    Largest connected error region (missed tumour or wrongly included tissue; ties -> missed tumour first),
-    clicked at its deepest interior point. sign 1 = positive (add), 0 = negative (remove)."""
-    best = None
-    for sign, err in ((1, gt & ~m), (0, m & ~gt)):
+    Largest connected error region (missed tumour or wrongly included tissue; ties -> missed tumour first), clicked at
+    its deepest interior point. sign 1 = positive (add), 0 = negative (remove).
+    v2: exclude = {(point, sign)} already attempted on the UNCHANGED mask -> the next eligible voxel is used
+    (deeper-first within the region, then the next largest region)."""
+    regions = []
+    for order_, (sign, err) in enumerate(((1, gt & ~m), (0, m & ~gt))):
         if not err.any():
             continue
         lab = label26(err)
         size = np.bincount(lab.ravel())[1:]
-        k = int(np.argmax(size)) + 1
-        if best is None or size[k - 1] > best[0]:
-            best = (int(size[k - 1]), sign, lab == k)
-    if best is None:
+        for k in np.argsort(-size, kind="stable")[: (1 if not exclude else len(size))]:
+            regions.append((-int(size[k]), order_, sign, lab, int(k) + 1))
+    if not regions:
         return None
-    size, sign, comp = best
-    return deepest_point(comp), sign, size
+    regions.sort(key=lambda r: (r[0], r[1]))
+    for negsize, _, sign, lab, k in regions:
+        comp = lab == k
+        if not exclude:
+            return deepest_point(comp), sign, -negsize
+        for q in ordered_points(comp):
+            q = tuple(int(v) for v in q)
+            if (q, sign) not in exclude:
+                return q, sign, -negsize
+    return None
 
 
 # ----------------------------------------------------------------------------------------------- editors (no GT)
@@ -174,11 +198,14 @@ class ClickEditor:
         t = torch.from_numpy(m.astype(np.float32))[None, None]
         return (F.interpolate(t, size=tuple(self.shape15), mode="trilinear", align_corners=False)[0, 0] > 0.5).numpy()
 
-    def propose(self, m, clicks):
-        """clicks = [(point_1mm, sign), ...]; the last one is new. Returns (edited mask, info)."""
+    def propose(self, m, clicks, at=None, sign=None, radius_mm=None, zero_prompt=False):
+        """clicks = [(point_1mm, sign), ...] given to SAM (the last one is the new click). Returns (edited mask, info).
+        at / sign override the edit location and polarity (replay probes); radius_mm bounds the applied change to a
+        ball around the click (v2); zero_prompt replaces the encoded mask prompt by zeros (diagnostic)."""
         import torch
         from cids.data.cache import crop_pad, znorm
-        p, s = clicks[-1]
+        p = tuple(at) if at is not None else tuple(clicks[-1][0])
+        s = sign if sign is not None else clicks[-1][1]
         n = CFG["sam_size"]
         c15 = np.floor((np.asarray(p, float) + 0.5) / CFG["sam_spacing"]).astype(int)
         vc, origin = crop_pad(self.post, c15)
@@ -186,13 +213,15 @@ class ClickEditor:
         x = torch.from_numpy(znorm(vc, fc)[None, None])
         mc, _ = crop_pad(self._mask15(m).astype(np.uint8), c15)
         low = mask_to_low(mc > 0, self.L, self.tau)
+        if zero_prompt:
+            low = torch.zeros_like(low)
         pts, labs = [], []
         for q, sg in clicks:
             cq = M3.to_crop(q, origin)
             if (cq >= 0).all() and (cq < n).all():
                 pts.append(cq); labs.append(sg)
-        coords = torch.tensor(np.asarray(pts, np.float32)[None])
-        labels = torch.tensor(np.asarray(labs)[None], dtype=torch.long)
+        coords = torch.tensor(np.asarray(pts, np.float32)[None]) if pts else None
+        labels = torch.tensor(np.asarray(labs)[None], dtype=torch.long) if pts else None
         prob = self.predict(x, coords, labels, low)
         up = M3.paste_back(prob, origin, self.shape15, self.shape1)
         S = up > 0.5
@@ -204,15 +233,20 @@ class ClickEditor:
         info = dict(roundtrip_dice=dice(rt[ext], m[ext]) if (rt[ext].any() or m[ext].any()) else np.nan,
                     p_at_click=float(up[tuple(p)]), click_back_err_mm=float(np.abs(
                         M3.crop_to_1mm(M3.to_crop(p, origin), origin) - np.asarray(p)).max()),
-                    n_points=len(pts), origin15=np.asarray(origin).tolist())
-        D = np.zeros(m.shape, bool)
-        D[ext] = (S[ext] & ~m[ext]) if s == 1 else (m[ext] & ~S[ext])
-        if not D[tuple(p)]:
-            info["change_vox"] = 0
+                    n_points=len(pts), origin15=np.asarray(origin).tolist(), mask_in_crop_vox=int(m[ext].sum()))
+        Dx = (S[ext] & ~m[ext]) if s == 1 else (m[ext] & ~S[ext])
+        pl = tuple(np.asarray(p) - a)
+        if not Dx[pl]:
+            info.update(change_vox=0, raw_change_vox=0)
             return m.copy(), info
-        lab = label26(D[ext])
+        lab = label26(Dx)
+        info["raw_change_vox"] = int((lab == lab[pl]).sum())
+        if radius_mm:
+            g = np.ogrid[tuple(slice(0, n_) for n_ in Dx.shape)]
+            Dx = Dx & (sum((g[i] - pl[i]) ** 2 for i in range(3)) <= radius_mm ** 2)
+            lab = label26(Dx)
         comp = np.zeros(m.shape, bool)
-        comp[ext] = lab == lab[tuple(np.asarray(p) - a)]
+        comp[ext] = lab == lab[pl]
         info["change_vox"] = int(comp.sum())
         return (m | comp) if s == 1 else (m & ~comp), info
 
@@ -224,7 +258,9 @@ def sam_predictor(sam, box_mod, dev, amp):
     def f(x, coords, labels, low):
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=amp):
             emb = sam.image_encoder(x.float().to(dev)).float()
-            lo = decode(sam, box_mod, emb, coords.to(dev), labels.to(dev), None, low.to(dev).float())
+            c_ = None if coords is None else coords.to(dev)
+            l_ = None if labels is None else labels.to(dev)
+            lo = decode(sam, box_mod, emb, c_, l_, None, low.to(dev).float())
             return torch.sigmoid(upsample(lo.float()))[0, 0].cpu().numpy()
     return f
 
@@ -235,14 +271,20 @@ def load_predictor(sam_ckpt, turbo, random_weights):
 
 
 # ----------------------------------------------------------------------------------------------- one patient, one arm
-def run_arm(arm, variant, A, gt, lab, kept0, cand_ids, touches, editor, budget, log, cid, overlay=None, img=None):
+def run_arm(arm, variant, A, gt, lab, kept0, cand_ids, touches, editor, budget, log, cid, overlay=None, img=None,
+            ver="v2", probe=None):
+    """ver v1 = the original simulator (kept for the record and the replay). ver v2: an attempted point/sign is not
+    retried while the mask is unchanged (every attempt still counts), SAM's prompt history has no duplicates, a SAM
+    edit is bounded to CFG['edit_radius_mm'] around the click, and whole-blob removal is an explicit simulated-reader
+    action (reader_delete_blob; it uses the reader's knowledge of the truth, like click placement, for every arm)."""
     m, kept, sam_clicks = A.copy(), set(kept0), []
+    exclude = set()
     dices = [dice(m, gt)]
     masks = {0: m.copy()}
     for step in range(1, budget + 1):
         t0 = time.time()
-        c = next_click(m, gt)
-        row = dict(cache_id=cid, arm=arm, variant=variant, step=step)
+        c = next_click(m, gt, exclude if ver == "v2" else None)
+        row = dict(cache_id=cid, arm=arm, variant=variant, step=step, version=ver)
         if c is None:
             row.update(action="no_error", effective=False)
             log.append(row); dices.append(dices[-1]); masks[step] = m.copy()
@@ -255,27 +297,39 @@ def run_arm(arm, variant, A, gt, lab, kept0, cand_ids, touches, editor, budget, 
             kind, k = act
             new = (m | (lab == k)) if kind == "toggle_on" else (m & ~(lab == k))
             (new_kept.add if kind == "toggle_on" else new_kept.discard)(k)
-            action = kind
+            action = kind if ver == "v1" else {"toggle_on": "add_blob", "toggle_off": "reader_delete_blob"}[kind]
         elif arm == "T":
             new, action = m.copy(), "ineffective"
-        elif arm == "TB":
-            new, action = brush(m, p, sign, CFG["brush_mm"]), "brush"
+        elif arm == "TB" or (arm == "TSH" and sign == 0):
+            new, action = brush(m, p, sign, CFG["brush_mm"]), "brush" if arm == "TB" else "hybrid_brush_negative"
         else:
-            sam_clicks.append((p, sign))
-            new, info = editor.propose(m, sam_clicks)
-            action = "sam"
+            appended = True
+            if ver == "v2" and (tuple(p), sign) in {(tuple(q), sg) for q, sg in sam_clicks}:
+                appended = False                       # no duplicate prompt tokens
+            else:
+                sam_clicks.append((tuple(p), sign))
+            if probe is not None:
+                probe(m, list(sam_clicks[:-1]) if appended else list(sam_clicks), p, sign, step)
+            new, info = editor.propose(m, sam_clicks, at=p, sign=sign,
+                                       radius_mm=CFG["edit_radius_mm"] if ver == "v2" else None)
+            info["duplicate_prompt"] = not appended
+            action = "sam" if arm == "TS" else "hybrid_sam_positive"
             if overlay is not None and step <= 3:
                 overlay(cid, arm, variant, step, img, gt, m, new, p, sign)
         accepted = True
         if variant == "oracle" and dice(new, gt) < dice(m, gt) - 1e-12:
             accepted = False
-            if action == "sam":
+            if action in ("sam", "hybrid_sam_positive") and info.get("duplicate_prompt") is False:
                 sam_clicks.pop()                       # an undone click is not kept as a prompt
         if accepted:
             effective = not np.array_equal(new, m)
             m, kept = new, new_kept
         else:
             effective = False
+        if effective:
+            exclude.clear()
+        else:
+            exclude.add((tuple(int(v) for v in p), sign))
         row.update(action=action, accepted=accepted, effective=effective, seconds=time.time() - t0,
                    **{k: v for k, v in info.items() if k != "origin15"})
         log.append(row)
@@ -489,7 +543,17 @@ def step_run(a, root, sp, out, smoke):
     if par.abs_diff.max() > 1e-6:
         raise SystemExit("parity.csv shows a mismatch")
     apply_calibration(out)
-    (out / "decision_rule.json").write_text(json.dumps(RULE, indent=1))          # frozen before any SAM call
+    ver = a.version
+    RULE["version"] = ver
+    if ver == "v2":
+        RULE["v2_changes"] = ["no retry of the same point/sign while the mask is unchanged (every attempt counts); "
+                              "SAM prompt history without duplicates",
+                              f"SAM edit bounded to a {CFG['edit_radius_mm']} mm ball around the click before choosing the "
+                              "connected change at the click (raw and applied volumes logged)",
+                              "whole-blob removal = explicit simulated-reader action (reader_delete_blob), same for every arm",
+                              "exploratory hybrid arm TSH: SAM for positive clicks, brush for negative clicks",
+                              "revision prompted by the v1 smoke results; v1 outputs preserved"]
+    (out / f"decision_rule_{ver}.json").write_text(json.dumps(RULE, indent=1))   # frozen before any SAM call
     pp, q, fails, pop = population(a)
     ids = choose_smoke(par, a.smoke_n) if smoke else pop
     table = pd.read_csv(Path(a.s3k_out).expanduser() / "train_oof_table.csv")
@@ -497,7 +561,8 @@ def step_run(a, root, sp, out, smoke):
     cdir = Path(a.train_cases).expanduser()
     editor = ClickEditor(load_predictor(a.sam_ckpt, None if a.random_weights else a.turbo_ckpt, a.random_weights),
                          CFG["mask_logit"], CFG["mask_tau"])
-    rd = out / ("smoke" if smoke else "full"); rd.mkdir(exist_ok=True)
+    rd = out / (("smoke" if smoke else "full") + ("" if ver == "v1" else "_v2")); rd.mkdir(exist_ok=True)
+    arms = ARMS_V1 if ver == "v1" else ARMS
     od = rd / "overlays" if smoke else None
     if od is not None:
         od.mkdir(exist_ok=True)
@@ -507,10 +572,10 @@ def step_run(a, root, sp, out, smoke):
         img, gt, lab, kept, cand, touches, A = load_patient(cid, paths[cid], cdir / f"{cid}.npz",
                                                             pp.loc[cid, "B0_rad_subset"], table)
         editor.prepare(img)
-        for arm in ARMS:
+        for arm in arms:
             for variant in VARIANTS:
                 ov = overlay_fn(od) if (od is not None and arm == "TS") else None
-                r = run_arm(arm, variant, A, gt, lab, kept, cand, touches, editor, a.budget, log, cid, ov, img)
+                r = run_arm(arm, variant, A, gt, lab, kept, cand, touches, editor, a.budget, log, cid, ov, img, ver=ver)
                 res.append(dict(cache_id=cid, arm=arm, variant=variant, in_queue=cid in qset, failure=cid in fails,
                                 start_type="empty" if not A.any() else ("wrong_target" if r["dice_0"] < 0.1 else
                                                                          "poor_boundary" if r["dice_0"] < 0.5 else "ok"),
@@ -520,6 +585,88 @@ def step_run(a, root, sp, out, smoke):
     df, lg = pd.DataFrame(res), pd.DataFrame(log)
     df.to_csv(rd / "per_patient.csv", index=False); lg.to_csv(rd / "clicks.csv", index=False)
     report(df, lg, rd, a.budget, smoke)
+
+
+def step_replay(a, root, sp, out):
+    """Diagnostic (no decision): replay the v1 smoke trajectories of the SAM arm and probe every negative SAM click on
+    its identical pre-edit state: no new click / negative with history / same-location positive with history /
+    negative only / positive only. For positive clicks in an empty crop, compare the zero mask prompt with the encoded
+    empty prompt. Reports probability at the clicked voxel, raw and 20 mm-bounded edit volume, duplicate status."""
+    apply_calibration(out)
+    par = pd.read_csv(out / "parity.csv")
+    ids = choose_smoke(par, a.smoke_n)
+    pp, q, fails, pop = population(a)
+    table = pd.read_csv(Path(a.s3k_out).expanduser() / "train_oof_table.csv")
+    paths = dict(require_cases(sp, root, "train"))
+    cdir = Path(a.train_cases).expanduser()
+    ed = ClickEditor(load_predictor(a.sam_ckpt, None if a.random_weights else a.turbo_ckpt, a.random_weights),
+                     CFG["mask_logit"], CFG["mask_tau"])
+    ref = None
+    if (out / "smoke" / "clicks.csv").exists():
+        ref = pd.read_csv(out / "smoke" / "clicks.csv")
+        ref = ref[ref.arm == "TS"]
+    rows, match = [], []
+    R = CFG["edit_radius_mm"]
+    for cid in ids:
+        img, gt, lab, kept, cand, touches, A = load_patient(cid, paths[cid], cdir / f"{cid}.npz",
+                                                            pp.loc[cid, "B0_rad_subset"], table)
+        ed.prepare(img)
+        for variant in VARIANTS:
+            states, log = [], []
+            run_arm("TS", variant, A, gt, lab, kept, cand, touches, ed, a.budget, log, cid, ver="v1",
+                    probe=lambda m, hist, p, sg, st: states.append((m.copy(), hist, tuple(p), sg, st)))
+            sam_rows = [r for r in log if r.get("action") == "sam"]
+            if ref is not None:
+                rr = ref[(ref.cache_id == cid) & (ref.variant == variant) & (ref.action == "sam")]
+                match += [int(x["change_vox"]) == int(y) for x, y in zip(sam_rows, rr.change_vox)]
+            for (m, hist, p, sg, st), r in zip(states, sam_rows):
+                dup = (p, sg) in {(tuple(x), y) for x, y in hist}
+                base = dict(cache_id=cid, variant=variant, step=st, sign=sg, p=list(p), duplicate=dup,
+                            v1_change_vox=int(r["change_vox"]), v1_failed=int(r["change_vox"]) == 0)
+                if sg == 0:
+                    conds = dict(no_new_click=(hist, 0), neg_with_history=(hist + [(p, 0)], 0),
+                                 pos_with_history=(hist + [(p, 1)], 1), neg_only=([(p, 0)], 0), pos_only=([(p, 1)], 1))
+                    for name, (cl, s_) in conds.items():
+                        _, info = ed.propose(m, cl, at=p, sign=0)
+                        _, inb = ed.propose(m, cl, at=p, sign=0, radius_mm=R)
+                        rows.append(dict(base, condition=name, p_at_click=info["p_at_click"],
+                                         raw_removal_vox=info["raw_change_vox"], bounded_removal_vox=inb["change_vox"],
+                                         n_points=info["n_points"]))
+                else:
+                    _, info = ed.propose(m, hist + [(p, 1)], at=p, sign=1)
+                    if info["mask_in_crop_vox"] == 0:
+                        _, iz = ed.propose(m, hist + [(p, 1)], at=p, sign=1, zero_prompt=True)
+                        for name, inf in (("empty_crop_encoded_prompt", info), ("empty_crop_zero_prompt", iz)):
+                            rows.append(dict(base, condition=name, p_at_click=inf["p_at_click"],
+                                             raw_addition_vox=inf["raw_change_vox"]))
+    df = pd.DataFrame(rows)
+    rd = out / "replay"; rd.mkdir(exist_ok=True)
+    df.to_csv(rd / "replay.csv", index=False)
+    pd.set_option("display.width", 220)
+    if ref is not None:
+        print(f"v1 trajectory reproduced: {sum(match)}/{len(match)} SAM edits have the same change volume as smoke/clicks.csv")
+    if not len(df):
+        print("no SAM clicks to probe in these trajectories")
+        print(f"-> {rd}")
+        return
+    neg = df[df.sign == 0]
+    if len(neg):
+        g = neg.groupby(["variant", "v1_failed", "condition"]).agg(states=("p_at_click", "size"),
+                                                                    p_median=("p_at_click", "median"),
+                                                                    p_below_05=("p_at_click", lambda x: float((x < 0.5).mean())),
+                                                                    raw_removal_ml=("raw_removal_vox", lambda x: x.median() / 1000),
+                                                                    bounded_removal_ml=("bounded_removal_vox", lambda x: x.median() / 1000))
+        print("\nnegative SAM clicks, probability at the clicked voxel under each condition:\n" + g.round(3).to_string())
+        nf = neg[(neg.condition == "neg_with_history") & neg.v1_failed]
+        print(f"\nfailed negative clicks: {len(nf)} states | unique (patient, variant, point): "
+              f"{nf.assign(pk=nf.p.astype(str)).drop_duplicates(['cache_id', 'variant', 'pk']).shape[0] if len(nf) else 0}"
+              f" | duplicates among them: {int(nf.duplicate.sum())}")
+    emp = df[df.condition.astype(str).str.startswith("empty_crop")]
+    if len(emp):
+        print("\nempty crop, positive click:\n" + emp.groupby("condition").agg(
+            n=("p_at_click", "size"), p_median=("p_at_click", "median"),
+            raw_addition_ml=("raw_addition_vox", lambda x: x.median() / 1000)).round(3).to_string())
+    print(f"-> {rd}")
 
 
 def boot_ci(d, n=5000, seed=0):
@@ -552,10 +699,10 @@ def report(df, lg, rd, budget, smoke):
     s.to_csv(rd / "summary.csv", index=False)
     act = lg.groupby(["arm", "variant", "action"]).size().unstack(fill_value=0)
     act.to_csv(rd / "click_actions.csv")
-    tech = {}
-    sm = lg[lg.action == "sam"]
-    if len(sm):
-        tech = dict(sam_edits=len(sm), roundtrip_dice_median=float(sm.roundtrip_dice.median()),
+    def tech_of(sm):
+        if not len(sm):
+            return {}
+        return dict(sam_edits=len(sm), roundtrip_dice_median=float(sm.roundtrip_dice.median()),
                     roundtrip_dice_min=float(sm.roundtrip_dice.min()), click_back_err_mm_max=float(sm.click_back_err_mm.max()),
                     p_at_positive_click_median=float(sm[sm.sign == 1].p_at_click.median()) if (sm.sign == 1).any() else None,
                     p_at_negative_click_median=float(sm[sm.sign == 0].p_at_click.median()) if (sm.sign == 0).any() else None,
@@ -565,7 +712,14 @@ def report(df, lg, rd, budget, smoke):
                     no_change_negative=int(((sm.sign == 0) & (sm.change_vox == 0)).sum()),
                     no_change_positive=int(((sm.sign == 1) & (sm.change_vox == 0)).sum()),
                     max_addition_ml=float(sm[sm.sign == 1].change_vox.max() / 1000) if (sm.sign == 1).any() else None,
+                    max_raw_addition_ml=float(sm[sm.sign == 1].raw_change_vox.max() / 1000)
+                    if "raw_change_vox" in sm and (sm.sign == 1).any() else None,
+                    duplicate_prompts=int(sm.duplicate_prompt.sum()) if "duplicate_prompt" in sm else None,
                     mask_tau=CFG["mask_tau"], mask_logit=CFG["mask_logit"])
+    sm = lg[lg.action == "sam"]
+    tech = {"pooled": tech_of(sm), **{v: tech_of(sm[sm.variant == v]) for v in VARIANTS}}
+    rep_pts = lg.dropna(subset=["p"]).assign(pkey=lambda d: d.p.astype(str) + "|" + d.sign.astype(str))
+    tech["repeated_point_sign_attempts"] = int(rep_pts.duplicated(["cache_id", "arm", "variant", "pkey"]).sum())
     (rd / "technical.json").write_text(json.dumps(tech, indent=1))
     verdict = None
     if budget >= 3 and not smoke:
@@ -599,7 +753,7 @@ def report(df, lg, rd, budget, smoke):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", choices=["parity", "calibrate", "smoke", "full"], required=True)
+    ap.add_argument("--step", choices=["parity", "calibrate", "replay", "smoke", "full"], required=True)
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
     ap.add_argument("--s3k_out", required=True)
@@ -611,6 +765,7 @@ def main():
     ap.add_argument("--budget", type=int, default=CFG["budget"])
     ap.add_argument("--budget_frac", type=float, default=CFG["budget_frac"], help="review queue share (frozen 0.10)")
     ap.add_argument("--smoke_n", type=int, default=12)
+    ap.add_argument("--version", choices=["v1", "v2"], default="v2", help="v1 = original simulator (record only)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     out = Path(a.out).expanduser(); out.mkdir(parents=True, exist_ok=True)
@@ -618,10 +773,10 @@ def main():
     sp = pd.read_csv(a.splits)
     if a.step == "parity":
         step_parity(a, root, sp, out)
-    elif a.step == "calibrate":
+    elif a.step in ("calibrate", "replay"):
         if not a.random_weights and not (a.sam_ckpt and a.turbo_ckpt):
             raise SystemExit("--sam_ckpt and --turbo_ckpt are required")
-        step_calibrate(a, root, sp, out)
+        (step_calibrate if a.step == "calibrate" else step_replay)(a, root, sp, out)
     else:
         if not a.random_weights and not (a.sam_ckpt and a.turbo_ckpt):
             raise SystemExit("--sam_ckpt and --turbo_ckpt are required")
