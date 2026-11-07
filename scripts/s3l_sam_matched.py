@@ -25,6 +25,10 @@ Frozen decision rule (1,080 out-of-fold training patients; A = B0_rad, B = B0_ra
 Outputs (<out>): arms_summary.csv, paired_comparison.csv, auc.csv, failure_audit.csv, per_patient.csv,
     folds.csv, selected_thresholds.json, decision_rule.json, decision_rule_check.json, provenance.json
 
+Optional check (--base finder): the same comparison WITHOUT radiomics, B0 (7 finder features, S3j/S3k
+    reference) vs B0_sam (7 + 4 SAM). Tells whether SAM helps on its own and is only overlapped by radiomics.
+    Same folds, seeds and frozen rule with A = B0.
+
 Usage (server)
     OMP_NUM_THREADS=1 python -u scripts/s3l_sam_matched.py --s3k_out ~/CIDS/outputs/s3k_radiomics \\
         --config configs/s3i_subset_jury.json --out ~/CIDS/outputs/s3l_sam
@@ -48,6 +52,7 @@ from cids.radiomics import RAD_ALL  # noqa: E402
 
 SAM4 = ["agree", "log_sam_ml", "log_sam_soft_ml", "log_sam_over_seg"]
 RULE = {**K.RULE, "A": "B0_rad (7 finder + 15 radiomics + 2 relative)", "B": "B0_rad + 4 SAM features"}
+RULE_FINDER = {**K.RULE, "A": "B0 (7 finder features)", "B": "B0 + 4 SAM features (no radiomics)"}
 
 
 def run(train, val, arms, C, out):
@@ -118,13 +123,17 @@ def main():
     ap.add_argument("--s3k_out", required=True, help="S3k output folder (train_oof_table.csv, val_table.csv)")
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--base", choices=["rad", "finder"], default="rad",
+                    help="rad: B0_rad vs B0_rad_sam (main); finder: B0 vs B0_sam, no radiomics (optional check)")
     a = ap.parse_args()
     C = json.loads(Path(a.config).read_text())
     src = Path(a.s3k_out).expanduser()
     out = Path(a.out).expanduser(); out.mkdir(parents=True, exist_ok=True)
-    (out / "decision_rule.json").write_text(json.dumps(RULE, indent=1))          # frozen before any fitting
-    FA = list(C["finder_features"]) + RAD_ALL + K.REL2
+    rule = RULE if a.base == "rad" else RULE_FINDER
+    (out / "decision_rule.json").write_text(json.dumps(rule, indent=1))          # frozen before any fitting
+    FA = list(C["finder_features"]) + (RAD_ALL + K.REL2 if a.base == "rad" else [])
     FB = FA + SAM4
+    nA, nB = ("B0_rad", "B0_rad_sam") if a.base == "rad" else ("B0", "B0_sam")
     S.check_whitelist(FB, C["forbidden_features"])
     tr_csv, va_csv = src / "train_oof_table.csv", src / "val_table.csv"
     for f in (tr_csv, va_csv):
@@ -138,7 +147,7 @@ def main():
     print(f"S3l | train {len(train)} (K=0: {sum(p['K'] == 0 for p in train)}) | val {len(val)} | "
           f"A: {len(FA)} features | B: {len(FB)} features | candidates with a missing SAM value: {nan_sam}", flush=True)
 
-    arms = {"B0_rad": FA, "B0_rad_sam": FB}
+    arms = {nA: FA, nB: FB}
     summ, comp, aucs, aud, pp, verdict = run(train, val, arms, C, out)
     pd.DataFrame(summ).to_csv(out / "arms_summary.csv", index=False)
     pd.DataFrame(comp).to_csv(out / "paired_comparison.csv", index=False)
@@ -146,7 +155,7 @@ def main():
     pd.DataFrame(aud).to_csv(out / "failure_audit.csv", index=False)
     pd.DataFrame(pp).to_csv(out / "per_patient.csv", index=False)
     (out / "decision_rule_check.json").write_text(json.dumps(verdict, indent=1))
-    prov = dict(script="scripts/s3l_sam_matched.py", config=C, rule=RULE, features_A=FA, features_B=FB,
+    prov = dict(script="scripts/s3l_sam_matched.py", base=a.base, config=C, rule=rule, features_A=FA, features_B=FB,
                 inputs={k: dict(path=str(v), md5=K.md5(v)) for k, v in dict(train=tr_csv, val=va_csv).items()},
                 note="Same tables as S3k (radiomics identical in both arms). SAM-S2b decoder saw the training "
                      "patients. Val is a reused development set. Test not read.")
@@ -155,13 +164,13 @@ def main():
     pd.set_option("display.width", 200)
     cols = ["split", "policy", "dice", "dice_median", "dice_lt_0_1", "dice_lt_0_5", "kept_n", "harmful_removals"]
     print("\n" + pd.DataFrame(summ)[cols].round(4).to_string(index=False))
-    print("\npaired B0_rad_sam - B0_rad (patient bootstrap):")
+    print(f"\npaired {nB} - {nA} (patient bootstrap):")
     print(pd.DataFrame(comp)[["split", "mean_diff", "ci95_lo", "ci95_hi", "better", "worse",
                               "new_fail_lt_0.1", "rescued_lt_0.1"]].round(4).to_string(index=False))
     print("\ncandidate AUC:")
     print(pd.DataFrame(aucs).round(4).to_string(index=False))
     print("\nfrozen rule (train OOF):", json.dumps(verdict, indent=1))
-    print(f"\nVERDICT: {'SAM FEATURES QUALIFY' if verdict['radiomics_qualify'] else 'keep B0_rad (SAM features do not qualify)'}")
+    print(f"\nVERDICT: {'SAM FEATURES QUALIFY' if verdict['radiomics_qualify'] else f'keep {nA} (SAM features do not qualify)'}")
     print(f"-> {out}")
 
 

@@ -79,3 +79,19 @@ def test_missing_tables(tmp_path):
     r = subprocess.run([sys.executable, str(ROOT / "scripts" / "s3l_sam_matched.py"), "--s3k_out", str(tmp_path),
                         "--config", str(cfg), "--out", str(tmp_path / "o")], capture_output=True, text=True)
     assert r.returncode != 0 and "run S3k first" in (r.stderr + r.stdout)
+
+
+def test_finder_base(tmp_path):
+    src = tmp_path / "s3k"; src.mkdir()
+    make_table(src / "train_oof_table.csv", "duke", 30, 0, empty=1)
+    make_table(src / "val_table.csv", "nact", 12, 1)
+    cfg = tmp_path / "cfg.json"; cfg.write_text(json.dumps(C_FAST))
+    out = tmp_path / "out"
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "s3l_sam_matched.py"), "--s3k_out", str(src),
+                        "--config", str(cfg), "--out", str(out), "--base", "finder"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "A: 7 features | B: 11 features" in r.stdout and "VERDICT" in r.stdout
+    assert set(pd.read_csv(out / "arms_summary.csv").policy) == {"B0", "B0_sam"}
+    prov = json.loads((out / "provenance.json").read_text())
+    assert prov["base"] == "finder" and len(prov["features_A"]) == 7 and not set(prov["features_A"]) & set(RAD_ALL)
+    assert json.loads((out / "decision_rule.json").read_text())["A"].startswith("B0 (7")
