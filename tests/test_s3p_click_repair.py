@@ -143,3 +143,30 @@ def test_end_to_end(tmp_path):
     v = json.loads((out / "full" / "decision_rule_check.json").read_text())
     assert set(v) >= {"mean_dnsd", "ci95", "harmed_TS", "harmed_TB", "advance_to_reader_study"}
     assert json.loads((out / "decision_rule.json").read_text())["min_mean_dnsd"] == 0.05
+
+
+def test_low_tau_keeps_small_blob():
+    mc = P.M3.ball((128,) * 3, (64, 64, 64), 3)          # ~6 mm blob at 1.5 mm
+    assert P.low_to_mask(P.mask_to_low(mc, 4.0, 0.5)).sum() <= P.low_to_mask(P.mask_to_low(mc, 4.0, 0.125)).sum()
+    assert P.low_to_mask(P.mask_to_low(mc, 4.0, 0.125)).any()
+    big = P.M3.ball((128,) * 3, (64, 64, 64), 20)
+    assert np.allclose(P.mask_to_low(big, 4.0, 0.5).numpy(), 4.0 * (2 * __import__("torch").nn.functional.avg_pool3d(
+        __import__("torch").from_numpy(big.astype(np.float32))[None, None], 4).numpy() - 1))
+
+
+def test_calibrate_then_smoke(tmp_path):
+    base = [x.replace("s3m_contour_study.py", "s3p_click_repair.py") for x in _with_tables(tmp_path)]
+    out = tmp_path / "out"
+    assert subprocess.run(base + ["--step", "parity", "--out", str(out)], capture_output=True, text=True).returncode == 0
+    r = subprocess.run(base + ["--step", "calibrate", "--random_weights", "--out", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    c = json.loads((out / "calibration.json").read_text())
+    assert c["chosen_tau"] in c["tau_grid"] and c["chosen_L"] in c["L_grid"]
+    par = pd.read_csv(out / "parity.csv")
+    assert not set(c["patients_used"]) & set(par.cache_id)                          # outside the population
+    r = subprocess.run(base + ["--step", "smoke", "--random_weights", "--budget", "2", "--smoke_n", "1", "--out", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "using calibration.json" in r.stdout
+    rule = json.loads((out / "decision_rule.json").read_text())
+    assert rule["calibration"]["tau"] == c["chosen_tau"] and rule["config"]["mask_logit"] == c["chosen_L"]

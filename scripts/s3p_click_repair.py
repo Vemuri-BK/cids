@@ -33,7 +33,9 @@ Frozen pilot advancement rule (queue, always-accept, after 3 clicks, TS vs TB): 
 Reported: Dice and NSD@2mm after 0, 1, 3, 5 clicks, rescues (<0.5 -> >=0.5), newly harmed (>=0.5 -> <0.5), patients
   ending below their starting Dice, patients never reaching Dice 0.8 by click 5, click actions, runtime.
 
-Steps: --step parity (CPU) -> --step smoke (GPU, 12 chosen patients + overlays) -> --step full (GPU)
+Steps: --step parity (CPU) -> --step calibrate (GPU; mask-prompt tau / L on 20 train patients OUTSIDE the
+  population, by round-trip agreement and click compliance only) -> --step smoke (GPU, 12 chosen patients + overlays)
+  -> --step full (GPU). smoke / full read <out>/calibration.json and record it in decision_rule.json.
 Usage (server)
   python scripts/s3p_click_repair.py --step parity --cache_root ~/data --s3k_out ~/CIDS/outputs/s3k_radiomics \\
       --train_cases ~/CIDS/outputs/s3g_oof_masks/cases --s3n_dir ~/CIDS/outputs/s3n_qc --out ~/CIDS/outputs/s3p_click
@@ -61,7 +63,7 @@ from cids.provenance import require_cases  # noqa: E402
 STRUCT = np.ones((3, 3, 3), bool)
 ARMS = ("T", "TB", "TS")
 VARIANTS = ("always", "oracle")
-CFG = dict(budget=5, brush_mm=5, mask_logit=4.0, sam_spacing=1.5, sam_size=128, report_steps=[0, 1, 3, 5],
+CFG = dict(budget=5, brush_mm=5, mask_logit=4.0, mask_tau=0.5, sam_spacing=1.5, sam_size=128, report_steps=[0, 1, 3, 5],
            budget_frac=0.10)
 RULE = dict(population="S3n 108-patient review queue (development cohort)", acceptance="always-accept",
             comparison="TS (toggle + SAM) vs TB (toggle + 5 mm brush) after 3 clicks", min_mean_dnsd=0.05,
@@ -138,12 +140,13 @@ def brush(m, p, sign, r):
     return out
 
 
-def mask_to_low(mc, L=4.0):
-    """128^3 bool crop -> (1,1,32,32,32) logits L*(2f-1), f = fraction of tumour voxels in each 4^3 block."""
+def mask_to_low(mc, L=4.0, tau=0.5):
+    """128^3 bool crop -> (1,1,32,32,32) logits L*(f - tau)/max(tau, 1 - tau), f = tumour fraction of each 4^3
+    block (tau = 0.5 gives L*(2f - 1)); a block counts as tumour when f > tau."""
     import torch
     import torch.nn.functional as F
     f = F.avg_pool3d(torch.from_numpy(mc.astype(np.float32))[None, None], 4)
-    return L * (2 * f - 1)
+    return L * (f - tau) / max(tau, 1 - tau)
 
 
 def low_to_mask(low):
@@ -155,8 +158,8 @@ class ClickEditor:
     """REAL-click SAM inference: takes click coordinates and the current mask, never the expert mask.
     predictor(x (1,1,128^3), coords (1,n,3) | None, labels (1,n) | None, low (1,1,32^3)) -> prob (128^3) numpy."""
 
-    def __init__(self, predictor, L=4.0):
-        self.predict, self.L = predictor, L
+    def __init__(self, predictor, L=4.0, tau=0.5):
+        self.predict, self.L, self.tau = predictor, L, tau
 
     def prepare(self, img):
         from cids.data.cache import resample
@@ -182,7 +185,7 @@ class ClickEditor:
         fc, _ = crop_pad(self.fg, c15)
         x = torch.from_numpy(znorm(vc, fc)[None, None])
         mc, _ = crop_pad(self._mask15(m).astype(np.uint8), c15)
-        low = mask_to_low(mc > 0, self.L)
+        low = mask_to_low(mc > 0, self.L, self.tau)
         pts, labs = [], []
         for q, sg in clicks:
             cq = M3.to_crop(q, origin)
@@ -313,6 +316,104 @@ def population(a):
     return pp, q, fails, pop
 
 
+# ----------------------------------------------------------------------------------------------- calibration
+CALIB = dict(n_patients=20, seed=0, tau_grid=[0.5, 0.25, 0.125], L_grid=[4.0, 2.0, 1.0],
+             tau_criterion="highest mean round-trip agreement (mask vs its converted prompt) in click-centred crops; "
+                           "ties -> larger tau",
+             L_criterion="highest click compliance = mean(share of positive clicks with SAM p > 0.5, share of "
+                         "negative clicks with SAM p < 0.5); ties -> larger L",
+             patients="train OOF patients OUTSIDE the 180-patient S3p population, with a non-empty starting mask",
+             note="technical calibration only: no criterion uses Dice against the expert mask")
+
+
+def largest_region_click(err):
+    if not err.any():
+        return None
+    lab = label26(err)
+    size = np.bincount(lab.ravel())[1:]
+    return deepest_point(lab == int(np.argmax(size)) + 1)
+
+
+def roundtrip_in_crop(editor, m, p, tau):
+    from cids.data.cache import crop_pad
+    c15 = np.floor((np.asarray(p, float) + 0.5) / CFG["sam_spacing"]).astype(int)
+    mc, origin = crop_pad(editor._mask15(m).astype(np.uint8), c15)
+    low = mask_to_low(mc > 0, 1.0, tau)
+    rt = M3.paste_back(low_to_mask(low).astype(np.float32), origin, editor.shape15, editor.shape1) > 0.5
+    n = CFG["sam_size"]
+    a = np.maximum(np.floor(np.asarray(origin) * 1.5).astype(int), 0)
+    b = np.minimum(np.ceil((np.asarray(origin) + n) * 1.5).astype(int), editor.shape1)
+    ext = tuple(slice(i, j) for i, j in zip(a, b))
+    return dice(rt[ext], m[ext]) if m[ext].any() else np.nan
+
+
+def step_calibrate(a, root, sp, out):
+    pp, q, fails, pop = population(a)
+    table = pd.read_csv(Path(a.s3k_out).expanduser() / "train_oof_table.csv")
+    pool = [c for c in pp.index if c not in set(pop) and M3.kept_ids(pp.loc[c, "B0_rad_subset"])]
+    rng = np.random.default_rng(CALIB["seed"])
+    ids = sorted(rng.choice(pool, min(CALIB["n_patients"], len(pool)), replace=False).tolist()) if pool else []
+    if not ids:
+        raise SystemExit("no calibration patients outside the population")
+    paths = dict(require_cases(sp, root, "train"))
+    cdir = Path(a.train_cases).expanduser()
+    pred = load_predictor(a.sam_ckpt, None if a.random_weights else a.turbo_ckpt, a.random_weights)
+    rows = []
+    for cid in ids:
+        img, gt, lab, kept, cand, touches, A = load_patient(cid, paths[cid], cdir / f"{cid}.npz",
+                                                            pp.loc[cid, "B0_rad_subset"], table)
+        ed = ClickEditor(pred); ed.prepare(img)
+        clicks = [(sg, largest_region_click(err)) for sg, err in ((1, gt & ~A), (0, A & ~gt))]
+        for sg, p in clicks:
+            if p is None:
+                continue
+            for tau in CALIB["tau_grid"]:
+                rows.append(dict(cache_id=cid, sign=sg, kind="roundtrip", tau=tau, value=roundtrip_in_crop(ed, A, p, tau)))
+        rows.append(dict(cache_id=cid, kind="_clicks", value=json.dumps([[sg, list(p)] for sg, p in clicks if p])))
+        ed._clicks = [(sg, p) for sg, p in clicks if p is not None]
+        ed._A = A
+        rows[-1]["_editor"] = ed
+    rt = pd.DataFrame([r for r in rows if r.get("kind") == "roundtrip"])
+    tau_tab = rt.groupby("tau").value.mean().sort_index(ascending=False)
+    tau = float(tau_tab.idxmax())                                   # first max in descending order = larger tau
+    comp = []
+    for r in [r for r in rows if r.get("kind") == "_clicks"]:
+        ed = r["_editor"]
+        for L in CALIB["L_grid"]:
+            ed.L, ed.tau = L, tau
+            for sg, p in ed._clicks:
+                _, info = ed.propose(ed._A, [(p, sg)])
+                comp.append(dict(cache_id=r["cache_id"], L=L, sign=sg, p_at_click=info["p_at_click"],
+                                 comply=bool(info["p_at_click"] > 0.5) if sg == 1 else bool(info["p_at_click"] < 0.5),
+                                 change_vox=info.get("change_vox", 0)))
+    cp = pd.DataFrame(comp)
+    by = cp.groupby(["L", "sign"]).comply.mean().unstack()
+    score = by.mean(axis=1).sort_index(ascending=False)
+    L = float(score.idxmax())
+    res = dict(**CALIB, patients_used=ids, chosen_tau=tau, chosen_L=L, roundtrip_by_tau=tau_tab.round(4).to_dict(),
+               compliance_by_L={str(k): {"positive": float(by.loc[k].get(1, np.nan)), "negative": float(by.loc[k].get(0, np.nan)),
+                                         "score": float(score.loc[k])} for k in score.index},
+               n_positive_clicks=int((cp.sign == 1).sum() / len(CALIB["L_grid"])),
+               n_negative_clicks=int((cp.sign == 0).sum() / len(CALIB["L_grid"])))
+    rt.to_csv(out / "calibration_roundtrip.csv", index=False); cp.to_csv(out / "calibration_clicks.csv", index=False)
+    (out / "calibration.json").write_text(json.dumps(res, indent=1, default=float))
+    print(json.dumps({k: v for k, v in res.items() if k not in ("patients_used",)}, indent=1, default=float))
+    print(f"CALIBRATED: tau = {tau}, L = {L}  -> {out / 'calibration.json'} (used by --step smoke / full)")
+
+
+def apply_calibration(out):
+    f = out / "calibration.json"
+    if not f.exists():
+        print("no calibration.json: using the default mask prompt (tau 0.5, L 4)")
+        return None
+    c = json.loads(f.read_text())
+    CFG["mask_tau"], CFG["mask_logit"] = float(c["chosen_tau"]), float(c["chosen_L"])
+    RULE["calibration"] = dict(file=str(f), tau=CFG["mask_tau"], L=CFG["mask_logit"], patients=len(c["patients_used"]),
+                               note=c["note"])
+    print(f"using calibration.json: tau = {CFG['mask_tau']}, L = {CFG['mask_logit']}")
+    return c
+
+
 # ----------------------------------------------------------------------------------------------- steps
 def step_parity(a, root, sp, out):
     pp, q, fails, pop = population(a)
@@ -387,6 +488,7 @@ def step_run(a, root, sp, out, smoke):
     par = pd.read_csv(par_f)
     if par.abs_diff.max() > 1e-6:
         raise SystemExit("parity.csv shows a mismatch")
+    apply_calibration(out)
     (out / "decision_rule.json").write_text(json.dumps(RULE, indent=1))          # frozen before any SAM call
     pp, q, fails, pop = population(a)
     ids = choose_smoke(par, a.smoke_n) if smoke else pop
@@ -394,7 +496,7 @@ def step_run(a, root, sp, out, smoke):
     paths = dict(require_cases(sp, root, "train"))
     cdir = Path(a.train_cases).expanduser()
     editor = ClickEditor(load_predictor(a.sam_ckpt, None if a.random_weights else a.turbo_ckpt, a.random_weights),
-                         CFG["mask_logit"])
+                         CFG["mask_logit"], CFG["mask_tau"])
     rd = out / ("smoke" if smoke else "full"); rd.mkdir(exist_ok=True)
     od = rd / "overlays" if smoke else None
     if od is not None:
@@ -457,7 +559,13 @@ def report(df, lg, rd, budget, smoke):
                     roundtrip_dice_min=float(sm.roundtrip_dice.min()), click_back_err_mm_max=float(sm.click_back_err_mm.max()),
                     p_at_positive_click_median=float(sm[sm.sign == 1].p_at_click.median()) if (sm.sign == 1).any() else None,
                     p_at_negative_click_median=float(sm[sm.sign == 0].p_at_click.median()) if (sm.sign == 0).any() else None,
-                    sam_no_change=int((sm.change_vox == 0).sum()), seconds_per_sam_edit=float(sm.seconds.mean()))
+                    sam_no_change=int((sm.change_vox == 0).sum()), seconds_per_sam_edit=float(sm.seconds.mean()),
+                    negative_compliance=float((sm[sm.sign == 0].p_at_click < 0.5).mean()) if (sm.sign == 0).any() else None,
+                    positive_compliance=float((sm[sm.sign == 1].p_at_click > 0.5).mean()) if (sm.sign == 1).any() else None,
+                    no_change_negative=int(((sm.sign == 0) & (sm.change_vox == 0)).sum()),
+                    no_change_positive=int(((sm.sign == 1) & (sm.change_vox == 0)).sum()),
+                    max_addition_ml=float(sm[sm.sign == 1].change_vox.max() / 1000) if (sm.sign == 1).any() else None,
+                    mask_tau=CFG["mask_tau"], mask_logit=CFG["mask_logit"])
     (rd / "technical.json").write_text(json.dumps(tech, indent=1))
     verdict = None
     if budget >= 3 and not smoke:
@@ -491,7 +599,7 @@ def report(df, lg, rd, budget, smoke):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", choices=["parity", "smoke", "full"], required=True)
+    ap.add_argument("--step", choices=["parity", "calibrate", "smoke", "full"], required=True)
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
     ap.add_argument("--s3k_out", required=True)
@@ -510,6 +618,10 @@ def main():
     sp = pd.read_csv(a.splits)
     if a.step == "parity":
         step_parity(a, root, sp, out)
+    elif a.step == "calibrate":
+        if not a.random_weights and not (a.sam_ckpt and a.turbo_ckpt):
+            raise SystemExit("--sam_ckpt and --turbo_ckpt are required")
+        step_calibrate(a, root, sp, out)
     else:
         if not a.random_weights and not (a.sam_ckpt and a.turbo_ckpt):
             raise SystemExit("--sam_ckpt and --turbo_ckpt are required")
