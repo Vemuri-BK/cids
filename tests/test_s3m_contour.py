@@ -201,3 +201,22 @@ def test_parity_failure_and_test_refused(tmp_path):
     r = subprocess.run(base + ["--step", "parity", "--eval_splits", "test", "--out", str(tmp_path / "o")],
                        capture_output=True, text=True)
     assert r.returncode != 0 and "development study" in r.stdout + r.stderr
+
+
+def test_shift_profile_finds_known_shift():
+    gt = M.ball(SHAPE, (30, 30, 20), 7)
+    assert M.shift_profile(gt, gt)[0] == (0, 0, 0)
+    moved = np.roll(gt, (2, -1, 1), axis=(0, 1, 2))
+    best, d0, bd = M.shift_profile(moved, gt, 3)
+    assert best == (-2, 1, -1) and bd == 1.0 and d0 < 1.0
+
+
+def test_shiftcheck_step(tmp_path):
+    base = _project(tmp_path)
+    out = tmp_path / "out"
+    assert subprocess.run(base + ["--step", "parity", "--out", str(out)], capture_output=True, text=True).returncode == 0
+    r = subprocess.run(base + ["--step", "shiftcheck", "--random_weights", "--shift_n", "3", "--out", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    s = pd.read_csv(out / "shift_summary.csv", index_col=0)
+    assert set(s.index) == set(M.ARMS) and s.loc["A", "mean_gain"] >= 0

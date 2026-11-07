@@ -278,7 +278,7 @@ def candidate_contours(img, lab, k, crop, box15, origin, shape15, es, runner):
     return out, comp, R, row
 
 
-def patient_run(cid, split, img, gt, lab, ks, runner, overlay_dir=None):
+def patient_run(cid, split, img, gt, lab, ks, runner, overlay_dir=None, return_masks=False):
     import s3a_seg2sam as s3
     t0 = time.time()
     masks = {f"{a}_{v}": np.zeros(gt.shape, bool) for a in ARMS for v in ("raw", "fb")}
@@ -312,7 +312,70 @@ def patient_run(cid, split, img, gt, lab, ks, runner, overlay_dir=None):
         for q, v in met.items():
             res[f"{name}_{q}"] = v
     res["seconds"] = time.time() - t0
-    return res, rows
+    return (res, rows, masks) if return_masks else (res, rows)
+
+
+# --------------------------------------------------------------------------------------------- shift check
+def shift_profile(m, gt, max_shift=3):
+    """Dice of m shifted by every integer (dx,dy,dz) in [-max_shift, max_shift]^3 against gt.
+    Returns (best_shift, dice_at_0, best_dice). A correctly aligned contour peaks at (0,0,0) on average."""
+    if not m.any() or not gt.any():
+        return (0, 0, 0), dice_count(m, gt), dice_count(m, gt)
+    idx = np.argwhere(m | gt)
+    lo = np.maximum(idx.min(0) - max_shift - 1, 0); hi = np.minimum(idx.max(0) + max_shift + 2, m.shape)
+    sl = tuple(slice(a, b) for a, b in zip(lo, hi))
+    mm = np.pad(m[sl], max_shift); gg = gt[sl]
+    best, d0, bd = (0, 0, 0), None, -1.0
+    sm, sg = int(m.sum()), int(gt.sum())
+    for dx in range(-max_shift, max_shift + 1):
+        for dy in range(-max_shift, max_shift + 1):
+            for dz in range(-max_shift, max_shift + 1):
+                w = mm[max_shift - dx:max_shift - dx + gg.shape[0], max_shift - dy:max_shift - dy + gg.shape[1],
+                       max_shift - dz:max_shift - dz + gg.shape[2]]
+                d = 2.0 * int((w & gg).sum()) / (sm + sg)
+                if (dx, dy, dz) == (0, 0, 0):
+                    d0 = d
+                if d > bd + 1e-12:
+                    best, bd = (dx, dy, dz), d
+    return best, d0, bd
+
+
+def step_shiftcheck(a, root, sp, pp, splits, out):
+    """Geometry diagnostic only (no decision): are the SAM contours aligned with the image as well as A is?"""
+    par = pd.read_csv(Path(a.parity_csv).expanduser() if a.parity_csv else out / "parity.csv")
+    pool = par[(par.n_kept == 1) & (par.dice >= 0.6) & par.split.isin(splits)]
+    pick = set(pool.sample(min(a.shift_n, len(pool)), random_state=a.seed).cache_id)
+    jobs = [j for j in jobs_for(a, root, sp, pp, splits) if j[0] in pick]
+    runner = load_runner(a.sam_ckpt, None if a.random_weights else a.turbo_ckpt, a.random_weights)
+    print(f"S3m shift check | {len(jobs)} patients (one kept blob, A Dice >= 0.6)", flush=True)
+    rows = []
+    for cid, split, cpath, lpath, subset, saved in jobs:
+        img, lbl = load_case(cpath)
+        gt = lbl > 0
+        lab = np.load(lpath)["lab"]
+        _, _, masks = patient_run(cid, split, img, gt, lab, kept_ids(subset), runner, None, return_masks=True)
+        for arm in ("A", "B", "C", "D", "E"):
+            m = masks[f"{arm}_raw"]
+            (dx, dy, dz), d0, bd = shift_profile(m, gt, 3)
+            rows.append(dict(cache_id=cid, split=split, arm=arm, dx=dx, dy=dy, dz=dz, dice_0=d0, dice_best=bd,
+                             gain=bd - d0, centroid_offset=(np.argwhere(m).mean(0) - np.argwhere(gt).mean(0)).round(2).tolist()
+                             if m.any() else None))
+    df = pd.DataFrame(rows)
+    df.to_csv(out / "shift_check.csv", index=False)
+    s = df.groupby("arm").agg(n=("dx", "size"), mean_dx=("dx", "mean"), mean_dy=("dy", "mean"), mean_dz=("dz", "mean"),
+                              zero_shift_share=("gain", lambda g: float((g <= 1e-12).mean())),
+                              mean_dice_0=("dice_0", "mean"), mean_dice_best=("dice_best", "mean"),
+                              mean_gain=("gain", "mean"))
+    for arm, g in df.groupby("arm"):
+        for ax in ("dx", "dy", "dz"):
+            s.loc[arm, f"{ax}_pos_neg"] = f"{int((g[ax] > 0).sum())}/{int((g[ax] < 0).sum())}"
+    s.to_csv(out / "shift_summary.csv")
+    pd.set_option("display.width", 220)
+    print("\nbest integer shift (mm) of each arm's contour against the expert mask (A = reference alignment):")
+    print(s.round(3).to_string())
+    print("\nRead: B/C/D aligned like A -> mean shifts near 0 and +/- counts balanced. A consistent same-sign shift in"
+          " B/C/D (not in A) = paste-back error.")
+    print(f"-> {out}")
 
 
 # --------------------------------------------------------------------------------------------- overlays
@@ -599,7 +662,8 @@ def step_arms(a, root, sp, pp, splits, out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", choices=["parity", "arms"], required=True)
+    ap.add_argument("--step", choices=["parity", "arms", "shiftcheck"], required=True)
+    ap.add_argument("--shift_n", type=int, default=30, help="patients for --step shiftcheck")
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
     ap.add_argument("--eval_splits", default="train,val")
@@ -628,7 +692,7 @@ def main():
     else:
         if not a.random_weights and not (a.sam_ckpt and a.turbo_ckpt):
             raise SystemExit("--sam_ckpt (S2b best.pt) and --turbo_ckpt are required")
-        step_arms(a, root, sp, pp, splits, out)
+        (step_arms if a.step == "arms" else step_shiftcheck)(a, root, sp, pp, splits, out)
 
 
 if __name__ == "__main__":
