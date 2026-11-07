@@ -237,3 +237,30 @@ def test_replay_reproduces_v1_and_probes_negatives(tmp_path):
     m = re.search(r"reproduced: (\d+)/(\d+)", r.stdout)
     assert m and m.group(1) == m.group(2)
     assert (out / "replay" / "replay.csv").exists()
+
+
+def test_v2_sam_arms_point_history():
+    img, gt, lab = _case()
+    A = lab == 3
+    seen = {"TS": [], "TS_hist": []}
+    for arm in seen:
+        def fake(x, coords, labels, low, arm=arm):
+            seen[arm].append(0 if coords is None else coords.shape[1])
+            c = coords[0, -1].numpy().astype(int)
+            return P.M3.ball((128,) * 3, c, 2).astype(np.float32)          # small, effective edits
+        log = []
+        P.run_arm(arm, "always", A, gt, lab, [3], {3, 4}, {3: True, 4: False}, _editor(img, fake), 4, log, "x")
+    assert seen["TS"] and all(n == 1 for n in seen["TS"])                   # current click only
+    assert max(seen["TS_hist"]) > 1                                         # history accumulates
+
+
+def test_implementation_checks_and_editor_has_no_gt():
+    img, gt, lab = _case()
+    A = lab == 3
+    rows, log = [], []
+    e = _editor(img, lambda x, c, l, low: P.M3.ball((128,) * 3, c[0, -1].numpy().astype(int), 2).astype(np.float32))
+    for arm in P.ARMS:
+        r = P.run_arm(arm, "always", A, gt, lab, [3], {3, 4}, {3: True, 4: False}, e, 3, log, "x")
+        rows.append(dict(cache_id="x", arm=arm, variant="always", **r))
+    c = P.implementation_checks(pd.DataFrame(rows), pd.DataFrame(log))
+    assert c["all_pass"] and c["editor_functions_take_no_expert_mask"] and c["retries_of_unchanged_attempts"] == 0

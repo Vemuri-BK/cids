@@ -62,7 +62,10 @@ from cids.provenance import require_cases  # noqa: E402
 
 STRUCT = np.ones((3, 3, 3), bool)
 ARMS_V1 = ("T", "TB", "TS")
-ARMS = ("T", "TB", "TS", "TSH")          # v2; TSH = exploratory hybrid (SAM for positive, brush for negative clicks)
+ARMS = ("T", "TB", "TS", "TS_hist", "TS_hybrid")
+# v2: TS (PRIMARY SAM arm) = current click only + current mask; TS_hist (exploratory) = de-duplicated in-crop click
+# history + current mask; TS_hybrid (exploratory) = SAM (current click) for positive clicks, brush for negative clicks
+SAM_ARMS = {"TS": "current", "TS_hist": "history", "TS_hybrid": "current"}
 VARIANTS = ("always", "oracle")
 CFG = dict(budget=5, brush_mm=5, edit_radius_mm=20, mask_logit=4.0, mask_tau=0.5, sam_spacing=1.5, sam_size=128, report_steps=[0, 1, 3, 5],
            budget_frac=0.10)
@@ -151,6 +154,24 @@ def toggle_action(p, sign, kept, cand_ids, lab, cand_touches_gt):
             return "toggle_on", c
         if sign == 0 and c in kept and not cand_touches_gt[c]:
             return "toggle_off", c
+    return None
+
+
+def reader_action(p, sign, kept, lab, cand_ids, gt):
+    """SIMULATED READER (uses the expert mask, like click placement): an explicit 'delete this whole blob' action when
+    a negative click falls in a kept candidate that the reader judges not to be tumour (no overlap with the expert
+    mask). Counted as one click in every arm."""
+    c = int(lab[tuple(p)])
+    if sign == 0 and c in cand_ids and c in kept and not (gt & (lab == c)).any():
+        return "delete_blob", c
+    return None
+
+
+def editor_blob_rule(p, sign, kept, lab, cand_ids):
+    """EDITOR (no expert mask): a positive click inside a candidate blob that is not kept adds that whole blob."""
+    c = int(lab[tuple(p)])
+    if sign == 1 and c in cand_ids and c not in kept:
+        return "add_blob", c
     return None
 
 
@@ -248,6 +269,7 @@ class ClickEditor:
         comp = np.zeros(m.shape, bool)
         comp[ext] = lab == lab[pl]
         info["change_vox"] = int(comp.sum())
+        info["max_edit_dist_mm"] = float(np.sqrt(((np.argwhere(lab == lab[pl]) - np.asarray(pl)) ** 2).sum(1).max()))
         return (m | comp) if s == 1 else (m & ~comp), info
 
 
@@ -294,35 +316,48 @@ def run_arm(arm, variant, A, gt, lab, kept0, cand_ids, touches, editor, budget, 
             continue
         p, sign, size = c
         row.update(p=list(p), sign=sign, region_vox=size, region_type="missed" if sign else "extra")
-        act = toggle_action(p, sign, kept, cand_ids, lab, touches)
-        info, new_kept = {}, set(kept)
+        if ver == "v1":
+            act = toggle_action(p, sign, kept, cand_ids, lab, touches)
+            act = None if act is None else ({"toggle_on": "toggle_on", "toggle_off": "toggle_off"}[act[0]], act[1])
+        else:
+            act = reader_action(p, sign, kept, lab, cand_ids, gt) or editor_blob_rule(p, sign, kept, lab, cand_ids)
+        info, new_kept, appended = {}, set(kept), False
         if act is not None:
             kind, k = act
-            new = (m | (lab == k)) if kind == "toggle_on" else (m & ~(lab == k))
-            (new_kept.add if kind == "toggle_on" else new_kept.discard)(k)
-            action = kind if ver == "v1" else {"toggle_on": "add_blob", "toggle_off": "reader_delete_blob"}[kind]
+            on = kind in ("toggle_on", "add_blob")
+            new = (m | (lab == k)) if on else (m & ~(lab == k))
+            (new_kept.add if on else new_kept.discard)(k)
+            action = {"toggle_on": "toggle_on", "toggle_off": "toggle_off", "add_blob": "add_blob",
+                      "delete_blob": "reader_delete_blob"}[kind]
         elif arm == "T":
             new, action = m.copy(), "ineffective"
-        elif arm == "TB" or (arm == "TSH" and sign == 0):
+        elif arm == "TB" or (arm == "TS_hybrid" and sign == 0):
             new, action = brush(m, p, sign, CFG["brush_mm"]), "brush" if arm == "TB" else "hybrid_brush_negative"
         else:
-            appended = True
-            if ver == "v2" and (tuple(p), sign) in {(tuple(q), sg) for q, sg in sam_clicks}:
-                appended = False                       # no duplicate prompt tokens
+            mode = "history" if (ver == "v1" or SAM_ARMS.get(arm) == "history") else "current"
+            if mode == "current":
+                prompts = [(tuple(p), sign)]
+                hist_before = []
             else:
-                sam_clicks.append((tuple(p), sign))
+                hist_before = list(sam_clicks)
+                if ver == "v2" and (tuple(p), sign) in {(tuple(q), sg) for q, sg in sam_clicks}:
+                    appended = False                   # no duplicate prompt tokens
+                else:
+                    sam_clicks.append((tuple(p), sign)); appended = True
+                prompts = sam_clicks
             if probe is not None:
-                probe(m, list(sam_clicks[:-1]) if appended else list(sam_clicks), p, sign, step)
-            new, info = editor.propose(m, sam_clicks, at=p, sign=sign,
+                probe(m, hist_before, p, sign, step)
+            new, info = editor.propose(m, prompts, at=p, sign=sign,
                                        radius_mm=CFG["edit_radius_mm"] if ver == "v2" else None)
-            info["duplicate_prompt"] = not appended
-            action = "sam" if arm == "TS" else "hybrid_sam_positive"
+            info["duplicate_prompt"] = bool(mode == "history" and not appended)
+            info["history_mode"] = mode
+            action = {"TS": "sam", "TS_hist": "sam_hist", "TS_hybrid": "hybrid_sam_positive"}[arm]
             if overlay is not None and step <= 3:
                 overlay(cid, arm, variant, step, img, gt, m, new, p, sign)
         accepted = True
         if variant == "oracle" and dice(new, gt) < dice(m, gt) - 1e-12:
             accepted = False
-            if action in ("sam", "hybrid_sam_positive") and info.get("duplicate_prompt") is False:
+            if appended:
                 sam_clicks.pop()                       # an undone click is not kept as a prompt
         if accepted:
             effective = not np.array_equal(new, m)
@@ -550,12 +585,21 @@ def step_run(a, root, sp, out, smoke):
     RULE["version"] = ver
     if ver == "v2":
         RULE["v2_changes"] = ["no retry of the same point/sign while the mask is unchanged (every attempt counts); "
-                              "SAM prompt history without duplicates",
+                              "SAM prompt history without duplicates (TS_hist)",
                               f"SAM edit bounded to a {CFG['edit_radius_mm']} mm ball around the click before choosing the "
                               "connected change at the click (raw and applied volumes logged)",
-                              "whole-blob removal = explicit simulated-reader action (reader_delete_blob), same for every arm",
-                              "exploratory hybrid arm TSH: SAM for positive clicks, brush for negative clicks",
-                              "revision prompted by the v1 smoke results; v1 outputs preserved"]
+                              "whole-blob removal = explicit simulated-reader action (reader_delete_blob, uses the expert "
+                              "mask like click placement), same for every arm; the editor (add_blob rule, brush, SAM) never "
+                              "sees the expert mask",
+                              "PRIMARY SAM arm TS = current click only + current mask; exploratory TS_hist = de-duplicated "
+                              "in-crop click history + current mask; exploratory TS_hybrid = SAM for positive, brush for "
+                              "negative clicks. Same checkpoint, tau, L, 20 mm bound, blob rules and click budget",
+                              "On replay of previously failed negative clicks, removing point history restored "
+                              "below-threshold tumour probability in 15/18 always-accept attempts and 6/6 oracle attempts. "
+                              "These were repeated attempts on a small smoke sample; the replay identifies an effect of "
+                              "including history, not which earlier clicks caused it or whether the edits improve Dice/NSD",
+                              "revision prompted by the v1 smoke results; v1 code (tag s3p-v1) and outputs preserved",
+                              "sensitivity: the primary comparison repeated excluding the 12 smoke patients"]
     (out / f"decision_rule_{ver}.json").write_text(json.dumps(RULE, indent=1))   # frozen before any SAM call
     pp, q, fails, pop = population(a)
     ids = choose_smoke(par, a.smoke_n) if smoke else pop
@@ -587,7 +631,7 @@ def step_run(a, root, sp, out, smoke):
             print(f"  {i + 1}/{len(ids)} patients | {(time.time() - t0) / 60:.1f} min", flush=True)
     df, lg = pd.DataFrame(res), pd.DataFrame(log)
     df.to_csv(rd / "per_patient.csv", index=False); lg.to_csv(rd / "clicks.csv", index=False)
-    report(df, lg, rd, a.budget, smoke)
+    report(df, lg, rd, a.budget, smoke, set(choose_smoke(par, 12)) if ver == "v2" else set())
 
 
 def step_replay(a, root, sp, out):
@@ -694,7 +738,49 @@ def summarise(df, label, budget):
     return rows
 
 
-def report(df, lg, rd, budget, smoke):
+def primary_verdict(df, exclude=()):
+    g = df[df.in_queue & (df.variant == "always") & ~df.cache_id.isin(set(exclude))]
+    ts = g[g.arm == "TS"].set_index("cache_id"); tb = g[g.arm == "TB"].set_index("cache_id").loc[ts.index]
+    d = ts.nsd_3 - tb.nsd_3
+    lo, hi = boot_ci(d, RULE["bootstrap"], RULE["seed"])
+    h_ts = int((ts.dice_3 < ts.dice_0 - 1e-9).sum()); h_tb = int((tb.dice_3 < tb.dice_0 - 1e-9).sum())
+    v = dict(n=len(ts), mean_dnsd=float(d.mean()), ci95=[lo, hi], harmed_TS=h_ts, harmed_TB=h_tb,
+             mean_dnsd_ok=bool(d.mean() >= RULE["min_mean_dnsd"]), ci_ok=bool(lo > RULE["ci_lo_gt"]),
+             harm_ok=bool(h_ts <= h_tb))
+    v["advance_to_reader_study"] = bool(v["mean_dnsd_ok"] and v["ci_ok"] and v["harm_ok"])
+    return v
+
+
+def implementation_checks(df, lg):
+    """v2 checks: current-click SAM arms send one point; no retry of an unchanged-mask attempt; edits within the bound;
+    every arm starts from the same mask; the editor functions take no expert mask."""
+    import inspect
+    sam = lg[lg.action.isin(["sam", "sam_hist", "hybrid_sam_positive"])]
+    cur = sam[sam.history_mode == "current"] if "history_mode" in sam else sam.iloc[0:0]
+    retries = 0
+    for _, g in lg.dropna(subset=["p"]).groupby(["cache_id", "arm", "variant"]):
+        prev = None
+        for _, r in g.sort_values("step").iterrows():
+            key = (str(r.p), r.sign)
+            if prev is not None and key == prev[0] and not prev[1]:
+                retries += 1
+            prev = (key, bool(r.effective))
+    edited = sam[sam.change_vox > 0] if len(sam) else sam
+    no_gt = all("gt" not in inspect.signature(f).parameters
+                for f in (editor_blob_rule, brush, ClickEditor.propose, mask_to_low))
+    c = dict(current_click_arms_send_one_point=bool((cur.n_points == 1).all()) if len(cur) else None,
+             retries_of_unchanged_attempts=int(retries),
+             max_edit_dist_mm=float(edited.max_edit_dist_mm.max()) if len(edited) and "max_edit_dist_mm" in edited else None,
+             edits_within_bound=bool((edited.max_edit_dist_mm <= CFG["edit_radius_mm"] + 1e-6).all())
+             if len(edited) and "max_edit_dist_mm" in edited else None,
+             same_start_mask_all_arms=bool((df.groupby(["cache_id", "variant"]).dice_0.nunique() == 1).all()),
+             editor_functions_take_no_expert_mask=no_gt)
+    c["all_pass"] = bool(c["current_click_arms_send_one_point"] is not False and c["retries_of_unchanged_attempts"] == 0
+                         and c["edits_within_bound"] is not False and c["same_start_mask_all_arms"] and no_gt)
+    return c
+
+
+def report(df, lg, rd, budget, smoke, smoke_ids=frozenset()):
     summ = summarise(df[df.in_queue], "queue_108", budget) + summarise(df[df.failure], "failures_137", budget)
     for t, g in df[df.in_queue].groupby("start_type"):
         summ += summarise(g, f"queue_{t}", budget)
@@ -719,22 +805,25 @@ def report(df, lg, rd, budget, smoke):
                     if "raw_change_vox" in sm and (sm.sign == 1).any() else None,
                     duplicate_prompts=int(sm.duplicate_prompt.sum()) if "duplicate_prompt" in sm else None,
                     mask_tau=CFG["mask_tau"], mask_logit=CFG["mask_logit"])
-    sm = lg[lg.action == "sam"]
-    tech = {"pooled": tech_of(sm), **{v: tech_of(sm[sm.variant == v]) for v in VARIANTS}}
+    tech = {}
+    for arm, act_name in (("TS", "sam"), ("TS_hist", "sam_hist"), ("TS_hybrid", "hybrid_sam_positive")):
+        sm = lg[(lg.arm == arm) & (lg.action == act_name)]
+        if len(sm):
+            tech[arm] = {"pooled": tech_of(sm), **{v: tech_of(sm[sm.variant == v]) for v in VARIANTS}}
     rep_pts = lg.dropna(subset=["p"]).assign(pkey=lambda d: d.p.astype(str) + "|" + d.sign.astype(str))
     tech["repeated_point_sign_attempts"] = int(rep_pts.duplicated(["cache_id", "arm", "variant", "pkey"]).sum())
+    if "version" in lg and (lg.version == "v2").any():
+        tech["implementation_checks"] = implementation_checks(df, lg)
     (rd / "technical.json").write_text(json.dumps(tech, indent=1))
     verdict = None
     if budget >= 3 and not smoke:
-        g = df[df.in_queue & (df.variant == "always")]
-        ts = g[g.arm == "TS"].set_index("cache_id"); tb = g[g.arm == "TB"].set_index("cache_id").loc[ts.index]
-        d = ts.nsd_3 - tb.nsd_3
-        lo, hi = boot_ci(d, RULE["bootstrap"], RULE["seed"])
-        h_ts = int((ts.dice_3 < ts.dice_0 - 1e-9).sum()); h_tb = int((tb.dice_3 < tb.dice_0 - 1e-9).sum())
-        verdict = dict(n=len(ts), mean_dnsd=float(d.mean()), ci95=[lo, hi], harmed_TS=h_ts, harmed_TB=h_tb,
-                       mean_dnsd_ok=bool(d.mean() >= RULE["min_mean_dnsd"]), ci_ok=bool(lo > RULE["ci_lo_gt"]),
-                       harm_ok=bool(h_ts <= h_tb))
-        verdict["advance_to_reader_study"] = bool(verdict["mean_dnsd_ok"] and verdict["ci_ok"] and verdict["harm_ok"])
+        verdict = primary_verdict(df)
+        if smoke_ids:
+            verdict["sensitivity_excluding_smoke_patients"] = primary_verdict(df, smoke_ids)
+        for arm in ("TS_hist", "TS_hybrid"):                                   # exploratory, same contrast vs TB
+            if arm in set(df.arm):
+                verdict[f"exploratory_{arm}_vs_TB"] = primary_verdict(df.assign(arm=df.arm.replace(
+                    {"TS": "_TS_primary", arm: "TS"})))
     (rd / "decision_rule_check.json").write_text(json.dumps(verdict, indent=1))
     pd.set_option("display.width", 230)
     cols = ["population", "arm", "variant", "clicks", "n", "dice", "nsd", "rescued_05", "newly_harmed_05", "below_start",
@@ -746,9 +835,13 @@ def report(df, lg, rd, budget, smoke):
     print("\nclick actions:\n" + act.to_string())
     print("\ntechnical:", json.dumps(tech, indent=1))
     if smoke:
+        ic = tech.get("implementation_checks")
+        if ic is not None:
+            print("\nIMPLEMENTATION CHECKS:", "PASS" if ic["all_pass"] else "FAIL", json.dumps(ic))
         print("\nSMOKE RUN: technical check only; the advancement rule is not evaluated. Check overlays/")
     elif verdict:
-        print("\nfrozen pilot rule (queue 108, always-accept, 3 clicks, TS vs TB):", json.dumps(verdict, indent=1))
+        print("\nfrozen pilot rule (queue 108, always-accept, 3 clicks, TS vs TB; sensitivity and exploratory arms "
+              "reported, not decisive):", json.dumps(verdict, indent=1))
         print("\nVERDICT:", "ADVANCE TO A READER STUDY" if verdict["advance_to_reader_study"] else
               "do not advance (SAM does not add enough over toggle + brush)")
     print(f"-> {rd}")
