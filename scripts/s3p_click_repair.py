@@ -266,6 +266,9 @@ def sam_predictor(sam, box_mod, dev, amp):
 
 
 def load_predictor(sam_ckpt, turbo, random_weights):
+    if random_weights:                       # tests: identical random weights in every process (smoke vs replay)
+        import torch
+        torch.manual_seed(0)
     r = M3.load_runner(sam_ckpt, turbo, random_weights)
     return sam_predictor(r.sam, r.box, r.dev, r.amp)
 
