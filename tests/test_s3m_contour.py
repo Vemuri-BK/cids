@@ -220,3 +220,26 @@ def test_shiftcheck_step(tmp_path):
     assert r.returncode == 0, r.stderr[-3000:]
     s = pd.read_csv(out / "shift_summary.csv", index_col=0)
     assert set(s.index) == set(M.ARMS) and s.loc["A", "mean_gain"] >= 0
+
+
+def test_shift_tie_prefers_zero():
+    gt = np.zeros(SHAPE, bool); gt[20:40, 20:40, 20:21] = True            # flat: z shifts of +-1 tie with 0? no
+    m = gt.copy()
+    assert M.shift_profile(m, gt, 2)[0] == (0, 0, 0)
+
+
+def test_box_sam_mask_matches_arms_B():
+    img, gt, lab = _case()
+    r, rows, masks = M.patient_run("duke_001", "train", img, gt, lab, [3], BallRunner(), return_masks=True)
+    b, t = M.box_sam_mask(img, lab, [3], BallRunner())
+    assert np.array_equal(b, masks["B_raw"]) and t >= 0
+
+
+def test_overlap_step(tmp_path):
+    base = _project(tmp_path)
+    out = tmp_path / "out"
+    assert subprocess.run(base + ["--step", "parity", "--out", str(out)], capture_output=True, text=True).returncode == 0
+    r = subprocess.run(base + ["--step", "overlap", "--random_weights", "--out", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    o = pd.read_csv(out / "overlap.csv")
+    assert len(o) == 6 and o.loc[o.n_kept == 0, "b_vox"].eq(0).all() and o.dice_ab.dropna().between(0, 1).all()

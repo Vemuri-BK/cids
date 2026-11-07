@@ -315,6 +315,61 @@ def patient_run(cid, split, img, gt, lab, ks, runner, overlay_dir=None, return_m
     return (res, rows, masks) if return_masks else (res, rows)
 
 
+# --------------------------------------------------------------------------------------------- overlap (for Q1)
+def box_sam_mask(img, lab, ks, runner):
+    """Patient-level box-only SAM mask B (raw, before fallback), exactly the arms-step B; and SAM seconds."""
+    import s3a_seg2sam as s3
+    b = np.zeros(lab.shape, bool)
+    if not ks:
+        return b, 0.0
+    cc = s3.candidate_crops(img, lab, [(k, float((lab == k).sum())) for k in ks])
+    t = 0.0
+    for j, k in enumerate(ks):
+        comp = lab == k
+        lo, hi = bbox(comp)
+        R = allowed_region(lab.shape, lo, hi, CFG["margin_mm"])
+        c = np.clip(to_crop(geometric_point(comp), cc["origins"][j]), 0, CFG["sam_size"] - 1)
+        t0 = time.time()
+        p = runner(cc["crops"][j][0], cc["boxes"][j], [c])[0]          # [0] = box-only logits (B)
+        t += time.time() - t0
+        up = paste_back(p, cc["origins"][j], cc["shape15"], lab.shape)
+        b |= keep_box_component((up > 0.5) & R, lo, hi)
+    return b, t
+
+
+def step_overlap(a, root, sp, pp, splits, out):
+    """Exact patient-level prediction-to-prediction overlap Dice(A, B_raw) at 1 mm (no expert mask used for it)."""
+    arms_pp = Path(a.arms_dir).expanduser() / "per_patient.csv" if a.arms_dir else None
+    ref = pd.read_csv(arms_pp).set_index("cache_id") if arms_pp and arms_pp.exists() else None
+    jobs = jobs_for(a, root, sp, pp, splits)
+    jobs = jobs[:a.limit] if a.limit else jobs
+    runner = load_runner(a.sam_ckpt, None if a.random_weights else a.turbo_ckpt, a.random_weights)
+    print(f"S3m overlap | {len(jobs)} patients | reference arms run: {arms_pp if ref is not None else 'none'}", flush=True)
+    rows, t0 = [], time.time()
+    for i, (cid, split, cpath, lpath, subset, saved) in enumerate(jobs):
+        img, lbl = load_case(cpath)
+        gt = lbl > 0
+        lab = np.load(lpath)["lab"]
+        ks = kept_ids(subset)
+        A = np.isin(lab, ks) if ks else np.zeros(gt.shape, bool)
+        B, ts = box_sam_mask(img, lab, ks, runner)
+        rows.append(dict(cache_id=cid, split=split, n_kept=len(ks), a_vox=int(A.sum()), b_vox=int(B.sum()),
+                         inter_ab=int((A & B).sum()), dice_ab=dice_count(A, B) if (A.any() or B.any()) else np.nan,
+                         a_dice_gt=dice_count(A, gt), b_raw_dice_gt=dice_count(B, gt), sam_seconds=ts))
+        if abs(rows[-1]["a_dice_gt"] - saved) > 1e-6:
+            raise SystemExit(f"{cid}: A Dice differs from S3k")
+        if (i + 1) % 100 == 0 or i + 1 == len(jobs):
+            print(f"  {i + 1}/{len(jobs)} | {(time.time() - t0) / 60:.1f} min", flush=True)
+    df = pd.DataFrame(rows)
+    if ref is not None:
+        d = (df.set_index("cache_id").b_raw_dice_gt - ref.reindex(df.cache_id).B_raw_dice.to_numpy()).abs()
+        df["b_parity_absdiff"] = d.to_numpy()
+        print(f"B parity vs arms run: max |dDice| {d.max():.2e}, patients > 1e-3: {int((d > 1e-3).sum())}")
+    df.to_csv(out / "overlap.csv", index=False)
+    print(df.groupby("split")[["dice_ab", "b_raw_dice_gt", "sam_seconds"]].mean().round(4).to_string())
+    print(f"-> {out / 'overlap.csv'}")
+
+
 # --------------------------------------------------------------------------------------------- shift check
 def shift_profile(m, gt, max_shift=3):
     """Dice of m shifted by every integer (dx,dy,dz) in [-max_shift, max_shift]^3 against gt.
@@ -335,8 +390,8 @@ def shift_profile(m, gt, max_shift=3):
                 d = 2.0 * int((w & gg).sum()) / (sm + sg)
                 if (dx, dy, dz) == (0, 0, 0):
                     d0 = d
-                if d > bd + 1e-12:
-                    best, bd = (dx, dy, dz), d
+                if d > bd + 1e-12 or (abs(d - bd) <= 1e-12 and abs(dx) + abs(dy) + abs(dz) < sum(map(abs, best))):
+                    best, bd = (dx, dy, dz), d             # ties -> the smallest shift (zero first)
     return best, d0, bd
 
 
@@ -662,8 +717,9 @@ def step_arms(a, root, sp, pp, splits, out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", choices=["parity", "arms", "shiftcheck"], required=True)
+    ap.add_argument("--step", choices=["parity", "arms", "shiftcheck", "overlap"], required=True)
     ap.add_argument("--shift_n", type=int, default=30, help="patients for --step shiftcheck")
+    ap.add_argument("--arms_dir", default="", help="--step overlap: full arms output, for the B parity check")
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
     ap.add_argument("--eval_splits", default="train,val")
@@ -692,7 +748,7 @@ def main():
     else:
         if not a.random_weights and not (a.sam_ckpt and a.turbo_ckpt):
             raise SystemExit("--sam_ckpt (S2b best.pt) and --turbo_ckpt are required")
-        (step_arms if a.step == "arms" else step_shiftcheck)(a, root, sp, pp, splits, out)
+        dict(arms=step_arms, shiftcheck=step_shiftcheck, overlap=step_overlap)[a.step](a, root, sp, pp, splits, out)
 
 
 if __name__ == "__main__":
