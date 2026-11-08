@@ -132,3 +132,31 @@ def test_end_to_end_masks(tmp_path):
     sp.to_csv(tmp_path / "s3k" / "per_patient.csv", index=False)
     r = subprocess.run(base + ["--step", "masks", "--random_weights"], capture_output=True, text=True)
     assert r.returncode != 0 and "PARITY FAILED" in r.stdout + r.stderr
+
+
+def test_nearest_blob():
+    lab = np.zeros(SHAPE, np.int32)
+    lab[ball(SHAPE, (30, 30, 20), 3)] = 3
+    lab[ball(SHAPE, (55, 50, 35), 3)] = 4
+    m, d = U.nearest_blob(lab, (30, 30, 20))
+    assert d == 0 and (m == (lab == 3)).all()
+    m, d = U.nearest_blob(lab, (30, 30, 30))
+    assert d == 7 and (m == (lab == 3)).all()
+    m, d = U.nearest_blob(np.zeros(SHAPE, np.int32), (1, 1, 1))
+    assert not m.any() and np.isnan(d)
+
+
+def test_posthoc_end_to_end(tmp_path):
+    base = _project(tmp_path)
+    r = subprocess.run(base + ["--step", "masks", "--random_weights"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    r = subprocess.run(base + ["--step", "posthoc"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "POST-HOC" in r.stdout
+    out = tmp_path / "out"
+    ph = pd.read_csv(out / "posthoc_per_patient.csv").set_index("cache_id")
+    assert ph.loc["nact_000", "Cn_dist_mm"] == 0 and ph.loc["nact_001", "Cn_dist_mm"] > 0
+    assert ph.loc["nact_001", "Cn_dice"] == 0                                 # nearest blob is the false one
+    s = json.loads((out / "posthoc_summary.json").read_text())
+    assert s["rescue_patients"] == 1 and "POST-HOC" in s["label"]
+    assert set(pd.read_csv(out / "posthoc_agreement_all.csv").source) == {"B", "Cn", "S", "H"}

@@ -209,11 +209,11 @@ def step_masks(a, out):
 
 
 # --------------------------------------------------------------------------------------------- analysis
-def agreement(F, pats):
+def agreement(F, pats, sources=None):
     """Per-feature CCC of every source vs E on the patient list pats -> {source: {feature: ccc}}."""
     E = F["E"].loc[pats]
     res = {}
-    for s in SOURCES[1:]:
+    for s in (sources or SOURCES[1:]):
         X = F[s].loc[pats]
         res[s] = {}
         for f in FEATS:
@@ -282,6 +282,91 @@ def step_analyse(a, out):
     print("\nCLAIMS:", json.dumps(claims, indent=1))
 
 
+def nearest_blob(lab, p):
+    """POST-HOC control: the candidate under the click, else the candidate nearest to it (Euclidean, voxels=mm).
+    Returns (mask, distance_mm); empty mask and nan if there are no candidates."""
+    k = int(lab[tuple(p)])
+    if k > 0:
+        return lab == k, 0.0
+    idx = np.argwhere(lab > 0)
+    if not len(idx):
+        return np.zeros(lab.shape, bool), np.nan
+    d = np.sqrt(((idx - np.asarray(p)) ** 2).sum(1))
+    j = int(np.argmin(d))
+    return lab == lab[tuple(idx[j])], float(d[j])
+
+
+def step_posthoc(a, out):
+    """Two checks added AFTER seeing the S3u results (labelled post-hoc, not part of the frozen rule):
+    1. agreement on ALL patients for the always-non-empty sources (B, S, H) + C_near;
+    2. a stronger non-SAM control C_near (nearest SegResNet candidate when the click misses every candidate),
+       compared with H on the patients where H used SAM."""
+    from cids.data.cache import find_cache_root, load_case
+    from cids.provenance import require_cases
+    pp = pd.read_csv(out / "per_patient.csv")
+    ft = pd.read_csv(out / "features.csv")
+    root = find_cache_root(str(Path(a.cache_root).expanduser()) if a.cache_root else "")
+    paths = dict(require_cases(pd.read_csv(a.splits), root, "val"))
+    cdir = Path(a.val_cases).expanduser()
+    cdir = cdir if any(cdir.glob("*.npz")) else next(cdir.rglob("*.npz")).parent
+    rows, extra = [], []
+    for _, r in pp.iterrows():
+        cid = r.cache_id
+        img, gt = load_case(paths[cid])
+        gt = gt > 0
+        lab = np.load(cdir / f"{cid}.npz")["lab"]
+        p = click_point(gt)
+        saved = json.loads(r.click) if isinstance(r.click, str) else None
+        if p is None or saved is None or list(p) != saved:
+            raise SystemExit(f"{cid}: click differs from the masks step ({p} vs {saved})")
+        m, dist = nearest_blob(lab, p)
+        rows.append(dict(cache_id=cid, h_used_sam=bool(r.h_used_sam), Cn_dice=M.dice_count(m, gt), Cn_dist_mm=dist,
+                         Cn_ml=float(m.sum()) / 1000, C_dice=r.C_dice, S_dice=r.S_dice, H_dice=r.H_dice,
+                         B_dice=r.B_dice))
+        extra.append(dict(cache_id=cid, source="Cn", **mask_features(img, m)))
+    ph = pd.DataFrame(rows)
+    ph.to_csv(out / "posthoc_per_patient.csv", index=False)
+    ft = pd.concat([ft, pd.DataFrame(extra)], ignore_index=True)
+    F = {s: g.set_index("cache_id")[FEATS] for s, g in ft.groupby("source")}
+    srcs = ["B", "Cn", "S", "H"]
+    ok = ph.set_index("cache_id").Cn_ml.gt(0)
+    pats = pp.cache_id[pp[["B_ml", "S_ml", "H_ml"]].gt(0).all(axis=1).to_numpy() &
+                       ok.reindex(pp.cache_id).to_numpy()].to_numpy()
+    med = median_ccc(agreement(F, pats, srcs))
+    rng = np.random.default_rng(RULE["bootstrap"]["seed"])
+    bt = pd.DataFrame([median_ccc(agreement(F, rng.choice(pats, len(pats), replace=True), srcs))
+                       for _ in range(RULE["bootstrap"]["n"])])
+    summ = [dict(source=s, median_ccc=med[s], ci95_lo=float(bt[s].quantile(0.025)),
+                 ci95_hi=float(bt[s].quantile(0.975)), n_patients=len(pats)) for s in srcs]
+    paired = []
+    for x, y in [("H", "B"), ("H", "Cn"), ("Cn", "B")]:
+        d = bt[x] - bt[y]
+        paired.append(dict(comparison=f"{x} - {y}", diff=med[x] - med[y], ci95_lo=float(d.quantile(0.025)),
+                           ci95_hi=float(d.quantile(0.975)), supported=bool(d.quantile(0.025) > 0)))
+    sam = ph[ph.h_used_sam]
+    fail = [dict(source=s, mean_dice=float(ph[f"{s}_dice"].mean()), gross_failures=int((ph[f"{s}_dice"] < 0.1).sum()))
+            for s in ("B", "Cn", "S", "H")]
+    res = dict(label="POST-HOC (added after seeing the S3u results)",
+               rescue_patients=len(sam), H_dice_on_rescue=float(sam.H_dice.mean()) if len(sam) else None,
+               Cn_dice_on_rescue=float(sam.Cn_dice.mean()) if len(sam) else None,
+               H_better_on_rescue=int((sam.H_dice > sam.Cn_dice).sum()),
+               Cn_better_on_rescue=int((sam.Cn_dice > sam.H_dice).sum()))
+    pd.DataFrame(summ).to_csv(out / "posthoc_agreement_all.csv", index=False)
+    pd.DataFrame(paired).to_csv(out / "posthoc_paired.csv", index=False)
+    (out / "posthoc_summary.json").write_text(json.dumps(res, indent=1))
+    pd.set_option("display.width", 200)
+    print("POST-HOC checks (added after seeing the S3u results)\n")
+    print("Dice / gross failures, all patients (Cn = nearest SegResNet candidate when the click misses):")
+    print(pd.DataFrame(fail).round(4).to_string(index=False))
+    print(f"\npatients where the click missed every candidate (H used SAM): {len(sam)}")
+    print(sam[["cache_id", "Cn_dist_mm", "Cn_dice", "S_dice", "B_dice"]].round(3).to_string(index=False))
+    print(f"\nagreement with the expert, ALL {len(pats)} patients (median CCC over {len(FEATS)} features):")
+    print(pd.DataFrame(summ).round(3).to_string(index=False))
+    print("\npaired differences:")
+    print(pd.DataFrame(paired).round(3).to_string(index=False))
+    print("\nRESCUE:", json.dumps(res, indent=1))
+
+
 def pcr_auc(F, pp, clinical, min_class=10):
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LogisticRegression
@@ -314,7 +399,7 @@ def pcr_auc(F, pp, clinical, min_class=10):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", choices=["masks", "analyse"], required=True)
+    ap.add_argument("--step", choices=["masks", "analyse", "posthoc"], required=True)
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--splits", default=str(ROOT / "configs" / "splits.csv"))
     ap.add_argument("--s3k_out", required=True, help="S3k output (per_patient.csv with the val B0_rad selection)")
@@ -338,7 +423,12 @@ def main():
     else:
         if not (out / "per_patient.csv").exists():
             raise SystemExit("run --step masks first")
-        step_analyse(a, out)
+        if a.step == "posthoc":
+            if not a.val_cases:
+                raise SystemExit("--val_cases is required")
+            step_posthoc(a, out)
+        else:
+            step_analyse(a, out)
 
 
 if __name__ == "__main__":
