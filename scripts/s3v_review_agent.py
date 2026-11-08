@@ -17,6 +17,9 @@ Two-stage agent (no expert information at decision time)
           g1 = Dice(Cn) - Dice(B0_rad), from the S3n review features (BASE; S3n train_oof_review.csv /
           val_review.csv). Gain model: gradient boosting regressor, cross-fitted on the S3k outer folds
           (train), fitted on all train for val.
+  With --sam_fold_ckpt each training patient's SAM mask comes from an S2b decoder retrained WITHOUT its outer
+  fold (scripts/make_s2b_folds.py + s2a_sam_finetune.py --split_col s2b_f<k>), so stage 2 / R3 become clean
+  on train OOF; val keeps the original S2b decoder.
   stage 2 (after the click) -- which tool: SAM instead of Cn if the predicted g2 = Dice(S) - Dice(Cn) > 0, from
           post-click features (click-to-blob distance, blob size / SegResNet probability / kept by B0_rad,
           SAM volume, Dice(SAM, Cn)). EXPLORATORY: the S2b decoder was trained on the 1,080 training
@@ -79,6 +82,9 @@ RULE = dict(
        "(train OOF), same direction on val",
     R2="10% budget: agent ranking beats QC ranking on mean Dice; bootstrap CI lower bound > 0 (train OOF)",
     R3="exploratory: val patients where stage 2 chooses SAM gain over Cn (descriptive)",
+    R4="SAM role (valid only with out-of-fold SAM decoders, --sam_fold_ckpt): on train OOF, (a) patients where "
+       "stage 2 chooses SAM: mean Dice(S) - Dice(Cn) bootstrap CI lower bound > 0, AND (b) at the 10% QC budget, "
+       "stage-2 tool choice beats always-Cn on mean Dice over all patients, CI lower bound > 0",
     budgets=BUDGETS, bootstrap=dict(n=2000, seed=0), random_draws=200)
 
 
@@ -133,13 +139,24 @@ def step_outcomes(a, out):
     part = out / "outcomes.partial.csv"
     rows = pd.read_csv(part).to_dict("records") if part.exists() else []
     done = {(r["split"], r["cache_id"]) for r in rows}
-    runner = M.load_runner(a.sam_ckpt, a.turbo_ckpt, a.random_weights)
     if a.random_weights:
         import torch
         torch.manual_seed(0)
+    runner = M.load_runner(a.sam_ckpt, a.turbo_ckpt, a.random_weights)
+    fold_of, fold_runner = {}, {}
+    if a.sam_fold_ckpt:                       # out-of-fold SAM: train patient -> decoder that never saw it
+        fold_of = dict(pd.read_csv(Path(a.folds).expanduser()).values)
+        for k in sorted(set(fold_of.values())):
+            ck = Path(a.sam_fold_ckpt.format(fold=k)).expanduser()
+            if not a.random_weights and not ck.exists():
+                raise SystemExit(f"missing fold checkpoint {ck}")
+            fold_runner[k] = M.load_runner(str(ck), a.turbo_ckpt, a.random_weights)
+        print(f"out-of-fold SAM decoders: {len(fold_runner)} folds (val uses {a.sam_ckpt or 'random'})", flush=True)
 
-    def sam_fn(img, p):
-        return U.sam_one_click(img, p, runner.sam, runner.box, runner.dev, runner.amp)
+    def runner_for(split, cid):
+        if split == "train_oof" and fold_runner:
+            return fold_runner[fold_of[cid]], f"fold{fold_of[cid]}"
+        return runner, "main"
 
     todo = [j for j in jobs if (j[0], j[1]) not in done]
     print(f"S3v outcomes | {len(jobs)} patients ({len(jobs) - len(todo)} already done)", flush=True)
@@ -153,9 +170,14 @@ def step_outcomes(a, out):
         kept = M.kept_ids(pp.loc[(split, cid), "B0_rad_subset"])
         t = tabs[split]
         probs = dict(zip(t[t.cache_id == cid].k.astype(int), t[t.cache_id == cid].seg_prob_mean))
+        rn, sam_src = runner_for(split, cid)
+
+        def sam_fn(img_, p_, rn=rn):
+            return U.sam_one_click(img_, p_, rn.sam, rn.box, rn.dev, rn.amp)
         p0 = U.click_point(gt)
         for variant, p in (("deep", p0), ("offset", offset_click(gt, p0, cid))):
             r = patient_outcomes(img, gt, lab, kept, probs, p, sam_fn)
+            r["sam_decoder"] = sam_src
             if abs(r["B_dice"] - float(pp.loc[(split, cid), "B0_rad_dice"])) > 1e-6:
                 raise SystemExit(f"PARITY FAILED {split} {cid}: B0_rad Dice {r['B_dice']} vs S3k")
             rows.append(dict(split=split, cache_id=cid, click=variant, click_xyz=list(p), **r))
@@ -286,15 +308,36 @@ def step_policy(a, out):
         lo1, hi1 = boot_ci(r1, len(d), RULE["bootstrap"]["n"], RULE["bootstrap"]["seed"])
         lo2, hi2 = boot_ci(r2, len(d), RULE["bootstrap"]["n"], RULE["bootstrap"]["seed"])
         sam = d[d.tool2 == "S"]
+        dS, dC, t2 = d.S_dice.to_numpy(), d.Cn_dice.to_numpy(), d.tool2.to_numpy()
+        ch = np.flatnonzero(t2 == "S")
+
+        def r4a(i):
+            return float((dS[ch][i] - dC[ch][i]).mean()) if len(ch) else 0.0
+
+        def r4b(idx):
+            q = select(d.qc.to_numpy()[idx], cid[idx], 0.10)
+            alt = np.where(t2[idx] == "S", dS[idx], dC[idx])
+            return float(np.where(q, alt - dC[idx], 0).mean())        # gain over always-Cn, QC-selected 10%
+        lo4a, hi4a = boot_ci(r4a, len(ch), RULE["bootstrap"]["n"], RULE["bootstrap"]["seed"]) if len(ch) > 1 else (np.nan, np.nan)
+        lo4b, hi4b = boot_ci(r4b, len(d), RULE["bootstrap"]["n"], RULE["bootstrap"]["seed"])
+        oof_sam = bool("sam_decoder" in d and d.sam_decoder.astype(str).str.startswith("fold").all()) \
+            if split == "train_oof" else None
         rules[split] = dict(
+            R4=dict(oof_sam_decoders=oof_sam, sam_chosen=int(len(ch)), gain_on_chosen=r4a(np.arange(len(ch))),
+                    gain_on_chosen_ci95=[lo4a, hi4a],
+                    gain_10pct_vs_always_cn=r4b(np.arange(len(d))), gain_10pct_ci95=[lo4b, hi4b],
+                    passes=bool(len(ch) > 1 and lo4a > 0 and lo4b > 0)),
             R1=dict(removed_QC=removed(allidx, d.qc), expected_random=float(0.10 * (fixed.sum() - hurt.sum())),
                     diff=r1(allidx), ci95=[lo1, hi1], passes=bool(lo1 > 0)),
             R2=dict(dice_agent_minus_qc=r2(allidx), ci95=[lo2, hi2], passes=bool(lo2 > 0)),
             R3=dict(sam_chosen=len(sam), dice_S=float(sam.S_dice.mean()) if len(sam) else None,
                     dice_Cn=float(sam.Cn_dice.mean()) if len(sam) else None,
                     sam_better=int((sam.S_dice > sam.Cn_dice).sum()), cn_better=int((sam.Cn_dice > sam.S_dice).sum())))
+    r4 = rules["train_oof"]["R4"]
     verdict = dict(R1_primary=bool(rules["train_oof"]["R1"]["passes"] and rules["val"]["R1"]["diff"] > 0),
-                   R2_agent_beats_qc=rules["train_oof"]["R2"]["passes"], rules=rules)
+                   R2_agent_beats_qc=rules["train_oof"]["R2"]["passes"],
+                   R4_sam_role=(bool(r4["passes"]) if r4["oof_sam_decoders"] else
+                                "not applicable: SAM decoders are not out-of-fold on train"), rules=rules)
     pd.DataFrame(curves).to_csv(out / "curves.csv", index=False)
     (out / "rules.json").write_text(json.dumps(verdict, indent=1, default=float))
     for (split, variant), d in choices.items():
@@ -325,6 +368,8 @@ def main():
     ap.add_argument("--val_cases", default="", help="S3f val component maps")
     ap.add_argument("--sam_ckpt", default="")
     ap.add_argument("--turbo_ckpt", default="")
+    ap.add_argument("--sam_fold_ckpt", default="", help="out-of-fold decoders, e.g. .../s2b_folds/f{fold}/best.pt")
+    ap.add_argument("--folds", default="", help="S3k folds.csv (needed with --sam_fold_ckpt)")
     ap.add_argument("--random_weights", action="store_true", help="tests only")
     ap.add_argument("--limit", type=int, default=0, help="patients per split (tests)")
     ap.add_argument("--out", required=True)
@@ -338,6 +383,8 @@ def main():
             raise SystemExit("--train_cases and --val_cases are required")
         if not a.random_weights and not (a.sam_ckpt and a.turbo_ckpt):
             raise SystemExit("--sam_ckpt (S2b best.pt) and --turbo_ckpt are required")
+        if a.sam_fold_ckpt and not a.folds:
+            raise SystemExit("--folds is required with --sam_fold_ckpt")
         step_outcomes(a, out)
     else:
         if not (out / "outcomes.csv").exists():

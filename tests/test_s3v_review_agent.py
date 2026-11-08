@@ -116,3 +116,33 @@ def test_test_files_refused(tmp_path):
     r = subprocess.run(base + ["--step", "policy", "--s3n_out", str(tmp_path / "test_s3n")],
                        capture_output=True, text=True)
     assert r.returncode != 0 and "test files are refused" in r.stdout + r.stderr
+
+
+def test_make_s2b_folds():
+    import make_s2b_folds as F
+    sp = pd.DataFrame(dict(cache_id=["a", "b", "c", "v", "t"], split=["train", "train", "train", "val", "test"]))
+    folds = pd.DataFrame(dict(cache_id=["a", "b", "c"], outer_fold=[0, 1, 0]))
+    out = F.make(sp, folds)
+    assert list(out.s2b_f0) == ["holdout", "train", "holdout", "val", "test"]
+    assert list(out.s2b_f1) == ["train", "holdout", "train", "val", "test"]
+    try:
+        F.make(sp, folds.iloc[:2])
+        assert False, "should refuse incomplete folds"
+    except SystemExit:
+        pass
+
+
+def test_out_of_fold_sam(tmp_path):
+    base, data = _project(tmp_path)
+    r = subprocess.run(base + data + ["--step", "outcomes", "--random_weights", "--sam_fold_ckpt",
+                                      str(tmp_path / "f{fold}" / "best.pt"), "--folds", str(tmp_path / "s3k" / "folds.csv")],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "out-of-fold SAM decoders: 2 folds" in r.stdout
+    oc = pd.read_csv(tmp_path / "out" / "outcomes.csv")
+    assert oc[oc.split == "train_oof"].sam_decoder.str.startswith("fold").all()
+    assert (oc[oc.split == "val"].sam_decoder == "main").all()
+    r = subprocess.run(base + ["--step", "policy", "--s3n_out", str(tmp_path / "s3n")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    v = json.loads((tmp_path / "out" / "rules.json").read_text())
+    assert v["rules"]["train_oof"]["R4"]["oof_sam_decoders"] is True and isinstance(v["R4_sam_role"], bool)
