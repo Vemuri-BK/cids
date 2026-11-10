@@ -100,3 +100,16 @@ def test_requires_oof_s3v(tmp_path):
                         "--sam_fold_ckpt", "x{fold}", "--folds", str(tmp_path / "s3k" / "folds.csv")] + data,
                        capture_output=True, text=True)
     assert r.returncode != 0 and "OUT-OF-FOLD" in r.stdout + r.stderr
+
+
+def test_deepest_point_matches_full_volume():
+    from scipy import ndimage
+    rng = np.random.default_rng(1)
+    for trial in range(30):
+        lab = np.zeros(SHAPE, np.int32)
+        for k in range(1, 4):
+            c = tuple(int(rng.integers(0, s)) for s in SHAPE)            # some blobs touch the volume edge
+            lab[ball(c, int(rng.integers(2, 7))) & (lab == 0)] = k
+        boxes = ndimage.find_objects(lab)
+        for k in np.unique(lab[lab > 0]):
+            assert W.deepest_point(lab == k, boxes[k - 1]) == W.M.geometric_point(lab == k)

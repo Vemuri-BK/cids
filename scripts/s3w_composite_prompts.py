@@ -95,14 +95,25 @@ def extra_positives(prob, region, p, n=CFG["pos_extra"], min_p=CFG["pos_min_p"],
     return out
 
 
+def deepest_point(blob, sl):
+    """M.geometric_point(blob) computed on the blob's bounding box only. Identical result: geometric_point pads
+    with background (as the full-volume call does at the volume edge), the voxels around a tight bounding box
+    are background anyway, and the centroid tie-break / lexicographic order are translation invariant."""
+    q = M.geometric_point(blob[sl])
+    return tuple(int(a + s.start) for a, s in zip(q, sl))
+
+
 def negatives(lab, region, p, n=CFG["neg_max"], within=CFG["neg_within_mm"]):
     """Deepest point of each candidate blob not touching the region, within `within` mm, nearest first."""
     pts = []
+    boxes = ndimage.find_objects(lab)
     for k in np.unique(lab[lab > 0]):
-        blob = lab == k
-        if (blob & region).any():
+        sl = boxes[k - 1]
+        blob = np.zeros(lab.shape, bool)
+        blob[sl] = lab[sl] == k
+        if (blob[sl] & region[sl]).any():
             continue
-        q = M.geometric_point(blob)
+        q = deepest_point(blob, sl)
         d = float(np.sqrt(((np.asarray(q) - np.asarray(p)) ** 2).sum()))
         if d <= within:
             pts.append((d, tuple(int(v) for v in q)))
