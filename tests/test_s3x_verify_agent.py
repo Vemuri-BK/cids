@@ -23,6 +23,8 @@ def _choices(n, seed, prefix):
     bad = rng.random(n) < 0.3                               # learnable: bad results have a small 'cn_log_ml'
     d["cn_log_ml"] = np.where(bad, rng.uniform(-6, -4, n), rng.uniform(0, 2, n))
     d["qc"] = rng.random(n)
+    d.loc[:3, "risk_baseline"] = np.inf                      # empty automatic masks (S3n: reviewed first)
+    d.loc[:3, "qc"] = np.inf
     d["tool2"] = np.where(rng.random(n) < 0.2, "S", "Cn")
     d["B_dice"] = rng.uniform(0, 1, n)
     d["Cn_dice"] = np.where(bad, 0.2, 0.8)

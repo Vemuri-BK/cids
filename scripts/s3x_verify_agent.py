@@ -72,13 +72,18 @@ def prepare(d: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def feats(df, cols):
+    """Model input: +-inf (QC risk of an empty automatic mask = 'review first') -> +-1e6, missing -> -1."""
+    return df[cols].replace([np.inf, -np.inf], [1e6, -1e6]).fillna(-1)
+
+
 def crossfit_proba(df, cols, folds):
     p = pd.Series(np.nan, index=df.index)
     f = df.cache_id.map(folds)
     for k in sorted(f.unique()):
         te = f == k
-        m = gbc().fit(df.loc[~te, cols].fillna(-1), df.loc[~te, "y"])
-        p[te] = m.predict_proba(df.loc[te, cols].fillna(-1))[:, 1]
+        m = gbc().fit(feats(df.loc[~te], cols), df.loc[~te, "y"])
+        p[te] = m.predict_proba(feats(df.loc[te], cols))[:, 1]
     return p.to_numpy()
 
 
@@ -157,10 +162,10 @@ def main():
     if set(tr.cache_id) != set(folds):
         raise SystemExit("S3z train patients differ from the S3k folds")
     tr["ver"] = crossfit_proba(tr, VER, folds)
-    va["ver"] = gbc().fit(tr[VER].fillna(-1), tr.y).predict_proba(va[VER].fillna(-1))[:, 1]
+    va["ver"] = gbc().fit(feats(tr, VER), tr.y).predict_proba(feats(va, VER))[:, 1]
     n, seed = RULE["bootstrap"]["n"], RULE["bootstrap"]["seed"]
     res = {s: evaluate(d, n, seed) for s, d in data.items()}
-    imp = pd.Series(gbc().fit(tr[VER].fillna(-1), tr.y).feature_importances_, index=VER).sort_values(ascending=False)
+    imp = pd.Series(gbc().fit(feats(tr, VER), tr.y).feature_importances_, index=VER).sort_values(ascending=False)
     imp.to_csv(out / "feature_importance.csv", header=["importance"])
     for s, d in data.items():
         d[["cache_id", "qc", "tool2", "B_dice", "Cn_dice", "FM_dice", "deliv_dice", "alt_dice", "y", "ver"]].to_csv(
