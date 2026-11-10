@@ -351,6 +351,9 @@ def validate(model, box, data, args, vcands=None):
         rej.extend(neg_stats(out[("neg", 1)], gt, 233 + s)[0])
     m = {f"{a}{b}": float(np.mean(v)) for (a, b), v in res.items()}
     m["neg_reject"] = float(np.nanmean(rej))
+    if getattr(args, "select", "default") == "click1":           # S3y: one-click specialisation
+        m["score"] = m["click1"]
+        return m
     if vcands is not None:
         m.update(cand_eval(model, box, vcands, args))
         m["score"] = float(np.nanmean([m["box1"], m["messy1"], m["hard_reject"], m["real_keep"]]))
@@ -493,6 +496,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=2, help="epochs")
     ap.add_argument("--max_clicks", type=int, default=5)
     ap.add_argument("--p_box", type=float, default=0.5)
+    ap.add_argument("--select", choices=["default", "click1"], default="default",
+                    help="checkpoint selection: default (as before) or val Dice@1 click only (S3y)")
     ap.add_argument("--box_jitter", type=int, default=5, help="voxels at 1.5 mm")
     ap.add_argument("--box_aug", choices=["clean", "realistic"], default="clean", help="S2a = clean, S2b = realistic")
     ap.add_argument("--p_messy", type=float, default=0.4, help="share of box prompts that are messy (S2b)")
