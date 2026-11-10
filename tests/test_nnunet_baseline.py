@@ -82,3 +82,14 @@ def test_evaluate_and_test_guard(tmp_path):
     (pred / "nact_003.nii.gz").unlink()
     r = subprocess.run(base + ["--split", "val", "--out", str(tmp_path / "ev2")], capture_output=True, text=True)
     assert r.returncode != 0 and "predictions missing" in r.stdout + r.stderr
+
+
+def test_partial_leftovers_removed(tmp_path):
+    root = _cache(tmp_path)
+    ds = tmp_path / "raw" / "Dataset501_MAMAMIA3ch" / "imagesTr"
+    ds.mkdir(parents=True)
+    (ds / "duke_001_0000.partial.nii.gz").write_bytes(b"x")
+    r = subprocess.run([sys.executable, SCRIPT, "--step", "convert", "--cache_root", str(root), "--splits",
+                        str(tmp_path / "splits.csv"), "--nnunet_raw", str(tmp_path / "raw")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert not list(ds.glob("*.partial.nii.gz"))

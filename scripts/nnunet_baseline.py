@@ -74,6 +74,8 @@ def step_convert(a):
     ds = Path(a.nnunet_raw).expanduser() / dataset_name(a.dataset_id, a.name)
     for d in ("imagesTr", "labelsTr", "imagesTs"):
         (ds / d).mkdir(parents=True, exist_ok=True)
+        for f in (ds / d).glob("*.partial.nii.gz"):           # leftovers of an interrupted run
+            f.unlink()
     jobs = []
     for split, folder in (("train", "imagesTr"), ("val", "imagesTr"), ("test", "imagesTs")):
         jobs += [(split, folder, cid) for cid in ids[split]]
